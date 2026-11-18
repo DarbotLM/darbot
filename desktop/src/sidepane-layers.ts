@@ -1,10 +1,4 @@
-/**
- * Composable sidepane layers.
- *
- * A sidepane is a stack of named layers rather than one hand-written column, so
- * a surface can compose the layers it needs without duplicating the agent
- * navigator, its disclosure behaviour, or the tool rail.
- */
+/** Composable, validated sidepane layers and their saved disclosure choices. */
 
 export const SIDEPANE_DISCLOSURE_SCHEMA_VERSION = 1;
 export const SIDEPANE_DISCLOSURE_STORAGE_KEY = "darbot:copilot:sidepane";
@@ -14,6 +8,7 @@ const MAX_ID_LENGTH = 128;
 const MAX_TITLE_LENGTH = 256;
 const MAX_DISCLOSURE_ENTRIES = 512;
 const MAX_DISCLOSURE_LENGTH = 200_000;
+const STABLE_ID = /^[a-z0-9][a-z0-9_-]*$/;
 
 export const SIDEPANE_REGIONS = ["header", "body", "footer"] as const;
 
@@ -21,22 +16,22 @@ export type SidepaneRegion = (typeof SIDEPANE_REGIONS)[number];
 
 export type SidepaneLayer = {
   /** Stable layer identity. Unique within a sidepane. */
-  id: string;
+  readonly id: string;
   /** Accessible label for the layer. */
-  title: string;
+  readonly title: string;
   /** Where the layer sits in the column. */
-  region: SidepaneRegion;
+  readonly region: SidepaneRegion;
   /** Ascending placement within the region. */
-  order: number;
+  readonly order: number;
   /** Whether the layer renders groups that can be expanded and collapsed. */
-  collapsible: boolean;
+  readonly collapsible: boolean;
   /** Whether a collapsible group starts expanded when the user has no saved choice. */
-  expandedByDefault: boolean;
+  readonly expandedByDefault: boolean;
 };
 
 export type SidepaneSpec = {
-  id: string;
-  label: string;
+  readonly id: string;
+  readonly label: string;
   layers: readonly SidepaneLayer[];
 };
 
@@ -64,12 +59,60 @@ export type SidepaneDisclosure = {
 
 type DisclosureStorage = Pick<Storage, "getItem" | "setItem">;
 
-function identifier(value: string, label: string, max: number): string {
+function record(value: unknown, label: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} must be an object.`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function onlyFields(
+  value: Record<string, unknown>,
+  fields: readonly string[],
+  label: string,
+): void {
+  if (Object.keys(value).some((key) => !fields.includes(key))) {
+    throw new Error(`${label} contains unsupported fields.`);
+  }
+}
+
+function identifier(value: unknown, label: string, max: number): string {
+  if (typeof value !== "string") {
+    throw new Error(`${label} must be a string.`);
+  }
   const trimmed = value.trim();
   if (!trimmed || trimmed.length > max) {
     throw new Error(`${label} must be between 1 and ${max} characters.`);
   }
   return trimmed;
+}
+
+function stableId(value: unknown, label: string): string {
+  const id = identifier(value, label, MAX_ID_LENGTH);
+  if (id !== value || !STABLE_ID.test(id)) {
+    throw new Error(`${label} must be a lowercase, unspaced identifier.`);
+  }
+  return id;
+}
+
+function isSidepaneRegion(value: unknown): value is SidepaneRegion {
+  return SIDEPANE_REGIONS.some((region) => region === value);
+}
+
+function persistableGroupKey(key: string): boolean {
+  const separator = key.indexOf(":");
+  const layerId = key.slice(0, separator);
+  const groupId = key.slice(separator + 1);
+  return (
+    separator > 0 &&
+    key.length <= MAX_ID_LENGTH * 2 + 1 &&
+    layerId.length <= MAX_ID_LENGTH &&
+    STABLE_ID.test(layerId) &&
+    !!groupId &&
+    groupId.length <= MAX_ID_LENGTH &&
+    groupId === groupId.trim() &&
+    !/\p{Cc}/u.test(groupId)
+  );
 }
 
 export function emptySidepaneDisclosure(): SidepaneDisclosure {
@@ -81,30 +124,69 @@ export function emptySidepaneDisclosure(): SidepaneDisclosure {
  * and then by explicit order, so callers render a stable column.
  */
 export function defineSidepane(spec: SidepaneSpecInput): SidepaneSpec {
-  const id = identifier(spec.id, "Sidepane ID", MAX_ID_LENGTH);
-  const label = identifier(spec.label, "Sidepane label", MAX_TITLE_LENGTH);
-  if (!spec.layers.length || spec.layers.length > MAX_LAYERS) {
+  const description = record(spec, "Sidepane");
+  onlyFields(description, ["id", "label", "layers"], "Sidepane");
+  const id = stableId(description.id, "Sidepane ID");
+  const label = identifier(
+    description.label,
+    "Sidepane label",
+    MAX_TITLE_LENGTH,
+  );
+  const inputLayers = description.layers;
+  if (
+    !Array.isArray(inputLayers) ||
+    !inputLayers.length ||
+    inputLayers.length > MAX_LAYERS
+  ) {
     throw new Error(
       `Sidepane must declare between 1 and ${MAX_LAYERS} layers.`,
     );
   }
   const seen = new Set<string>();
-  const layers = spec.layers.map((layer, index) => {
-    const layerId = identifier(layer.id, "Sidepane layer ID", MAX_ID_LENGTH);
+  const layers = inputLayers.map((inputLayer, index) => {
+    const layer = record(inputLayer, "Sidepane layer");
+    onlyFields(
+      layer,
+      ["id", "title", "region", "order", "collapsible", "expandedByDefault"],
+      "Sidepane layer",
+    );
+    const layerId = stableId(layer.id, "Sidepane layer ID");
     if (seen.has(layerId)) {
       throw new Error(
         `Sidepane layer "${layerId}" is declared more than once.`,
       );
     }
     seen.add(layerId);
-    if (!SIDEPANE_REGIONS.includes(layer.region)) {
+    if (!isSidepaneRegion(layer.region)) {
       throw new Error(
         `Sidepane layer "${layerId}" must sit in ${SIDEPANE_REGIONS.join(", ")}.`,
       );
     }
     const order = layer.order ?? index;
-    if (!Number.isFinite(order)) {
-      throw new Error(`Sidepane layer "${layerId}" needs a finite order.`);
+    if (
+      typeof order !== "number" ||
+      !Number.isSafeInteger(order) ||
+      order < 0
+    ) {
+      throw new Error(
+        `Sidepane layer "${layerId}" needs a non-negative integer order.`,
+      );
+    }
+    if (
+      layer.collapsible !== undefined &&
+      typeof layer.collapsible !== "boolean"
+    ) {
+      throw new Error(
+        `Sidepane layer "${layerId}" needs a boolean collapsible flag.`,
+      );
+    }
+    if (
+      layer.expandedByDefault !== undefined &&
+      typeof layer.expandedByDefault !== "boolean"
+    ) {
+      throw new Error(
+        `Sidepane layer "${layerId}" needs a boolean expandedByDefault flag.`,
+      );
     }
     const collapsible = layer.collapsible ?? false;
     const expandedByDefault = layer.expandedByDefault ?? false;
@@ -113,21 +195,21 @@ export function defineSidepane(spec: SidepaneSpecInput): SidepaneSpec {
         `Sidepane layer "${layerId}" cannot default to expanded without being collapsible.`,
       );
     }
-    return {
+    return Object.freeze({
       id: layerId,
       title: identifier(layer.title, "Sidepane layer title", MAX_TITLE_LENGTH),
       region: layer.region,
       order,
       collapsible,
       expandedByDefault,
-    } satisfies SidepaneLayer;
+    } satisfies SidepaneLayer);
   });
   layers.sort(
     (left, right) =>
       SIDEPANE_REGIONS.indexOf(left.region) -
         SIDEPANE_REGIONS.indexOf(right.region) || left.order - right.order,
   );
-  return { id, label, layers };
+  return Object.freeze({ id, label, layers: Object.freeze(layers) });
 }
 
 export function sidepaneRegion(
@@ -150,7 +232,10 @@ export function sidepaneLayer(
 
 /** Namespaces a group key so two layers never share disclosure state. */
 export function sidepaneGroupKey(layerId: string, groupId: string): string {
-  return `${layerId}:${groupId}`;
+  if (typeof groupId !== "string" || !groupId) {
+    throw new Error("Sidepane group ID must be a nonempty string.");
+  }
+  return `${stableId(layerId, "Sidepane layer ID")}:${groupId}`;
 }
 
 /**
@@ -178,6 +263,9 @@ export function setSidepaneGroupExpanded(
   expanded: boolean,
 ): SidepaneDisclosure {
   if (!layer.collapsible) return disclosure;
+  if (typeof expanded !== "boolean") {
+    throw new Error("Sidepane group expansion must be true or false.");
+  }
   const key = sidepaneGroupKey(layer.id, groupId);
   const entries = Object.entries(disclosure.groups).filter(
     ([candidate]) => candidate !== key,
@@ -190,47 +278,36 @@ export function setSidepaneGroupExpanded(
 }
 
 export function validateSidepaneDisclosure(value: unknown): SidepaneDisclosure {
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("Saved sidepane layout must be an object.");
-  }
-  const data = value as Record<string, unknown>;
-  if (
-    Object.keys(data).some((key) => !["schemaVersion", "groups"].includes(key))
-  ) {
-    throw new Error("Saved sidepane layout contains unsupported fields.");
-  }
+  const data = record(value, "Saved sidepane layout");
+  onlyFields(data, ["schemaVersion", "groups"], "Saved sidepane layout");
   if (data.schemaVersion !== SIDEPANE_DISCLOSURE_SCHEMA_VERSION) {
     throw new Error(
       "Unsupported sidepane layout version. Use the Darbot version that saved it.",
     );
   }
-  if (
-    !data.groups ||
-    typeof data.groups !== "object" ||
-    Array.isArray(data.groups)
-  ) {
-    throw new Error("Saved sidepane groups must be an object.");
-  }
-  const entries = Object.entries(data.groups as Record<string, unknown>);
+  const entries = Object.entries(record(data.groups, "Saved sidepane groups"));
   if (entries.length > MAX_DISCLOSURE_ENTRIES) {
     throw new Error(
       `Saved sidepane layout must contain at most ${MAX_DISCLOSURE_ENTRIES} groups.`,
     );
   }
-  const groups: Record<string, boolean> = {};
+  const groups: [string, boolean][] = [];
   for (const [key, expanded] of entries) {
-    if (!key || key.length > MAX_ID_LENGTH * 2 + 1) {
+    if (!persistableGroupKey(key)) {
       throw new Error("Saved sidepane group keys are invalid.");
     }
     if (typeof expanded !== "boolean") {
       throw new Error(`Saved sidepane group "${key}" must be true or false.`);
     }
-    groups[key] = expanded;
+    groups.push([key, expanded]);
   }
-  return { schemaVersion: SIDEPANE_DISCLOSURE_SCHEMA_VERSION, groups };
+  return {
+    schemaVersion: SIDEPANE_DISCLOSURE_SCHEMA_VERSION,
+    groups: Object.fromEntries(groups),
+  };
 }
 
-/** Reads saved disclosure state, falling back to defaults rather than failing the surface. */
+/** Presentation state is optional, but corrupt storage is reported before using defaults. */
 export function readSidepaneDisclosure(
   storage?: DisclosureStorage,
 ): SidepaneDisclosure {
@@ -239,9 +316,17 @@ export function readSidepaneDisclosure(
       SIDEPANE_DISCLOSURE_STORAGE_KEY,
     );
     if (raw === null) return emptySidepaneDisclosure();
-    if (raw.length > MAX_DISCLOSURE_LENGTH) return emptySidepaneDisclosure();
+    if (raw.length > MAX_DISCLOSURE_LENGTH) {
+      throw new Error(
+        "Saved sidepane layout exceeds the supported storage size.",
+      );
+    }
     return validateSidepaneDisclosure(JSON.parse(raw));
-  } catch {
+  } catch (error) {
+    console.warn(
+      "Saved sidepane layout could not be read; using defaults.",
+      error,
+    );
     return emptySidepaneDisclosure();
   }
 }
@@ -250,7 +335,19 @@ export function writeSidepaneDisclosure(
   disclosure: SidepaneDisclosure,
   storage?: DisclosureStorage,
 ): void {
-  const serialized = JSON.stringify(validateSidepaneDisclosure(disclosure));
+  const entries = Object.entries(disclosure.groups);
+  const persistable = entries.filter(([key]) => persistableGroupKey(key));
+  if (persistable.length !== entries.length) {
+    console.warn(
+      "Some agent IDs cannot be saved as sidepane disclosure keys; their choices remain available until the window closes.",
+    );
+  }
+  const serialized = JSON.stringify(
+    validateSidepaneDisclosure({
+      ...disclosure,
+      groups: Object.fromEntries(persistable),
+    }),
+  );
   if (serialized.length > MAX_DISCLOSURE_LENGTH) {
     throw new Error("The sidepane layout exceeds the supported storage size.");
   }

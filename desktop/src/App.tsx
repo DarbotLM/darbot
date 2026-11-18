@@ -482,6 +482,7 @@ export function App() {
           <button
             type="button"
             className="quiet"
+            data-ui-action="setup_back"
             onClick={() => setStep("model")}
           >
             Back
@@ -669,6 +670,7 @@ export function App() {
                 <button
                   type="button"
                   className="quiet"
+                  data-ui-action="setup_intelligence_sign_in"
                   onClick={signInTodarbotlm}
                 >
                   Sign in to darbotlm again
@@ -697,6 +699,7 @@ export function App() {
                       type="button"
                       key={project.id}
                       className="tile"
+                      data-ui-action="setup_select_project"
                       disabled={signingIn}
                       onClick={() => pickProject(project.id)}
                     >
@@ -713,6 +716,7 @@ export function App() {
                     <button
                       type="button"
                       className="quiet"
+                      data-ui-action="setup_intelligence_sign_in"
                       disabled={signingIn}
                       onClick={signInTodarbotlm}
                     >
@@ -731,6 +735,7 @@ export function App() {
                 </p>
                 <button
                   type="button"
+                  data-ui-action="setup_intelligence_sign_in"
                   disabled={signingIn}
                   onClick={signInTodarbotlm}
                 >
@@ -748,6 +753,7 @@ export function App() {
                 <button
                   type="button"
                   className="quiet"
+                  data-ui-action="setup_reuse_intelligence"
                   onClick={() => setReuseIntelligence(true)}
                 >
                   Use a saved connection
@@ -757,6 +763,7 @@ export function App() {
               <label htmlFor="root">Where darbot lives</label>
               <input
                 id="root"
+                data-ui-action="setup_root"
                 disabled={busy}
                 value={root}
                 onChange={(event) => {
@@ -777,7 +784,9 @@ export function App() {
             The heading now describes the action, and the note says what the defaults are.
           */}
             <details>
-              <summary>Point at your own Intelligence server</summary>
+              <summary data-ui-action="inspect_details">
+                Point at your own Intelligence server
+              </summary>
               <p className="footnote" style={{ margin: "0.6rem 0 0.75rem" }}>
                 These default to darbotlm's managed service. Change them only if
                 you run Intelligence yourself, and paste that server's key
@@ -787,6 +796,7 @@ export function App() {
                 <label htmlFor="key">Project key</label>
                 <input
                   id="key"
+                  data-ui-action="setup_intelligence_key"
                   type="password"
                   value={apiKey}
                   onChange={(event) => setApiKey(event.target.value)}
@@ -799,6 +809,7 @@ export function App() {
                 <label htmlFor="api">API URL</label>
                 <input
                   id="api"
+                  data-ui-action="setup_intelligence_api"
                   value={apiUrl}
                   onChange={(event) => setApiUrl(event.target.value)}
                   spellCheck={false}
@@ -808,6 +819,7 @@ export function App() {
                 <label htmlFor="ws">Gateway WebSocket URL</label>
                 <input
                   id="ws"
+                  data-ui-action="setup_intelligence_gateway"
                   value={wsUrl}
                   onChange={(event) => setWsUrl(event.target.value)}
                   spellCheck={false}
@@ -837,6 +849,7 @@ export function App() {
           <button
             type="button"
             className="quiet standalone-action"
+            data-ui-action="setup_change_provider"
             disabled={busy}
             onClick={() => setStep("model")}
           >
@@ -848,6 +861,7 @@ export function App() {
             <>
               <button
                 type="button"
+                data-ui-action="setup_show_darbot"
                 /*
                  * The refusal is shown, not swallowed.
                  *
@@ -868,6 +882,7 @@ export function App() {
               <button
                 type="button"
                 className="quiet"
+                data-ui-action="setup_stop_stack"
                 onClick={stop}
                 disabled={busy}
               >
@@ -877,6 +892,7 @@ export function App() {
           ) : (
             <button
               type="button"
+              data-ui-action="setup_start_stack"
               onClick={start}
               // The model is answered by its own screen now, so what is checked here is that it was
               // answered at all, not that some field on this screen is non-empty.

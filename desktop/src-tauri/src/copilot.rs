@@ -1,8 +1,9 @@
 //! Supported GitHub Copilot CLI discovery for the desktop shell.
 //!
-//! Authentication belongs to Copilot CLI; OAuth tokens never enter Darbot. ACP supplies session
+//! Local authentication belongs to Copilot CLI. ACP supplies session
 //! configuration, including authoritative agent/model choices. CLI JSON supplies resource inventory.
 //! Only public agent frontmatter is read locally, for the picker before a session exists.
+//! Opt-in Studio discovery uses subscription-scoped Azure CLI tokens only in memory, never for ACP.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -31,6 +32,138 @@ const STDERR_TIMEOUT: Duration = Duration::from_secs(1);
 const DIAGNOSTIC_LIMIT: usize = 16 * 1024;
 const AGENT_METADATA_LIMIT: usize = 2 * 1024 * 1024;
 const HISTORY_BATCH_SIZE: usize = 100;
+
+// Diagnostics deliberately has no fields for URLs, identities, paths, errors or tool content.
+mod diagnostics {
+    use super::*;
+    use sha2::{Digest, Sha256};
+    use std::{collections::VecDeque, sync::LazyLock, time::UNIX_EPOCH};
+
+    #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub(crate) enum Operation {
+        Identity,
+        VerifyAccount,
+        Bots,
+        Workflows,
+        CanvasApps,
+        ModelDrivenApps,
+        AcpInitialize,
+        AcpListSessions,
+        ListPlugins,
+        ListSkills,
+        ListMcp,
+        SdkStart,
+        SdkStatus,
+        SdkVerifyAuth,
+        SdkPlugins,
+        SdkAgents,
+        SdkTasks,
+        SdkRemote,
+        FallbackPlugins,
+    }
+
+    #[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub(super) struct Call {
+        pub at_unix_ms: u64,
+        pub latency_ms: u64,
+        pub succeeded: bool,
+        pub http_status: Option<u16>,
+    }
+
+    #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub(super) struct History {
+        pub last_call: Call,
+        pub last_success: Option<Call>,
+        pub last_failure: Option<Call>,
+    }
+    pub(super) type Observations = BTreeMap<Operation, History>;
+
+    pub(super) fn record(rows: &mut Observations, op: Operation, call: Call) {
+        let history = rows.entry(op).or_insert(History {
+            last_call: call,
+            last_success: None,
+            last_failure: None,
+        });
+        history.last_call = call;
+        if call.succeeded {
+            history.last_success = Some(call);
+        } else {
+            history.last_failure = Some(call);
+        }
+    }
+
+    pub(super) fn finished(
+        start: Instant,
+        succeeded: bool,
+        http_status: Option<u16>,
+    ) -> Option<Call> {
+        Some(Call {
+            at_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .ok()?
+                .as_millis()
+                .try_into()
+                .ok()?,
+            latency_ms: start.elapsed().as_millis().try_into().ok()?,
+            succeeded,
+            http_status,
+        })
+    }
+
+    // Transport observations outside Studio live only for this process. Keep a bounded set
+    // of workspace buckets, without storing the path in the registry or returning it to UI.
+    type Scope = Option<[u8; 32]>;
+    type Buckets = VecDeque<(Scope, Observations)>;
+    static LOCAL: LazyLock<Mutex<Buckets>> = LazyLock::new(Default::default);
+
+    fn scope(cwd: Option<&str>) -> Scope {
+        cwd.map(|path| Sha256::digest(path.as_bytes()).into())
+    }
+
+    pub(crate) fn local(cwd: Option<&str>, op: Operation, start: Instant, succeeded: bool) {
+        let Some(call) = finished(start, succeeded, None) else {
+            return;
+        };
+        let key = scope(cwd);
+        let Ok(mut buckets) = LOCAL.lock() else {
+            return;
+        };
+        let mut rows = buckets
+            .iter()
+            .position(|(k, _)| *k == key)
+            .and_then(|i| buckets.remove(i))
+            .map(|(_, rows)| rows)
+            .unwrap_or_default();
+        record(&mut rows, op, call);
+        buckets.push_front((key, rows));
+        buckets.truncate(64);
+    }
+
+    pub(super) fn snapshot(cwd: Option<&str>) -> Observations {
+        let key = scope(cwd);
+        LOCAL
+            .lock()
+            .ok()
+            .and_then(|b| b.iter().find(|(k, _)| *k == key).map(|(_, v)| v.clone()))
+            .unwrap_or_default()
+    }
+
+    pub(super) fn reading<T>(
+        cwd: Option<&str>,
+        op: Operation,
+        read: impl FnOnce() -> Result<T, Problem>,
+    ) -> Result<T, Problem> {
+        let started = Instant::now();
+        let result = read();
+        local(cwd, op, started, result.is_ok());
+        result
+    }
+}
+use diagnostics::Observations;
+pub(crate) use diagnostics::{local as record_transport, Operation};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -74,6 +207,8 @@ pub struct CopilotStatus {
     pub session_count: usize,
     pub has_more_sessions: bool,
     pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    observations: Observations,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -86,19 +221,99 @@ pub struct CopilotPlugin {
     pub source: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CopilotAgent {
     pub id: String,
     pub name: String,
     pub description: String,
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<LocalDefinition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<StudioAgentSource>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalDefinition {
+    pub file: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_at_unix: Option<u64>,
+    pub declared_id: Option<String>,
+    pub tools: Vec<DeclaredTool>,
+    pub omitted_entries: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct DeclaredTool {
+    pub name: String,
+    pub field: String,
+    pub server: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StudioAgentSource {
+    #[serde(deserialize_with = "deserialize_studio_provider")]
+    pub provider: String,
+    pub tenant_id: String,
+    pub environment_id: String,
+    pub environment_name: String,
+    pub environment_url: String,
+    pub bot_id: String,
+    pub schema_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_description: Option<String>,
+    pub modified_at: String,
+    pub state_code: i64,
+    pub last_synced_at: u64,
+}
+
+fn deserialize_studio_provider<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
+    let provider = String::deserialize(deserializer)?;
+    if provider != "copilot-studio" {
+        return Err(serde::de::Error::custom(
+            "Unsupported Studio source provider",
+        ));
+    }
+    Ok(provider)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StudioSourceStatus {
+    pub tenant_id: String,
+    pub environment_id: String,
+    pub environment_name: String,
+    pub environment_url: String,
+    pub state: String,
+    pub agent_count: usize,
+    pub last_synced_at: Option<u64>,
+    pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assets: Option<Vec<StudioAsset>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub asset_warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    observations: Observations,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StudioAsset {
+    pub kind: String,
+    pub id: String,
+    pub name: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CopilotAgentCatalog {
     pub agents: Vec<CopilotAgent>,
+    pub sources: Vec<StudioSourceStatus>,
     pub warnings: Vec<String>,
 }
 
@@ -125,10 +340,13 @@ pub struct CopilotMcpServer {
 #[serde(rename_all = "camelCase")]
 pub struct CopilotInventory {
     pub agents: Vec<CopilotAgent>,
+    pub sources: Vec<StudioSourceStatus>,
     pub plugins: Vec<CopilotPlugin>,
     pub skills: Vec<CopilotSkill>,
     pub mcp_servers: Vec<CopilotMcpServer>,
     pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    observations: Observations,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -515,6 +733,7 @@ impl CopilotRuntimeState {
         agent: Option<String>,
         cwd: String,
     ) -> Result<CopilotSession, Problem> {
+        require_local_agent(agent.as_deref())?;
         let cwd = session_root(&cwd)?;
         self.connected(app)?.new_session(cwd, nonempty(agent))
     }
@@ -526,6 +745,7 @@ impl CopilotRuntimeState {
         session_id: String,
         cwd: String,
     ) -> Result<CopilotSession, Problem> {
+        require_local_agent(agent.as_deref())?;
         let cwd = session_root(&cwd)?;
         self.connected(app)?.load_session(session_id, cwd, agent)
     }
@@ -537,6 +757,7 @@ impl CopilotRuntimeState {
         session_id: String,
         cwd: String,
     ) -> Result<CopilotSession, Problem> {
+        require_local_agent(agent.as_deref())?;
         let cwd = session_root(&cwd)?;
         self.connected(app)?.resume_session(session_id, cwd, agent)
     }
@@ -544,10 +765,11 @@ impl CopilotRuntimeState {
     pub fn prompt<R: Runtime>(
         &self,
         _app: &AppHandle<R>,
-        _agent: Option<String>,
+        agent: Option<String>,
         session_id: String,
         prompt: String,
     ) -> Result<CopilotPromptResult, Problem> {
+        require_local_agent(agent.as_deref())?;
         self.current()?.prompt(session_id, prompt)
     }
 
@@ -595,7 +817,967 @@ impl CopilotRuntimeState {
         config_id: String,
         value: String,
     ) -> Result<CopilotSessionConfig, Problem> {
+        require_local_agent(Some(&value))?;
         self.current()?.configure(session_id, config_id, value)
+    }
+}
+
+fn require_local_agent(agent: Option<&str>) -> Result<(), Problem> {
+    if agent.is_some_and(|id| id.trim().to_ascii_lowercase().starts_with("studio:")) {
+        return Err(Problem::plain(
+            "Copilot Studio agents are catalog-only here and cannot run through the local Copilot CLI ACP runtime. Open the agent in Copilot Studio instead.",
+        ));
+    }
+    Ok(())
+}
+
+/// Read-only, positive evidence only. Never return log text, tool arguments, git errors or paths.
+pub mod evidence {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    type Check<T> = Result<T, &'static str>;
+    const LIMIT: usize = 8 * 1024 * 1024;
+    const LOG: &str =
+        "Local session evidence is missing, incomplete or exceeds the inspection limit.";
+    const OWNER: &str = "No unambiguous successful commit for this selected agent and workspace.";
+    const GIT: &str =
+        "Local Git objects or origin/main could not be verified within the inspection limit.";
+    const AUTHOR: &str =
+        "Changed application source could not be matched to a successful edit by this agent.";
+    const SNAPSHOT: &str = "Local origin/main snapshot only; not fetched or checked for freshness.";
+
+    #[derive(Serialize)]
+    pub struct Evidence {
+        status: &'static str,
+        commits: Vec<String>,
+        points: usize,
+        reason: String,
+    }
+
+    fn local_path(s: &str) -> bool {
+        !s.is_empty()
+            && s.len() <= 4096
+            && !s.chars().any(char::is_control)
+            && !s.replace('\\', "/").starts_with("//")
+            && Path::new(s).is_absolute()
+            && !Path::new(s)
+                .components()
+                .any(|c| c == std::path::Component::ParentDir)
+    }
+
+    // Shell syntax is *recognized*, never evaluated. Only a literal absolute repo and
+    // one ordinary commit with literal message(s); no pipelines, substitutions or scripts.
+    fn commit_command(cmd: &str, cwd: &Path) -> bool {
+        fn literal(s: &str) -> Option<(&str, &str)> {
+            let q = s.chars().next()?;
+            let (v, tail) = if matches!(q, '\'' | '"') {
+                s[1..].split_once(q)?
+            } else {
+                s.split_once(' ').unwrap_or((s, ""))
+            };
+            if v.is_empty()
+                || v.contains([
+                    '$', '`', '&', ';', '|', '>', '<', '\r', '\n', '!', '"', '\'',
+                ])
+                || !matches!(q, '\'' | '"')
+                    && !v
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"/\\.:_-".contains(&b))
+                || !tail.is_empty() && !tail.starts_with(' ') && matches!(q, '\'' | '"')
+            {
+                return None;
+            }
+            Some((v, tail.trim_start_matches(' ')))
+        }
+        let pair = cmd.strip_prefix("git -C ").and_then(literal).or_else(|| {
+            cmd.strip_prefix("Set-Location ")
+                .or_else(|| cmd.strip_prefix("cd "))
+                .and_then(literal)
+                .and_then(|(p, tail)| Some((p, tail.strip_prefix("&& git ")?)))
+        });
+        let Some((p, tail)) = pair else { return false };
+        if Path::new(p) != cwd || !local_path(p) {
+            return false;
+        }
+        let Some(mut tail) = tail.strip_prefix("commit ") else {
+            return false;
+        };
+        loop {
+            let Some((_, rest)) = tail.strip_prefix("-m ").and_then(literal) else {
+                return false;
+            };
+            if rest.is_empty() {
+                return true;
+            }
+            tail = rest;
+        }
+    }
+
+    fn result_oid(data: &Value) -> Option<String> {
+        if data["success"] != true || data.pointer("/shellExecution/exitCode")?.as_i64()? != 0 {
+            return None;
+        }
+        let line = data.pointer("/result/content")?.as_str()?.lines().next()?;
+        let (header, _) = line.strip_prefix('[')?.split_once("] ")?;
+        let (branch, oid) = header.split_once(' ')?;
+        if branch.is_empty()
+            || !(7..=64).contains(&oid.len())
+            || !oid.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        Some(oid.to_ascii_lowercase())
+    }
+
+    #[derive(Clone)]
+    struct Edit {
+        path: String,
+        old: String,
+        new: String,
+    }
+    struct Candidate {
+        id: String,
+        edits: Vec<Edit>,
+    }
+    enum Call {
+        Edit(Edit),
+        Commit(Vec<Edit>),
+        UnsupportedCommit,
+    }
+
+    // Narrow subset of the native patch tool: one file, one contiguous hunk, no moves.
+    // As with `edit`, the completion must attest the path, and both blobs are checked.
+    fn patch_edit(patch: &str, cwd: &Path) -> Option<Edit> {
+        let body = patch
+            .strip_prefix("*** Begin Patch\n")?
+            .trim_end_matches('\n')
+            .strip_suffix("\n*** End Patch")?;
+        let (header, body) = body.split_once('\n')?;
+        let (p, body, add) = if let Some(p) = header.strip_prefix("*** Add File: ") {
+            (p, body, true)
+        } else {
+            (
+                header.strip_prefix("*** Update File: ")?,
+                body.strip_prefix("@@\n")?,
+                false,
+            )
+        };
+        let p = Path::new(p);
+        let rel = if p.is_absolute() {
+            p.strip_prefix(cwd).ok()?
+        } else {
+            p
+        };
+        let path = rel.to_str()?.replace('\\', "/");
+        if !source(&path) {
+            return None;
+        }
+        let (mut old, mut new) = (String::new(), String::new());
+        for line in body.lines() {
+            let (sign, text) = line.split_at_checked(1)?;
+            match sign {
+                " " if !add => {
+                    old.push_str(text);
+                    old.push('\n');
+                    new.push_str(text);
+                    new.push('\n');
+                }
+                "-" if !add => {
+                    old.push_str(text);
+                    old.push('\n');
+                }
+                "+" => {
+                    new.push_str(text);
+                    new.push('\n');
+                }
+                _ => return None,
+            }
+        }
+        if old.trim() == new.trim() || new.trim().is_empty() || !add && old.is_empty() {
+            return None;
+        }
+        Some(Edit { path, old, new })
+    }
+
+    fn scan(bytes: &[u8], session: &str, cwd: &Path, agent: &str) -> Check<Vec<Candidate>> {
+        let mut selected = false;
+        let mut seen = HashSet::new();
+        let mut pending = HashMap::new();
+        let mut edits = Vec::new();
+        let mut found = Vec::new();
+        let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+        for (i, line) in bytes
+            .strip_suffix(b"\n")
+            .unwrap_or(bytes)
+            .split(|b| *b == b'\n')
+            .enumerate()
+        {
+            if i >= 32_768 || line.len() > AGENT_METADATA_LIMIT {
+                return Err(LOG);
+            }
+            let e: Value = serde_json::from_slice(line).map_err(|_| LOG)?;
+            let data = &e["data"];
+            let kind = e["type"].as_str().ok_or(LOG)?;
+            let top = e["agentId"].is_null() && data["parentToolCallId"].is_null();
+            if i == 0 {
+                if kind != "session.start"
+                    || data["sessionId"].as_str() != Some(session)
+                    || data["context"]["cwd"].as_str().map(Path::new) != Some(cwd)
+                    || !data["context"]["gitRoot"].is_null()
+                        && data["context"]["gitRoot"].as_str().map(Path::new) != Some(cwd)
+                {
+                    return Err(OWNER);
+                }
+                continue;
+            }
+            match kind {
+                "session.start" | "session.resume" | "session.workspace_changed" => {
+                    return Err(OWNER)
+                }
+                "subagent.selected" | "subagent.deselected" if top => {
+                    pending.clear();
+                    edits.clear();
+                    selected = kind == "subagent.selected"
+                        && data["agentName"].as_str().map(selected_agent_name) == Some(agent);
+                }
+                "tool.execution_start" => {
+                    let id = data["toolCallId"].as_str().ok_or(LOG)?;
+                    if !seen.insert(id.to_owned()) {
+                        return Err(LOG);
+                    }
+                    if !top
+                        || !selected
+                        || data.get("mcpServerName").is_some()
+                        || data.get("mcpToolName").is_some()
+                    {
+                        continue;
+                    }
+                    let args = &data["arguments"];
+                    let call = match data["toolName"].as_str() {
+                        Some("bash" | "powershell")
+                            if args["command"]
+                                .as_str()
+                                .is_some_and(|s| commit_command(s, cwd))
+                                && args["mode"].as_str().unwrap_or("sync") == "sync" =>
+                        {
+                            Call::Commit(std::mem::take(&mut edits))
+                        }
+                        Some("bash" | "powershell")
+                            if args["command"]
+                                .as_str()
+                                .is_some_and(|s| s.contains("commit")) =>
+                        {
+                            Call::UnsupportedCommit
+                        }
+                        Some("apply_patch") => {
+                            let Some(edit) = args.as_str().and_then(|s| patch_edit(s, cwd)) else {
+                                continue;
+                            };
+                            Call::Edit(edit)
+                        }
+                        Some(tool @ ("edit" | "create")) => {
+                            let change = if tool == "create" {
+                                args["file_text"].as_str().map(|new| ("", new))
+                            } else {
+                                args["old_str"]
+                                    .as_str()
+                                    .filter(|s| !s.is_empty())
+                                    .zip(args["new_str"].as_str())
+                            };
+                            let Some((p, (old, new))) = args["path"].as_str().zip(change) else {
+                                continue;
+                            };
+                            let Some(rel) =
+                                Path::new(p).strip_prefix(cwd).ok().and_then(Path::to_str)
+                            else {
+                                continue;
+                            };
+                            let path = rel.replace('\\', "/");
+                            if !source(&path) || new.trim().is_empty() || old.trim() == new.trim() {
+                                continue;
+                            }
+                            Call::Edit(Edit {
+                                path,
+                                old: old.into(),
+                                new: new.into(),
+                            })
+                        }
+                        _ => continue,
+                    };
+                    pending.insert(id.to_owned(), call);
+                }
+                "tool.execution_complete" => {
+                    let Some(call) = data["toolCallId"]
+                        .as_str()
+                        .and_then(|id| pending.remove(id))
+                    else {
+                        continue;
+                    };
+                    if !top || !selected || data["success"] != true {
+                        continue;
+                    }
+                    match call {
+                        Call::Edit(edit) => {
+                            let exact = data["fileEdits"].as_array().is_some_and(|items| {
+                                items.len() == 1
+                                    && items[0]["kind"]
+                                        == if edit.old.is_empty() {
+                                            "create"
+                                        } else {
+                                            "edit"
+                                        }
+                                    && items[0]["path"].as_str().map(Path::new)
+                                        == Some(cwd.join(&edit.path).as_path())
+                            });
+                            if exact {
+                                edits.push(edit)
+                            }
+                        }
+                        Call::Commit(edits) => {
+                            if let Some(id) = result_oid(data) {
+                                if found.len() >= 16 {
+                                    return Err(LOG);
+                                }
+                                found.push(Candidate { id, edits });
+                            } else {
+                                return Err(OWNER);
+                            }
+                        }
+                        Call::UnsupportedCommit if result_oid(data).is_some() => return Err(OWNER),
+                        Call::UnsupportedCommit => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        if found.is_empty() {
+            Err(OWNER)
+        } else {
+            Ok(found)
+        }
+    }
+
+    fn source(path: &str) -> bool {
+        let lower = path.to_ascii_lowercase();
+        let mut parts: Vec<_> = lower.split('/').collect();
+        let file = parts.pop().unwrap_or("");
+        let excluded = |s: &str| {
+            [
+                "test",
+                "tests",
+                "testing",
+                "spec",
+                "specs",
+                "mock",
+                "mocks",
+                "fixture",
+                "fixtures",
+                "doc",
+                "docs",
+                "documentation",
+                "vendor",
+                "vendored",
+                "generated",
+                "gen",
+                "build",
+                "dist",
+                "target",
+                "node_modules",
+                "third_party",
+                "third-party",
+                "examples",
+                "samples",
+                "snapshots",
+                "coverage",
+                "e2e",
+                "stories",
+                "bench",
+                "benches",
+                "bundle",
+                "min",
+                "designer",
+                "pb",
+                "g",
+                "config",
+            ]
+            .contains(&s)
+        };
+        let stem = file.split('.').next().unwrap_or("");
+        !parts.iter().any(|s| {
+            s.is_empty()
+                || s.starts_with('.')
+                || excluded(s)
+                || s.split(['.', '-', '_']).any(excluded)
+        }) && parts.iter().any(|s| matches!(*s, "src" | "app" | "lib"))
+            && !file.starts_with('.')
+            && !file.split(['.', '-', '_']).any(excluded)
+            && !file.ends_with(".d.ts")
+            && !file.contains("generated")
+            && !["test", "spec", "fixture", "mock", "vendor", "generated"]
+                .iter()
+                .any(|s| {
+                    stem.starts_with(s)
+                        || stem.ends_with(s)
+                        || stem.trim_end_matches('s').ends_with(s)
+                })
+            && matches!(
+                file.rsplit('.').next(),
+                Some(
+                    "rs" | "ts"
+                        | "tsx"
+                        | "js"
+                        | "jsx"
+                        | "py"
+                        | "go"
+                        | "cpp"
+                        | "c"
+                        | "cs"
+                        | "java"
+                        | "swift"
+                        | "kt"
+                )
+            )
+    }
+
+    struct Repo {
+        root: PathBuf,
+        deadline: Instant,
+    }
+    trait Objects {
+        fn git(&self, args: &[&str]) -> Check<Vec<u8>>;
+        fn text(&self, args: &[&str]) -> Check<String> {
+            String::from_utf8(self.git(args)?).map_err(|_| GIT)
+        }
+    }
+    impl Objects for Repo {
+        fn git(&self, args: &[&str]) -> Check<Vec<u8>> {
+            if Instant::now() >= self.deadline {
+                return Err(GIT);
+            }
+            let mut cmd = quiet::command("git");
+            for (key, _) in std::env::vars_os() {
+                if key
+                    .to_string_lossy()
+                    .to_ascii_uppercase()
+                    .starts_with("GIT_")
+                {
+                    cmd.env_remove(key);
+                }
+            }
+            let null = if cfg!(windows) { "NUL" } else { "/dev/null" };
+            let mut child = cmd
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", null)
+                .env("GIT_ALLOW_PROTOCOL", "")
+                .env("GIT_NO_LAZY_FETCH", "1")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .args([
+                    "--no-pager",
+                    "--no-replace-objects",
+                    "--no-optional-locks",
+                    "--literal-pathspecs",
+                    "-C",
+                ])
+                .arg(&self.root)
+                .args([
+                    "-c",
+                    "core.fsmonitor=false",
+                    "-c",
+                    "core.hooksPath=",
+                    "-c",
+                    "core.commitGraph=false",
+                    "-c",
+                    "gc.auto=0",
+                ])
+                .args(args)
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .stdout(Stdio::piped())
+                .spawn()
+                .map_err(|_| GIT)?;
+            let pipe = child.stdout.take().ok_or(GIT)?;
+            let reader = std::thread::spawn(move || {
+                let mut out = Vec::new();
+                pipe.take(512 * 1024 + 1)
+                    .read_to_end(&mut out)
+                    .map_err(|_| GIT)?;
+                if out.len() > 512 * 1024 {
+                    Err(GIT)
+                } else {
+                    Ok(out)
+                }
+            });
+            let ok = loop {
+                match child.try_wait() {
+                    Ok(Some(s)) => break s.success(),
+                    Ok(None) if Instant::now() < self.deadline => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    _ => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break false;
+                    }
+                }
+            };
+            let out = reader.join().map_err(|_| GIT)??;
+            if ok {
+                Ok(out)
+            } else {
+                Err(GIT)
+            }
+        }
+    }
+
+    fn full_oid(id: &str) -> bool {
+        matches!(id.len(), 40 | 64) && id.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+
+    fn authored(old: &str, new: &str, edit: &Edit) -> bool {
+        if edit.old.is_empty() {
+            if !old.is_empty() || new != edit.new {
+                return false;
+            }
+        } else {
+            let Some((before, after)) = old.split_once(&edit.old) else {
+                return false;
+            };
+            if after.contains(&edit.old) || new != format!("{before}{}{after}", edit.new) {
+                return false;
+            }
+        }
+        // Prefer undercounting to awarding inline tests or generated code.
+        let lower = new.to_ascii_lowercase();
+        let previous = old.to_ascii_lowercase();
+        let prior_lines: HashSet<_> = edit.old.lines().map(str::trim).collect();
+        ![
+            "generated",
+            "#[cfg(test)]",
+            "#[test",
+            "mod tests",
+            "describe(",
+            " it(",
+            "test(",
+            "unittest",
+            "@test",
+            "#if debug",
+            "codegen",
+            "do not edit",
+        ]
+        .iter()
+        .any(|m| lower.contains(m) || previous.contains(m))
+            && edit.new.lines().any(|line| {
+                let t = line.trim();
+                !t.is_empty()
+                    && !["//", "/*", "*", "#", "<!--", "///"]
+                        .iter()
+                        .any(|p| t.starts_with(p))
+                    && !prior_lines.contains(t)
+            })
+    }
+
+    fn qualifies(repo: &impl Objects, id: &str, edits: &[Edit]) -> Check<bool> {
+        let parents = repo.text(&["rev-list", "--parents", "-n", "1", id, "--"])?;
+        match parents.split_whitespace().count() {
+            2 => {}
+            3.. => return Ok(false),
+            _ => return Err(AUTHOR),
+        }
+        let diff = repo.git(&[
+            "diff-tree",
+            "--no-commit-id",
+            "-r",
+            "--raw",
+            "--no-abbrev",
+            "--no-renames",
+            "--no-ext-diff",
+            "--no-textconv",
+            "-z",
+            id,
+            "--",
+        ])?;
+        let mut records = diff.strip_suffix(b"\0").unwrap_or(&diff).split(|b| *b == 0);
+        let mut app = false;
+        while let Some(header) = records.next() {
+            if header.is_empty() {
+                break;
+            }
+            let path = std::str::from_utf8(records.next().ok_or(GIT)?).map_err(|_| GIT)?;
+            if !source(path) {
+                continue;
+            }
+            let fields: Vec<_> = std::str::from_utf8(header)
+                .map_err(|_| GIT)?
+                .split(' ')
+                .collect();
+            let [old_mode, new_mode, old_id, new_id, change] = fields.as_slice() else {
+                return Err(GIT);
+            };
+            if !matches!(*new_mode, "100644" | "100755") || old_id == new_id {
+                continue;
+            }
+            app = true;
+            let added = *change == "A" && *old_mode == ":000000";
+            if !(added || *change == "M" && matches!(*old_mode, ":100644" | ":100755"))
+                || !full_oid(old_id)
+                || !full_oid(new_id)
+            {
+                continue;
+            }
+            if edits.iter().any(|e| e.path == path) {
+                let old = if added {
+                    String::new()
+                } else {
+                    repo.text(&["cat-file", "blob", old_id])?
+                };
+                let new = repo.text(&["cat-file", "blob", new_id])?;
+                if edits
+                    .iter()
+                    .filter(|e| e.path == path && e.old.is_empty() == added)
+                    .any(|e| authored(&old, &new, e))
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        if app {
+            Err(AUTHOR)
+        } else {
+            Ok(false)
+        }
+    }
+
+    fn inspect(session: &str, cwd: &str, agent: &str) -> Check<BTreeSet<String>> {
+        if session.is_empty()
+            || session.len() > 128
+            || !session
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            || !local_path(cwd)
+            || agent.is_empty()
+            || !public_symbol(agent)
+            || agent == "*"
+            || agent == "__unavailable__"
+        {
+            return Err(OWNER);
+        }
+        let home = copilot_home()
+            .map_err(|_| LOG)?
+            .join("session-state")
+            .canonicalize()
+            .map_err(|_| LOG)?;
+        let path = home.join(session).join("events.jsonl");
+        if path.canonicalize().map_err(|_| LOG)? != path {
+            return Err(LOG);
+        }
+        let file = fs::File::open(path).map_err(|_| LOG)?;
+        let meta = file.metadata().map_err(|_| LOG)?;
+        if !meta.is_file() || meta.len() > LIMIT as u64 {
+            return Err(LOG);
+        }
+        let mut bytes = Vec::new();
+        file.take(LIMIT as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| LOG)?;
+        if bytes.len() as u64 != meta.len() {
+            return Err(LOG);
+        }
+        let found = scan(&bytes, session, Path::new(cwd), agent)?;
+        let root = Path::new(cwd).canonicalize().map_err(|_| GIT)?;
+        if Path::new(&display_path(&root)) != Path::new(cwd) {
+            return Err(GIT);
+        }
+        let dot = root.join(".git");
+        if !dot.is_dir()
+            || dot.canonicalize().map_err(|_| GIT)? != dot
+            || [
+                "info/grafts",
+                "shallow",
+                "commondir",
+                "objects/info/alternates",
+                "objects/info/http-alternates",
+            ]
+            .iter()
+            .any(|s| !matches!(dot.join(s).try_exists(), Ok(false)))
+        {
+            return Err(GIT);
+        }
+        let repo = Repo {
+            root,
+            deadline: Instant::now() + Duration::from_secs(5),
+        };
+        verify(&repo, found)
+    }
+
+    fn verify(repo: &impl Objects, found: Vec<Candidate>) -> Check<BTreeSet<String>> {
+        if repo
+            .text(&[
+                "config",
+                "--local",
+                "--no-includes",
+                "--get",
+                "remote.origin.url",
+            ])?
+            .trim()
+            .is_empty()
+            || !repo
+                .text(&[
+                    "config",
+                    "--local",
+                    "--no-includes",
+                    "--get-all",
+                    "remote.origin.fetch",
+                ])?
+                .lines()
+                .any(|l| {
+                    matches!(
+                        l.trim_start_matches('+'),
+                        "refs/heads/*:refs/remotes/origin/*"
+                            | "refs/heads/main:refs/remotes/origin/main"
+                    )
+                })
+        {
+            return Err(GIT);
+        }
+        let main = repo.text(&["rev-parse", "--verify", "refs/remotes/origin/main"])?;
+        if !full_oid(main.trim()) {
+            return Err(GIT);
+        }
+        let history = repo.text(&["rev-list", "--max-count=4097", main.trim(), "--"])?;
+        let reachable: HashSet<_> = history.lines().collect();
+        let mut verified = BTreeSet::new();
+        for candidate in found {
+            let resolved =
+                repo.text(&["rev-parse", &format!("--disambiguate={}", candidate.id)])?;
+            let id = resolved.trim();
+            if !full_oid(id)
+                || !id.starts_with(&candidate.id)
+                || repo.text(&["cat-file", "-t", id])?.trim() != "commit"
+            {
+                return Err(GIT);
+            }
+            if !reachable.contains(id) {
+                if reachable.len() >= 4097 {
+                    return Err(GIT);
+                }
+                continue;
+            }
+            if !verified.contains(id) && qualifies(repo, id, &candidate.edits)? {
+                verified.insert(id.to_string());
+            }
+        }
+        Ok(verified)
+    }
+
+    pub fn read(session: &str, cwd: &str, agent: &str) -> Evidence {
+        match inspect(session, cwd, agent) {
+            Ok(ids) => Evidence {
+                status: if ids.is_empty() { "none" } else { "verified" },
+                points: ids.len(),
+                commits: ids.into_iter().collect(),
+                reason: SNAPSHOT.into(),
+            },
+            Err(reason) => Evidence {
+                status: "unknown",
+                commits: vec![],
+                points: 0,
+                reason: reason.into(),
+            },
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        fn root() -> &'static Path {
+            Path::new(if cfg!(windows) {
+                r"E:\example"
+            } else {
+                "/example"
+            })
+        }
+        fn events() -> Vec<Value> {
+            vec![
+                json!({"type":"session.start","data":{"sessionId":"abc","context":{"cwd":root(),"gitRoot":root()}}}),
+                json!({"type":"subagent.selected","data":{"agentName":"worker"}}),
+                json!({"type":"tool.execution_start","data":{"toolCallId":"a","toolName":"edit","arguments":{"path":root().join("src/core.rs"),"old_str":"1","new_str":"2"}}}),
+                json!({"type":"tool.execution_complete","data":{"toolCallId":"a","success":true,"fileEdits":[{"path":root().join("src/core.rs"),"kind":"edit"}]}}),
+                json!({"type":"tool.execution_start","data":{"toolCallId":"b","toolName":"powershell","arguments":{"command":format!("git -C '{}' commit -m 'update'",root().display())}}}),
+                json!({"type":"tool.execution_complete","data":{"toolCallId":"b","success":true,"shellExecution":{"exitCode":0},"result":{"content":"[main 1234567] update"}}}),
+            ]
+        }
+        fn parse(events: &[Value]) -> Check<Vec<Candidate>> {
+            let bytes = events
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            scan(bytes.as_bytes(), "abc", root(), "worker")
+        }
+        #[test]
+        fn joins_observed_start_result_and_edit_by_owner() {
+            let mut events = events();
+            let found = parse(&events).unwrap();
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].id, "1234567");
+            assert_eq!(found[0].edits.len(), 1);
+            events[3]["agentId"] = json!("child");
+            assert!(parse(&events).unwrap()[0].edits.is_empty());
+        }
+        #[test]
+        fn no_text_or_scope_shortcuts() {
+            for (i, field, v) in [
+                (0, "/data/sessionId", json!("other")),
+                (0, "/data/context/gitRoot", json!("elsewhere")),
+                (1, "/data/agentName", json!("Worker")),
+                (4, "/data/toolName", json!("custom")),
+                (4, "/data/arguments/command", json!("git commit -m message")),
+                (5, "/type", json!("assistant.message")),
+                (5, "/data/toolCallId", json!("other")),
+                (5, "/data/success", json!(false)),
+                (5, "/data/shellExecution/exitCode", json!(1)),
+                (5, "/data/result/content", json!("observed 1234567 in main")),
+            ] {
+                let mut e = events();
+                *e[i].pointer_mut(field).unwrap() = v;
+                assert!(parse(&e).is_err(), "{field}");
+            }
+            let mut e = events();
+            e[4]["data"]["parentToolCallId"] = json!("nested");
+            assert!(parse(&e).is_err());
+            let mut e = events();
+            e.insert(5, json!({"type":"subagent.deselected","data":{}}));
+            assert!(parse(&e).is_err());
+            let mut e = events();
+            e[4]["data"]["arguments"]["command"] = json!(format!(
+                "git -C '{}' commit -m ok && echo fake",
+                root().display()
+            ));
+            assert!(parse(&e).is_err());
+        }
+        #[test]
+        fn only_exact_application_blob_edits_count() {
+            let patch = patch_edit(
+                "*** Begin Patch\n*** Update File: src/core.rs\n@@\n-old\n+new\n*** End Patch",
+                root(),
+            )
+            .unwrap();
+            assert!(authored("a\nold\n", "a\nnew\n", &patch));
+            assert!(patch_edit(
+                "*** Begin Patch\n*** Add File: ../src/core.rs\n+new\n*** End Patch",
+                root()
+            )
+            .is_none());
+            for path in [
+                "docs/src/x.ts",
+                "src/vendor/x.ts",
+                "src/__tests__/x.rs",
+                "src/generated/x.ts",
+                "src/x.spec.ts",
+                "src/x_test.go",
+                "src/XTests.cs",
+                "src/x.fixture.js",
+                "src/x.min.js",
+                "src/x.pb.go",
+                "src/x.generated.cs",
+                "fixtures/src/x.ts",
+                "src/x.d.ts",
+                "src/readme.md",
+            ] {
+                assert!(!source(path), "{path}");
+            }
+            assert!(source("desktop/src/core.ts"));
+            let edit = Edit {
+                path: "src/core.ts".into(),
+                old: "1".into(),
+                new: "2".into(),
+            };
+            assert!(authored("return 1", "return 2", &edit));
+            assert!(!authored("return 1", "return 2 + other", &edit));
+            assert!(!authored(
+                "#[cfg(test)] return 1",
+                "#[cfg(test)] return 2",
+                &edit
+            ));
+            assert_eq!(read("../x", "invalid", "worker").status, "unknown");
+        }
+
+        #[test]
+        fn verifies_objects_ancestry_parent_count_authorship_and_dedup_without_writing_git() {
+            const C: &str = "1234567890123456789012345678901234567890";
+            const P: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+            const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+            struct Fixture {
+                kind: &'static str,
+                history: &'static str,
+                merge: bool,
+                path: &'static str,
+            }
+            impl Objects for Fixture {
+                fn git(&self, args: &[&str]) -> Check<Vec<u8>> {
+                    let out = match args {
+                        ["config", .., "remote.origin.url"] => "example".into(),
+                        ["config", .., "remote.origin.fetch"] => {
+                            "+refs/heads/*:refs/remotes/origin/*".into()
+                        }
+                        ["rev-parse", "--verify", "refs/remotes/origin/main"] => P.into(),
+                        ["rev-parse", "--disambiguate=1234567"] => C.into(),
+                        ["cat-file", "-t", C] => self.kind.into(),
+                        ["rev-list", "--max-count=4097", P, "--"] => self.history.into(),
+                        ["rev-list", "--parents", "-n", "1", C, "--"] => {
+                            if self.merge {
+                                format!("{C} {P} {B}")
+                            } else {
+                                format!("{C} {P}")
+                            }
+                        }
+                        ["diff-tree", ..] => format!(":100644 100644 {P} {B} M\0{}\0", self.path),
+                        ["cat-file", "blob", P] => "return 1".into(),
+                        ["cat-file", "blob", B] => "return 2".into(),
+                        _ => return Err(GIT),
+                    };
+                    Ok(out.into_bytes())
+                }
+            }
+            let mut repo = Fixture {
+                kind: "commit",
+                history: C,
+                merge: false,
+                path: "src/core.rs",
+            };
+            let candidates = || {
+                let mut f = parse(&events()).unwrap();
+                f.extend(parse(&events()).unwrap());
+                f
+            };
+            assert_eq!(verify(&repo, candidates()).unwrap().len(), 1);
+            repo.path = "src/other.rs";
+            assert_eq!(verify(&repo, candidates()), Err(AUTHOR));
+            repo.path = "src/core_test.rs";
+            assert!(verify(&repo, candidates()).unwrap().is_empty());
+            repo.path = "src/core.rs";
+            repo.merge = true;
+            assert!(verify(&repo, candidates()).unwrap().is_empty());
+            repo.merge = false;
+            repo.history = P;
+            assert!(verify(&repo, candidates()).unwrap().is_empty());
+            repo.kind = "tag";
+            assert_eq!(verify(&repo, candidates()), Err(GIT));
+        }
+    }
+}
+
+fn selected_agent_name(name: &str) -> &str {
+    match name.split_once(':') {
+        Some((ns, agent))
+            if ns
+                .strip_prefix("agency-rendered-")
+                .is_some_and(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())) =>
+        {
+            agent
+        }
+        _ => name,
     }
 }
 
@@ -639,19 +1821,7 @@ fn initial_history_agent(path: &Path) -> Result<Option<String>, Problem> {
                     .ok_or_else(|| {
                         Problem::plain("Some selected-agent records have no agent name.")
                     })?;
-                let name = match name.split_once(':') {
-                    Some((namespace, agent))
-                        if namespace
-                            .strip_prefix("agency-rendered-")
-                            .is_some_and(|suffix| {
-                                suffix.len() == 32
-                                    && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
-                            }) =>
-                    {
-                        agent
-                    }
-                    _ => name,
-                };
+                let name = selected_agent_name(name);
                 return Ok(Some(name.to_string()));
             }
             // --agent selection is recorded before the first assistant answer. Do not scan or
@@ -1307,7 +2477,7 @@ fn route_runtime_message<R: Runtime>(core: &Arc<RuntimeCore>, app: &AppHandle<R>
             if let Some(sender) = core.pending.lock().unwrap().remove(&id) {
                 let response = if let Some(error) = message.get("error") {
                     Err(Problem::with(
-                        "GitHub Copilot refused the request.",
+                        "GitHub Copilot returned a runtime error.",
                         error.to_string(),
                     ))
                 } else {
@@ -1839,7 +3009,7 @@ impl AcpConnection {
             }
             if let Some(error) = message.get("error") {
                 return Err(Problem::with(
-                    "GitHub Copilot refused the request.",
+                    "GitHub Copilot returned a runtime error.",
                     error.to_string(),
                 ));
             }
@@ -1868,27 +3038,29 @@ impl Drop for AcpConnection {
 
 pub fn status() -> Result<CopilotStatus, Problem> {
     let mut connection = AcpConnection::start()?;
-    let initialized = connection.request(0, "initialize", initialize_params(false))?;
-    let mut status = parse_status(&initialized)?;
+    let mut status = diagnostics::reading(None, Operation::AcpInitialize, || {
+        parse_status(&connection.request(0, "initialize", initialize_params(false))?)
+    })?;
 
     if status.capabilities.list_sessions {
-        match connection.request(1, "session/list", json!({})) {
-            Ok(result) => {
-                let sessions = result
-                    .get("sessions")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| {
-                        Problem::with(
-                            "GitHub Copilot returned an invalid session list.",
-                            result.to_string(),
-                        )
-                    })?;
+        let result = diagnostics::reading(None, Operation::AcpListSessions, || {
+            let result = connection.request(1, "session/list", json!({}))?;
+            let count = result
+                .get("sessions")
+                .and_then(Value::as_array)
+                .ok_or_else(|| Problem::plain("GitHub Copilot returned an invalid session list."))?
+                .len();
+            let more = result
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .is_some_and(|cursor| !cursor.is_empty());
+            Ok((count, more))
+        });
+        match result {
+            Ok((count, more)) => {
                 status.authentication = CopilotAuthentication::Ready;
-                status.session_count = sessions.len();
-                status.has_more_sessions = result
-                    .get("nextCursor")
-                    .and_then(Value::as_str)
-                    .is_some_and(|cursor| !cursor.is_empty());
+                status.session_count = count;
+                status.has_more_sessions = more;
             }
             Err(problem) if authentication_required(&problem) => {
                 status.authentication = CopilotAuthentication::Required;
@@ -1901,13 +3073,14 @@ pub fn status() -> Result<CopilotStatus, Problem> {
     if !warning.is_empty() {
         status.warnings.push(warning);
     }
+    status.observations = diagnostics::snapshot(None);
     Ok(status)
 }
 
 pub fn inventory(cwd: Option<String>) -> Result<CopilotInventory, Problem> {
     let cwd = workspace(cwd)?.cwd;
     let mut warnings = Vec::new();
-    let agents = match discover_agents() {
+    let mut agents = match discover_agents() {
         Ok((agents, agent_warnings)) => {
             warnings.extend(agent_warnings);
             agents
@@ -1917,10 +3090,30 @@ pub fn inventory(cwd: Option<String>) -> Result<CopilotInventory, Problem> {
             Vec::new()
         }
     };
+    let cloud = studio_catalog::catalog(false)?;
+    agents.extend(cloud.agents);
+    warnings.extend(cloud.warnings);
     let (plugins, skills, mcp) = std::thread::scope(|scope| {
-        let plugins = scope.spawn(|| run_json(["plugin", "list", "--json"], "plugins", &cwd));
-        let skills = scope.spawn(|| run_json(["skill", "list", "--json"], "skills", &cwd));
-        let mcp = scope.spawn(|| run_json(["mcp", "list", "--json"], "MCP servers", &cwd));
+        let plugins = scope.spawn(|| {
+            read_inventory(
+                "plugin",
+                "plugins",
+                &cwd,
+                Operation::ListPlugins,
+                parse_plugins,
+            )
+        });
+        let skills = scope
+            .spawn(|| read_inventory("skill", "skills", &cwd, Operation::ListSkills, parse_skills));
+        let mcp = scope.spawn(|| {
+            read_inventory(
+                "mcp",
+                "MCP servers",
+                &cwd,
+                Operation::ListMcp,
+                parse_mcp_servers,
+            )
+        });
         let failed = || Problem::plain("A Copilot resource reader stopped unexpectedly.");
         (
             plugins.join().unwrap_or_else(|_| Err(failed())),
@@ -1929,18 +3122,29 @@ pub fn inventory(cwd: Option<String>) -> Result<CopilotInventory, Problem> {
         )
     });
 
+    let mut observations = diagnostics::snapshot(Some(&cwd));
+    observations.extend(diagnostics::snapshot(None));
     Ok(CopilotInventory {
         agents,
-        plugins: resource_result(plugins, parse_plugins, &mut warnings),
-        skills: resource_result(skills, parse_skills, &mut warnings),
-        mcp_servers: resource_result(mcp, parse_mcp_servers, &mut warnings),
+        sources: cloud.sources,
+        plugins: resource_result(plugins, &mut warnings),
+        skills: resource_result(skills, &mut warnings),
+        mcp_servers: resource_result(mcp, &mut warnings),
         warnings,
+        observations,
     })
 }
 
 pub fn agents() -> Result<CopilotAgentCatalog, Problem> {
-    let (agents, warnings) = discover_agents()?;
-    Ok(CopilotAgentCatalog { agents, warnings })
+    let (mut agents, mut warnings) = discover_agents()?;
+    let cloud = studio_catalog::catalog(true)?;
+    agents.extend(cloud.agents);
+    warnings.extend(cloud.warnings);
+    Ok(CopilotAgentCatalog {
+        agents,
+        sources: cloud.sources,
+        warnings,
+    })
 }
 
 pub fn create_agent(
@@ -2047,25 +3251,28 @@ pub fn create_agent(
         name: name.into(),
         description: description.into(),
         model: None,
+        definition: Some(LocalDefinition {
+            file: path.to_string_lossy().into_owned(),
+            modified_at_unix: modified_at_unix(&path),
+            declared_id: None,
+            tools: Vec::new(),
+            omitted_entries: 0,
+        }),
+        source: None,
     })
 }
 
 fn resource_result<T>(
-    result: Result<(Value, Option<String>), Problem>,
-    parse: impl FnOnce(Value) -> Result<Vec<T>, Problem>,
+    result: Result<(Vec<T>, Option<String>), Problem>,
     warnings: &mut Vec<String>,
 ) -> Vec<T> {
-    let result = result.and_then(|(value, warning)| {
-        warnings.extend(warning);
-        parse(value)
-    });
     match result {
-        Ok(resources) => resources,
+        Ok((resources, warning)) => {
+            warnings.extend(warning);
+            resources
+        }
         Err(problem) => {
-            warnings.push(match problem.detail {
-                Some(detail) if !detail.is_empty() => format!("{}\n{detail}", problem.said),
-                _ => problem.said,
-            });
+            warnings.push(problem.said);
             Vec::new()
         }
     }
@@ -2096,7 +3303,7 @@ fn discover_agents() -> Result<(Vec<CopilotAgent>, Vec<String>), Problem> {
             }
         };
         let path = entry.path();
-        if !path.is_file()
+        if !entry.file_type().is_ok_and(|kind| kind.is_file())
             || path
                 .extension()
                 .and_then(|extension| extension.to_str())
@@ -2104,11 +3311,23 @@ fn discover_agents() -> Result<(Vec<CopilotAgent>, Vec<String>), Problem> {
         {
             continue;
         }
-        let mut bytes = Vec::new();
-        match fs::File::open(&path)
-            .and_then(|file| file.take(1024 * 1024 + 1).read_to_end(&mut bytes))
-        {
-            Ok(_) => {}
+        let text = match fs::File::open(&path).and_then(|file| {
+            // Stop at the closing delimiter; the instruction body is not card metadata.
+            let mut reader = BufReader::new(file.take(64 * 1024 + 1));
+            let mut header = String::new();
+            loop {
+                let offset = header.len();
+                if reader.read_line(&mut header)? == 0 {
+                    break;
+                }
+                let delimiter = header[offset..].trim_start_matches('\u{feff}').trim_end() == "---";
+                if (offset == 0 && !delimiter) || (offset > 0 && delimiter) {
+                    break;
+                }
+            }
+            Ok(header)
+        }) {
+            Ok(header) => header,
             Err(error) => {
                 warnings.push(format!(
                     "{} could not be read: {error}",
@@ -2116,31 +3335,12 @@ fn discover_agents() -> Result<(Vec<CopilotAgent>, Vec<String>), Problem> {
                 ));
                 continue;
             }
-        }
-        if bytes.len() > 1024 * 1024 {
-            warnings.push(format!(
-                "{} was ignored because its metadata file is larger than 1 MiB.",
-                entry.file_name().to_string_lossy()
-            ));
-            continue;
-        }
-        let text = match String::from_utf8(bytes) {
-            Ok(text) => text,
-            Err(error) => {
-                warnings.push(format!(
-                    "{} is not valid UTF-8: {error}",
-                    entry.file_name().to_string_lossy()
-                ));
-                continue;
-            }
         };
-        if let Some(agent) = parse_agent_definition(&text) {
-            if !agents
-                .iter()
-                .any(|found: &CopilotAgent| found.id == agent.id)
-            {
-                agents.push(agent);
+        if let Some(mut agent) = parse_agent_definition(&text, &path.to_string_lossy()) {
+            if let Some(definition) = &mut agent.definition {
+                definition.modified_at_unix = modified_at_unix(&path);
             }
+            agents.push(agent);
         } else {
             warnings.push(format!(
                 "{} has no valid agent name/description. Copilot will validate it when loading a session.",
@@ -2180,70 +3380,168 @@ fn user_home() -> Result<PathBuf, Problem> {
         })
 }
 
-fn parse_agent_definition(text: &str) -> Option<CopilotAgent> {
-    let lines = frontmatter_lines(text)?;
-    let id = frontmatter_value(&lines, "name")?;
-    let description = frontmatter_value(&lines, "description")?;
+fn modified_at_unix(path: &Path) -> Option<u64> {
+    fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|t| t.as_secs())
+}
+
+// Admit bounded display prose, not markup, connection strings or credential-like tokens.
+fn public_description(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= 1000
+        && value
+            .chars()
+            .all(|c| c.is_alphanumeric() || " .,;:!?()'’\"-/–—&".contains(c))
+        && !sensitive_metadata(value)
+}
+
+fn sensitive_metadata(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    [
+        "bearer ",
+        "basic ",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "credential",
+        "api key",
+        "api-key",
+        "apikey",
+        "api_key",
+        "private key",
+        "://",
+        "ghp_",
+        "github_pat_",
+        "xox",
+        "akia",
+        "eyj",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+        || lower
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+            .any(|word| word.starts_with("sk-") || (word.starts_with("asia") && word.len() == 20))
+        || value
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|part| part.len() >= 32)
+}
+
+fn parse_agent_definition(text: &str, file: &str) -> Option<CopilotAgent> {
+    use serde_yaml_ng::Value as Yaml;
+    let mut lines = text.trim_start_matches('\u{feff}').lines();
+    if lines.next()?.trim_end() != "---" {
+        return None;
+    }
+    let mut header = String::new();
+    loop {
+        let line = lines.next()?;
+        if line.trim_end() == "---" {
+            break;
+        }
+        header.push_str(line);
+        header.push('\n');
+        if header.len() > 64 * 1024 {
+            return None;
+        }
+    }
+    let fields: Yaml = serde_yaml_ng::from_str(&header).ok()?;
+    let scalar = |key: &str| nonempty(fields.get(key)?.as_str().map(str::to_owned));
+    let name = scalar("name")?;
+    let declared_id = scalar("id").filter(|id| public_symbol(id));
+    let mut definition = LocalDefinition {
+        file: file.into(),
+        modified_at_unix: None,
+        declared_id: declared_id.clone(),
+        tools: Vec::new(),
+        omitted_entries: 0,
+    };
+    let mut collect = |field: &str, values: Option<&Yaml>, server: Option<&str>| {
+        let Some(values) = values else { return };
+        let Some(items) = values.as_sequence() else {
+            definition.omitted_entries += 1;
+            return;
+        };
+        for item in items {
+            if let Some(name) = item.as_str().filter(|name| public_symbol(name)) {
+                definition.tools.push(DeclaredTool {
+                    name: name.into(),
+                    field: field.into(),
+                    server: server.map(str::to_owned),
+                });
+            } else {
+                definition.omitted_entries += 1;
+            }
+        }
+    };
+    collect("mcps", fields.get("mcps"), None);
+    if let Some(tools) = fields.get("tools") {
+        if tools.is_mapping() {
+            for level in ["required", "optional"] {
+                collect(&format!("tools.{level}"), tools.get(level), None);
+            }
+            if let Some(servers) = tools.get("mcp").and_then(Yaml::as_mapping) {
+                for (server, config) in servers {
+                    if let Some(server) = server.as_str().filter(|name| public_symbol(name)) {
+                        for level in ["required", "optional"] {
+                            collect(
+                                &format!("tools.mcp.{level}"),
+                                config.get(level),
+                                Some(server),
+                            );
+                        }
+                    }
+                }
+            }
+        } else {
+            collect("tools", Some(tools), None);
+        }
+    }
+    // Only keys, never configuration objects (which may contain commands or environment values).
+    for field in ["mcp-servers", "mcpServers"] {
+        if let Some(servers) = fields.get(field).and_then(Yaml::as_mapping) {
+            for server in servers.keys() {
+                if let Some(name) = server.as_str().filter(|s| public_symbol(s)) {
+                    definition.tools.push(DeclaredTool {
+                        name: name.into(),
+                        field: field.into(),
+                        server: None,
+                    });
+                } else {
+                    definition.omitted_entries += 1;
+                }
+            }
+        }
+    }
     Some(CopilotAgent {
-        name: id.clone(),
-        id,
-        description,
-        model: frontmatter_value(&lines, "model"),
+        // ACP selection and existing workspace history use the frontmatter name.
+        id: name.clone(),
+        name,
+        description: ["description", "purpose"]
+            .iter()
+            .find_map(|field| scalar(field).filter(|s| public_description(s)))
+            .unwrap_or_default(),
+        model: scalar("model").filter(|model| public_symbol(model)),
+        definition: Some(definition),
+        source: None,
     })
 }
 
-fn frontmatter_lines(text: &str) -> Option<Vec<&str>> {
-    let mut lines = text.trim_start_matches('\u{feff}').lines();
-    if lines.next()?.trim() != "---" {
-        return None;
-    }
-    let mut frontmatter = Vec::new();
-    for line in lines {
-        if line.trim() == "---" {
-            return Some(frontmatter);
-        }
-        frontmatter.push(line);
-    }
-    None
-}
-
-fn frontmatter_value(lines: &[&str], key: &str) -> Option<String> {
-    let prefix = format!("{key}:");
-    for (index, line) in lines.iter().enumerate() {
-        if line.len() != line.trim_start().len() || !line.starts_with(&prefix) {
-            continue;
-        }
-        let raw = line[prefix.len()..].trim();
-        if matches!(raw, ">" | ">-" | "|" | "|-") {
-            let mut parts = Vec::new();
-            for continuation in lines.iter().skip(index + 1) {
-                if continuation.trim().is_empty() {
-                    continue;
-                }
-                if continuation.len() == continuation.trim_start().len() {
-                    break;
-                }
-                parts.push(continuation.trim());
-            }
-            return nonempty(Some(if raw.starts_with('>') {
-                parts.join(" ")
-            } else {
-                parts.join("\n")
-            }));
-        }
-        return nonempty(Some(unquote_yaml_scalar(raw)));
-    }
-    None
-}
-
-fn unquote_yaml_scalar(value: &str) -> String {
-    if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
-        return value[1..value.len() - 1].replace("''", "'");
-    }
-    if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
-        return value[1..value.len() - 1].replace("\\\"", "\"");
-    }
-    value.to_string()
+fn public_symbol(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && (value == "*" || value.as_bytes()[0].is_ascii_alphanumeric())
+        && !value.contains("//")
+        && !value.contains("..")
+        && !sensitive_metadata(value)
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_.-/*:".contains(&b))
 }
 
 pub fn login() -> Result<CopilotStatus, Problem> {
@@ -2265,35 +3563,33 @@ pub fn login() -> Result<CopilotStatus, Problem> {
     status()
 }
 
-fn run_json<const N: usize>(
-    args: [&str; N],
+fn read_inventory<T>(
+    resource: &str,
     label: &str,
     cwd: &str,
-) -> Result<(Value, Option<String>), Problem> {
-    let output = quiet::command("copilot")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .map_err(|error| {
-            Problem::with(
-                format!("Darbot could not read GitHub Copilot {label}."),
-                error.to_string(),
-            )
+    operation: Operation,
+    parse: impl FnOnce(Value) -> Result<Vec<T>, Problem>,
+) -> Result<(Vec<T>, Option<String>), Problem> {
+    diagnostics::reading(Some(cwd), operation, || {
+        let output = quiet::command("copilot")
+            .args([resource, "list", "--json"])
+            .current_dir(cwd)
+            .output()
+            .map_err(|_| {
+                Problem::plain(format!("Darbot could not read GitHub Copilot {label}."))
+            })?;
+        if !output.status.success() {
+            return Err(Problem::plain(format!(
+                "GitHub Copilot could not list {label}."
+            )));
+        }
+        let value = serde_json::from_slice(&output.stdout).map_err(|_| {
+            Problem::plain(format!("GitHub Copilot returned invalid {label} data."))
         })?;
-    let warning = quiet::said(&output.stderr);
-    if !output.status.success() {
-        return Err(Problem::with(
-            format!("GitHub Copilot could not list {label}."),
-            warning,
-        ));
-    }
-    let value = serde_json::from_slice(&output.stdout).map_err(|error| {
-        Problem::with(
-            format!("GitHub Copilot returned invalid {label} data."),
-            error.to_string(),
-        )
-    })?;
-    Ok((value, (!warning.is_empty()).then_some(warning)))
+        let warning = (!output.stderr.is_empty())
+            .then(|| format!("GitHub Copilot reported a warning while listing {label}."));
+        Ok((parse(value)?, warning))
+    })
 }
 
 fn parse_status(initialized: &Value) -> Result<CopilotStatus, Problem> {
@@ -2351,6 +3647,7 @@ fn parse_status(initialized: &Value) -> Result<CopilotStatus, Problem> {
         session_count: 0,
         has_more_sessions: false,
         warnings: Vec::new(),
+        observations: Observations::new(),
     })
 }
 
@@ -2476,6 +3773,1447 @@ fn authentication_required(problem: &Problem) -> bool {
 
 fn nonempty(value: Option<String>) -> Option<String> {
     value.and_then(|value| (!value.trim().is_empty()).then_some(value))
+}
+
+mod studio_catalog {
+    use super::*;
+    use reqwest::blocking::Client;
+    use reqwest::Url;
+    use std::sync::OnceLock;
+    use std::time::UNIX_EPOCH;
+
+    const CONFIG_LIMIT: usize = 128 * 1024;
+    const CACHE_LIMIT: usize = 16 * 1024 * 1024;
+    const RESPONSE_LIMIT: usize = 2 * 1024 * 1024;
+    const TOKEN_LIMIT: usize = 128 * 1024;
+    const MAX_PAGES: usize = 1000;
+    const MAX_AGENTS: usize = 100_000;
+    const BOTS_PATH: &str = "/api/data/v9.2/bots";
+    const BOT_SELECT: &str = "botid,name,schemaname,modifiedon,statecode,description";
+    const STALE_SECONDS: u64 = 3600;
+
+    fn approved_assets(source: &SourceConfig) -> bool {
+        source.asset_inventory
+    }
+
+    #[derive(Copy, Clone)]
+    struct Projection {
+        operation: Operation,
+        path: &'static str,
+        select: &'static str,
+        id: &'static str,
+        filter: Option<&'static str>,
+    }
+
+    const BOTS: Projection = Projection {
+        operation: Operation::Bots,
+        path: BOTS_PATH,
+        select: BOT_SELECT,
+        id: "botid",
+        filter: None,
+    };
+    // Dataverse Web API references: workflow, canvasapp and appmodule. Exclude
+    // process activations, templates, dialogs, business rules and actions.
+    const ASSETS: [(&str, &str, Projection); 3] = [
+        ("workflow", "name", Projection {
+            operation: Operation::Workflows,
+            path: "/api/data/v9.2/workflows", select: "workflowid,name", id: "workflowid",
+            filter: Some("type eq 1 and (category eq 0 or category eq 4 or category eq 5 or category eq 6 or category eq 7)"),
+        }),
+        ("canvas-app", "displayname", Projection {
+            operation: Operation::CanvasApps,
+            path: "/api/data/v9.2/canvasapps", select: "canvasappid,displayname", id: "canvasappid", filter: None,
+        }),
+        ("model-driven-app", "name", Projection {
+            operation: Operation::ModelDrivenApps,
+            path: "/api/data/v9.2/appmodules", select: "appmoduleid,name", id: "appmoduleid", filter: None,
+        }),
+    ];
+
+    fn asset_reason(failure: Failure) -> &'static str {
+        match failure {
+            Failure::Forbidden => "HTTP 403",
+            Failure::Unauthorized => "HTTP 401",
+            Failure::NotFound => "HTTP 404",
+            Failure::Retryable => "HTTP 429 or 5xx",
+            Failure::Http => "unexpected HTTP status",
+            Failure::Network => "network failure",
+            Failure::Limit => "collection limit exceeded",
+            Failure::Pagination => "invalid pagination",
+            _ => "invalid metadata",
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum Failure {
+        Config,
+        ConfigChanged,
+        Cache,
+        CacheWrite,
+        CliMissing,
+        Cli,
+        CliTimeout,
+        Token,
+        Tenant,
+        Account,
+        Identity,
+        Network,
+        Unauthorized,
+        Forbidden,
+        NotFound,
+        Retryable,
+        Http,
+        Response,
+        Pagination,
+        Limit,
+        Aged,
+        Unsupported,
+    }
+
+    impl Failure {
+        fn message(self) -> &'static str {
+            match self {
+                Self::Config => "Copilot Studio configuration is invalid or unreadable. Check studio-sources.json schema, unique sources, GUIDs, account and public Dataverse root URLs.",
+                Self::ConfigChanged => "Copilot Studio configuration changed during discovery. Refresh again; results for the previous configuration were discarded.",
+                Self::Cache => "The Copilot Studio cache is invalid or unreadable. Refresh the catalog to rebuild it.",
+                Self::CacheWrite => "The Copilot Studio catalog could not be saved atomically (16 MiB limit). Check app-data permissions and refresh again.",
+                Self::CliMissing => "Azure CLI was not found in an absolute PATH directory. Install Azure CLI, then refresh.",
+                Self::Cli => "Azure CLI could not obtain a token. Verify the configured subscription and existing signed-in account, then refresh. Darbot does not change accounts or sign in automatically.",
+                Self::CliTimeout => "Azure CLI token acquisition exceeded 60 seconds. Check Azure CLI outside Darbot, then refresh.",
+                Self::Token => "Azure CLI returned an invalid token response. Verify Azure CLI authentication, then refresh.",
+                Self::Tenant => "Azure CLI returned a different tenant. Verify the configured subscription and tenant; no fallback account was used.",
+                Self::Account => "Dataverse authenticated a different account. Verify the configured account and subscription; no fallback account was used.",
+                Self::Identity => "Dataverse identity verification failed. Verify access to the configured environment, then refresh.",
+                Self::Network => "Dataverse could not be reached within the network timeout. Check connectivity, then refresh.",
+                Self::Unauthorized => "Dataverse returned HTTP 401. Renew the configured Azure CLI authentication outside Darbot, then refresh.",
+                Self::Forbidden => "Dataverse returned HTTP 403. Request read access to this environment and its bots, then refresh.",
+                Self::NotFound => "Dataverse returned HTTP 404. Verify the environment URL and Dataverse API availability.",
+                Self::Retryable => "Dataverse returned HTTP 429 or 5xx. The service is busy; wait and refresh again.",
+                Self::Http => "Dataverse returned an unexpected HTTP status or redirect. Verify the environment URL and access.",
+                Self::Response => "Dataverse returned invalid bot metadata. Refresh again; the previous complete snapshot was retained.",
+                Self::Pagination => "Dataverse returned unsafe, repeated or conflicting pagination. The incomplete snapshot was discarded.",
+                Self::Limit => "Dataverse exceeded the bounded response, page or agent limit. The incomplete snapshot was discarded.",
+                Self::Aged => "This Copilot Studio snapshot is more than one hour old. Refresh the catalog.",
+                Self::Unsupported => "Copilot Studio catalog configuration requires Windows LOCALAPPDATA.",
+            }
+        }
+
+        fn problem(self) -> Problem {
+            Problem::plain(self.message())
+        }
+
+        fn known_message(message: &str) -> bool {
+            [
+                Self::Config,
+                Self::ConfigChanged,
+                Self::Cache,
+                Self::CacheWrite,
+                Self::CliMissing,
+                Self::Cli,
+                Self::CliTimeout,
+                Self::Token,
+                Self::Tenant,
+                Self::Account,
+                Self::Identity,
+                Self::Network,
+                Self::Unauthorized,
+                Self::Forbidden,
+                Self::NotFound,
+                Self::Retryable,
+                Self::Http,
+                Self::Response,
+                Self::Pagination,
+                Self::Limit,
+                Self::Aged,
+                Self::Unsupported,
+            ]
+            .iter()
+            .any(|failure| failure.message() == message)
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub(super) struct SourceConfig {
+        pub(super) tenant_id: String,
+        pub(super) environment_id: String,
+        pub(super) environment_name: String,
+        pub(super) environment_url: String,
+        pub(super) subscription_id: String,
+        pub(super) account: String,
+        #[serde(default)]
+        asset_inventory: bool,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub(super) struct Config {
+        schema_version: u32,
+        pub(super) sources: Vec<SourceConfig>,
+    }
+
+    #[derive(Clone, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub(super) struct Snapshot {
+        pub(super) config: SourceConfig,
+        pub(super) agents: Vec<CopilotAgent>,
+        pub(super) status: StudioSourceStatus,
+    }
+
+    #[derive(Default, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    pub(super) struct Cache {
+        pub(super) schema_version: u32,
+        pub(super) sources: Vec<Snapshot>,
+    }
+
+    pub(super) fn guid(value: &str) -> Result<String, Failure> {
+        if value.len() != 36
+            || !value.bytes().enumerate().all(|(index, ch)| {
+                if matches!(index, 8 | 13 | 18 | 23) {
+                    ch == b'-'
+                } else {
+                    ch.is_ascii_hexdigit()
+                }
+            })
+        {
+            return Err(Failure::Config);
+        }
+        Ok(value.to_ascii_lowercase())
+    }
+
+    fn text(value: &str, max: usize) -> bool {
+        !value.trim().is_empty() && value.len() <= max && !value.chars().any(|ch| ch.is_control())
+    }
+
+    fn account(value: &str) -> bool {
+        text(value, 320)
+            && value.bytes().all(|ch| {
+                ch.is_ascii_alphanumeric() || matches!(ch, b'@' | b'.' | b'_' | b'-' | b'+' | b'#')
+            })
+    }
+
+    fn root_url(value: &str) -> Result<String, Failure> {
+        // Validate the original spelling too: URL parsers normalize backslashes and dot segments.
+        let authority = value
+            .strip_prefix("https://")
+            .ok_or(Failure::Config)?
+            .strip_suffix('/')
+            .unwrap_or_else(|| value.strip_prefix("https://").unwrap());
+        let host = authority.strip_suffix(":443").unwrap_or(authority);
+        if host.len() > 253
+            || !host.to_ascii_lowercase().ends_with(".crm.dynamics.com")
+            || !host.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && label.as_bytes()[0].is_ascii_alphanumeric()
+                    && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+                    && label
+                        .bytes()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == b'-')
+            })
+        {
+            return Err(Failure::Config);
+        }
+        let parsed = Url::parse(value).map_err(|_| Failure::Config)?;
+        if parsed.scheme() != "https"
+            || parsed.path() != "/"
+            || parsed.port().is_some()
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+            || parsed.query().is_some()
+            || parsed.fragment().is_some()
+        {
+            return Err(Failure::Config);
+        }
+        Ok(format!("https://{}", host.to_ascii_lowercase()))
+    }
+
+    fn normalize_source(source: &mut SourceConfig) -> Result<(), Failure> {
+        source.tenant_id = guid(&source.tenant_id)?;
+        source.environment_id = guid(&source.environment_id)?;
+        source.subscription_id = guid(&source.subscription_id)?;
+        if !text(&source.environment_name, 256) || !account(&source.account) {
+            return Err(Failure::Config);
+        }
+        source.account = source.account.to_ascii_lowercase();
+        source.environment_url = root_url(&source.environment_url)?;
+        Ok(())
+    }
+
+    pub(super) fn parse_config(bytes: &[u8]) -> Result<Config, Failure> {
+        if bytes.len() > CONFIG_LIMIT {
+            return Err(Failure::Config);
+        }
+        let mut config: Config = serde_json::from_slice(bytes).map_err(|_| Failure::Config)?;
+        if config.schema_version != 1 || config.sources.len() > 100 {
+            return Err(Failure::Config);
+        }
+        let mut identities = HashSet::new();
+        let mut urls = HashSet::new();
+        for source in &mut config.sources {
+            normalize_source(source)?;
+            if !identities.insert((source.tenant_id.clone(), source.environment_id.clone()))
+                || !urls.insert(source.environment_url.clone())
+            {
+                return Err(Failure::Config);
+            }
+        }
+        Ok(config)
+    }
+
+    pub(super) fn scoped_id(config: &SourceConfig, bot_id: &str) -> String {
+        format!(
+            "studio:{}:{}:{}",
+            config.tenant_id, config.environment_id, bot_id
+        )
+        .to_ascii_lowercase()
+    }
+
+    fn status(config: &SourceConfig, now: Option<u64>) -> StudioSourceStatus {
+        StudioSourceStatus {
+            tenant_id: config.tenant_id.clone(),
+            environment_id: config.environment_id.clone(),
+            environment_name: config.environment_name.clone(),
+            environment_url: config.environment_url.clone(),
+            state: if now.is_some() {
+                "ready"
+            } else {
+                "unavailable"
+            }
+            .into(),
+            agent_count: 0,
+            last_synced_at: now,
+            error: None,
+            assets: None,
+            asset_warnings: Vec::new(),
+            observations: Observations::new(),
+        }
+    }
+
+    fn read_bounded(
+        path: &Path,
+        limit: usize,
+        failure: Failure,
+    ) -> Result<Option<Vec<u8>>, Failure> {
+        let file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(failure),
+        };
+        let mut bytes = Vec::new();
+        file.take(limit as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| failure)?;
+        if bytes.len() > limit {
+            return Err(failure);
+        }
+        Ok(Some(bytes))
+    }
+
+    fn cache_write(path: &Path, cache: &Cache) -> Result<(), Failure> {
+        let content = serde_json::to_string(cache).map_err(|_| Failure::CacheWrite)?;
+        if content.len() > CACHE_LIMIT {
+            return Err(Failure::CacheWrite);
+        }
+        // Reuse the approved atomic writer when its 1 MiB text limit permits.
+        if content.len() <= 1024 * 1024 {
+            return copilot_files::write(path, &content).map_err(|_| Failure::CacheWrite);
+        }
+        // Larger catalogs use the same sibling-file, sync and rename protocol.
+        let parent = path.parent().ok_or(Failure::CacheWrite)?;
+        let temporary = parent.join(format!(".studio-catalog-{:032x}", rand::random::<u128>()));
+        let result = (|| {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)?;
+            if let Ok(metadata) = fs::metadata(path) {
+                file.set_permissions(metadata.permissions())?;
+            }
+            file.write_all(content.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            fs::rename(&temporary, path)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result.map_err(|_: std::io::Error| Failure::CacheWrite)
+    }
+
+    pub(super) fn validate_snapshot(snapshot: &Snapshot, now: u64) -> Result<(), Failure> {
+        let mut config = snapshot.config.clone();
+        normalize_source(&mut config).map_err(|_| Failure::Cache)?;
+        if config != snapshot.config || snapshot.agents.len() > MAX_AGENTS {
+            return Err(Failure::Cache);
+        }
+        let actual = &snapshot.status;
+        for (&op, history) in &actual.observations {
+            let allowed = matches!(
+                op,
+                Operation::Identity | Operation::VerifyAccount | Operation::Bots
+            ) || (approved_assets(&config)
+                && ASSETS.iter().any(|(_, _, q)| q.operation == op));
+            let valid = |call: diagnostics::Call| {
+                call.at_unix_ms > 0
+                    && call.at_unix_ms / 1000 <= now.saturating_add(300)
+                    && call.http_status.is_none_or(|s| (100..=599).contains(&s))
+                    && (!call.succeeded || call.http_status == Some(200))
+            };
+            if !allowed
+                || !valid(history.last_call)
+                || history
+                    .last_success
+                    .is_some_and(|c| !valid(c) || !c.succeeded)
+                || history
+                    .last_failure
+                    .is_some_and(|c| !valid(c) || c.succeeded)
+                || Some(history.last_call)
+                    != if history.last_call.succeeded {
+                        history.last_success
+                    } else {
+                        history.last_failure
+                    }
+            {
+                return Err(Failure::Cache);
+            }
+        }
+        if actual.assets.is_some() || !actual.asset_warnings.is_empty() {
+            if !approved_assets(&config) || actual.last_synced_at.is_none() {
+                return Err(Failure::Cache);
+            }
+            let mut failed = HashSet::new();
+            for warning in &actual.asset_warnings {
+                let (kind, reason) = warning.split_once(": ").ok_or(Failure::Cache)?;
+                if !ASSETS.iter().any(|entry| entry.0 == kind)
+                    || !failed.insert(kind)
+                    || ![
+                        Failure::Forbidden,
+                        Failure::Unauthorized,
+                        Failure::NotFound,
+                        Failure::Retryable,
+                        Failure::Http,
+                        Failure::Network,
+                        Failure::Limit,
+                        Failure::Pagination,
+                        Failure::Response,
+                    ]
+                    .iter()
+                    .any(|&f| asset_reason(f) == reason)
+                {
+                    return Err(Failure::Cache);
+                }
+            }
+            if actual.assets.is_none() != (failed.len() == ASSETS.len()) {
+                return Err(Failure::Cache);
+            }
+            let mut ids = HashSet::new();
+            for asset in actual.assets.iter().flatten() {
+                if !ASSETS.iter().any(|entry| entry.0 == asset.kind)
+                    || failed.contains(asset.kind.as_str())
+                    || !text(&asset.name, 1024)
+                    || guid(&asset.id).ok().as_ref() != Some(&asset.id)
+                    || !ids.insert((&asset.kind, &asset.id))
+                    || ids.len() > ASSETS.len() * MAX_AGENTS
+                {
+                    return Err(Failure::Cache);
+                }
+            }
+        }
+        let expected = status(&config, actual.last_synced_at);
+        if actual.tenant_id != expected.tenant_id
+            || actual.environment_id != expected.environment_id
+            || actual.environment_name != expected.environment_name
+            || actual.environment_url != expected.environment_url
+            || actual.agent_count != snapshot.agents.len()
+            || actual
+                .error
+                .as_deref()
+                .is_some_and(|error| !Failure::known_message(error))
+        {
+            return Err(Failure::Cache);
+        }
+        match (actual.state.as_str(), actual.last_synced_at) {
+            ("ready", Some(timestamp))
+                if timestamp > 0 && timestamp <= now + 300 && actual.error.is_none() => {}
+            ("stale", Some(timestamp))
+                if timestamp > 0 && timestamp <= now + 300 && actual.error.is_some() => {}
+            ("unavailable", None) if snapshot.agents.is_empty() && actual.error.is_some() => {}
+            _ => return Err(Failure::Cache),
+        }
+        let mut ids = HashSet::new();
+        for agent in &snapshot.agents {
+            let source = agent.source.as_ref().ok_or(Failure::Cache)?;
+            if source.provider != "copilot-studio"
+                || source.tenant_id != config.tenant_id
+                || source.environment_id != config.environment_id
+                || source.environment_name != config.environment_name
+                || source.environment_url != config.environment_url
+                || guid(&source.bot_id).map_err(|_| Failure::Cache)? != source.bot_id
+                || agent.id != scoped_id(&config, &source.bot_id)
+                || !ids.insert(&agent.id)
+                || !text(&agent.name, 1024)
+                || !text(&source.schema_name, 512)
+                || source
+                    .declared_description
+                    .as_deref()
+                    .is_some_and(|s| !public_description(s))
+                || !timestamp(&source.modified_at)
+                || !matches!(source.state_code, 0 | 1)
+                || Some(source.last_synced_at) != actual.last_synced_at
+                || agent.model.is_some()
+                || agent.definition.is_some()
+                || agent.description != format!("Copilot Studio · {}", config.environment_name)
+            {
+                return Err(Failure::Cache);
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn matching_snapshot(
+        cache: &Cache,
+        config: &SourceConfig,
+        now: u64,
+    ) -> Result<Option<Snapshot>, Failure> {
+        let mut matches = cache
+            .sources
+            .iter()
+            .filter(|snapshot| &snapshot.config == config);
+        let Some(snapshot) = matches.next() else {
+            return Ok(None);
+        };
+        if matches.next().is_some() {
+            return Err(Failure::Cache);
+        }
+        validate_snapshot(snapshot, now)?;
+        let mut snapshot = snapshot.clone();
+        if snapshot.status.state == "ready"
+            && snapshot
+                .status
+                .last_synced_at
+                .is_some_and(|time| now.saturating_sub(time) > STALE_SECONDS)
+        {
+            snapshot.status.state = "stale".into();
+            snapshot.status.error = Some(Failure::Aged.message().into());
+        }
+        Ok(Some(snapshot))
+    }
+
+    pub(super) fn refreshed(
+        config: &SourceConfig,
+        previous: Option<Snapshot>,
+        result: Result<Vec<CopilotAgent>, Failure>,
+        now: u64,
+    ) -> Snapshot {
+        match result {
+            Ok(agents) => {
+                let mut status = status(config, Some(now));
+                status.agent_count = agents.len();
+                Snapshot {
+                    config: config.clone(),
+                    agents,
+                    status,
+                }
+            }
+            Err(error) => {
+                let mut snapshot = previous.unwrap_or_else(|| Snapshot {
+                    config: config.clone(),
+                    agents: Vec::new(),
+                    status: status(config, None),
+                });
+                snapshot.status.state = if snapshot.status.last_synced_at.is_some() {
+                    "stale"
+                } else {
+                    "unavailable"
+                }
+                .into();
+                snapshot.status.error = Some(error.message().into());
+                snapshot
+            }
+        }
+    }
+
+    fn data_directory() -> Result<PathBuf, Failure> {
+        if !cfg!(windows) {
+            return Err(Failure::Unsupported);
+        }
+        let root = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .filter(|root| root.is_absolute())
+            .ok_or(Failure::Unsupported)?;
+        Ok(root.join("ai.darbotlm.darbot.desktop"))
+    }
+
+    fn now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    const CACHE_SCHEMA: u32 = 2;
+
+    fn decode_cache(bytes: &[u8]) -> Result<Cache, Failure> {
+        // v1 has catalog sync times and coarse warnings, not call times or durations.
+        // Its absent observations map stays empty, including for a cached HTTP 403.
+        let mut cache: Cache = serde_json::from_slice(bytes).map_err(|_| Failure::Cache)?;
+        if !matches!(cache.schema_version, 1 | CACHE_SCHEMA) || cache.sources.len() > 100 {
+            return Err(Failure::Cache);
+        }
+        cache.schema_version = CACHE_SCHEMA;
+        Ok(cache)
+    }
+
+    pub(super) fn catalog(refresh: bool) -> Result<CopilotAgentCatalog, Problem> {
+        // Studio configuration is Windows-only; unconfigured platforms keep local discovery.
+        if !cfg!(windows) {
+            return Ok(CopilotAgentCatalog {
+                agents: Vec::new(),
+                sources: Vec::new(),
+                warnings: Vec::new(),
+            });
+        }
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _lock = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .map_err(|_| Failure::Cache.problem())?;
+        let directory = data_directory().map_err(Failure::problem)?;
+        let Some(bytes) = read_bounded(
+            &directory.join("studio-sources.json"),
+            CONFIG_LIMIT,
+            Failure::Config,
+        )
+        .map_err(Failure::problem)?
+        else {
+            return Ok(CopilotAgentCatalog {
+                agents: Vec::new(),
+                sources: Vec::new(),
+                warnings: Vec::new(),
+            });
+        };
+        let config = parse_config(&bytes).map_err(Failure::problem)?;
+        let path = directory.join("studio-catalog.json");
+        let mut warnings = Vec::new();
+        let cache = read_bounded(&path, CACHE_LIMIT, Failure::Cache)
+            .and_then(|bytes| match bytes {
+                None => Ok(Cache {
+                    schema_version: CACHE_SCHEMA,
+                    sources: Vec::new(),
+                }),
+                Some(bytes) => decode_cache(&bytes),
+            })
+            .unwrap_or_else(|error| {
+                warnings.push(error.message().into());
+                Cache::default()
+            });
+        let mut next = Cache {
+            schema_version: CACHE_SCHEMA,
+            sources: Vec::new(),
+        };
+        for source in &config.sources {
+            let previous = matching_snapshot(&cache, source, now()).unwrap_or_else(|error| {
+                warnings.push(error.message().into());
+                None
+            });
+            let snapshot = match previous {
+                Some(snapshot) if !refresh => snapshot,
+                previous => {
+                    let synced_at = now();
+                    refresh_with(source, previous, synced_at, |rows| {
+                        fetch_source(source, synced_at, rows)
+                    })
+                }
+            };
+            next.sources.push(snapshot);
+        }
+        let current = read_bounded(
+            &directory.join("studio-sources.json"),
+            CONFIG_LIMIT,
+            Failure::Config,
+        )
+        .map_err(Failure::problem)?
+        .ok_or_else(|| Failure::ConfigChanged.problem())?;
+        if parse_config(&current).map_err(Failure::problem)?.sources != config.sources {
+            return Err(Failure::ConfigChanged.problem());
+        }
+        // Always write only currently configured identities: removed sources/account snapshots
+        // must not survive a successful cache reconciliation.
+        if let Err(error) = cache_write(&path, &next) {
+            warnings.push(error.message().into());
+        }
+        let mut result = CopilotAgentCatalog {
+            agents: Vec::new(),
+            sources: Vec::new(),
+            warnings,
+        };
+        for snapshot in next.sources {
+            if let Some(error) = &snapshot.status.error {
+                result.warnings.push(format!(
+                    "Copilot Studio · {}: {error}",
+                    snapshot.config.environment_name
+                ));
+            }
+            result.agents.extend(snapshot.agents);
+            result.sources.push(snapshot.status);
+        }
+        Ok(result)
+    }
+
+    fn azure_command(config: &SourceConfig) -> Result<std::process::Command, Failure> {
+        #[cfg(windows)]
+        {
+            // Azure's Windows MSI launcher uses wbin\..\python.exe. Invoking that
+            // interpreter directly avoids shell quoting/injection and leaves one killable process.
+            let paths = std::env::var_os("PATH").ok_or(Failure::CliMissing)?;
+            for directory in std::env::split_paths(&paths).filter(|path| path.is_absolute()) {
+                if directory.join("az.cmd").is_file() {
+                    let python = directory
+                        .parent()
+                        .ok_or(Failure::CliMissing)?
+                        .join("python.exe");
+                    if !python.is_file() {
+                        continue;
+                    }
+                    let mut command = quiet::command(python);
+                    command.args(["-IBm", "azure.cli"]);
+                    command.env("AZ_INSTALLER", "MSI");
+                    token_args(&mut command, config);
+                    return Ok(command);
+                }
+                let executable = directory.join("az.exe");
+                if executable.is_file() {
+                    let mut command = quiet::command(executable);
+                    token_args(&mut command, config);
+                    return Ok(command);
+                }
+            }
+            Err(Failure::CliMissing)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = config;
+            Err(Failure::Unsupported)
+        }
+    }
+
+    pub(super) fn token_args(command: &mut std::process::Command, config: &SourceConfig) {
+        command.args([
+            "account",
+            "get-access-token",
+            "--subscription",
+            &config.subscription_id,
+            "--resource",
+            &config.environment_url,
+            "--output",
+            "json",
+            "--only-show-errors",
+        ]);
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+    }
+
+    #[derive(Deserialize)]
+    struct TokenResponse {
+        tenant: String,
+        #[serde(rename = "accessToken")]
+        access_token: String,
+    }
+
+    pub(super) fn parse_token(bytes: &[u8], config: &SourceConfig) -> Result<String, Failure> {
+        if bytes.len() > TOKEN_LIMIT {
+            return Err(Failure::Token);
+        }
+        let response: TokenResponse = serde_json::from_slice(bytes).map_err(|_| Failure::Token)?;
+        if guid(&response.tenant).map_err(|_| Failure::Token)? != config.tenant_id {
+            return Err(Failure::Tenant);
+        }
+        if response.access_token.len() < 16
+            || response.access_token.len() > 64 * 1024
+            || !response
+                .access_token
+                .bytes()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, b'.' | b'_' | b'-'))
+        {
+            return Err(Failure::Token);
+        }
+        Ok(response.access_token)
+    }
+
+    fn token(config: &SourceConfig) -> Result<String, Failure> {
+        let mut command = azure_command(config)?;
+        let mut child = command.spawn().map_err(|_| Failure::Cli)?;
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(Failure::Cli);
+        };
+        let (sender, receiver) = mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let result = stdout.take(TOKEN_LIMIT as u64 + 1).read_to_end(&mut bytes);
+            let _ = sender.send(result.map(|_| bytes));
+        });
+        let started = Instant::now();
+        let result = loop {
+            if started.elapsed() >= Duration::from_secs(60) {
+                break Err(Failure::CliTimeout);
+            }
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => {
+                    let remaining = Duration::from_secs(60).saturating_sub(started.elapsed());
+                    break receiver
+                        .recv_timeout(remaining)
+                        .map_err(|_| Failure::CliTimeout)
+                        .and_then(|bytes| bytes.map_err(|_| Failure::Cli))
+                        .and_then(|bytes| parse_token(&bytes, config));
+                }
+                Ok(Some(_)) | Err(_) => break Err(Failure::Cli),
+                Ok(None) => std::thread::sleep(Duration::from_millis(50)),
+            }
+        };
+        if result.is_err() {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+        result
+    }
+
+    struct Dataverse<'a> {
+        client: Client,
+        token: &'a str,
+        observations: &'a mut Observations,
+    }
+
+    impl Dataverse<'_> {
+        fn get<T>(
+            &mut self,
+            op: Operation,
+            url: Url,
+            accept: impl FnOnce(&[u8]) -> Result<T, Failure>,
+        ) -> Result<T, Failure> {
+            observed_get(
+                self.observations,
+                op,
+                || {
+                    let response = self
+                        .client
+                        .get(url)
+                        .bearer_auth(self.token)
+                        .header("Accept", "application/json")
+                        .header("OData-Version", "4.0")
+                        .header("OData-MaxVersion", "4.0")
+                        .header("Prefer", "odata.maxpagesize=100")
+                        .send()
+                        .map_err(|_| Failure::Network)?;
+                    Ok((
+                        response.status().as_u16(),
+                        response.content_length(),
+                        response,
+                    ))
+                },
+                accept,
+            )
+        }
+    }
+
+    fn observed_get<T, R: Read>(
+        observations: &mut Observations,
+        op: Operation,
+        send: impl FnOnce() -> Result<(u16, Option<u64>, R), Failure>,
+        accept: impl FnOnce(&[u8]) -> Result<T, Failure>,
+    ) -> Result<T, Failure> {
+        let started = Instant::now();
+        let mut status = None;
+        let result = send().and_then(|(code, length, response)| {
+            status = Some(code);
+            match code {
+                200 => {}
+                401 => return Err(Failure::Unauthorized),
+                403 => return Err(Failure::Forbidden),
+                404 => return Err(Failure::NotFound),
+                429 | 500..=599 => return Err(Failure::Retryable),
+                _ => return Err(Failure::Http),
+            }
+            if length.is_some_and(|size| size > RESPONSE_LIMIT as u64) {
+                return Err(Failure::Limit);
+            }
+            let mut bytes = Vec::new();
+            response
+                .take(RESPONSE_LIMIT as u64 + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| Failure::Network)?;
+            if bytes.len() > RESPONSE_LIMIT {
+                return Err(Failure::Limit);
+            }
+            accept(&bytes)
+        });
+        if let Some(call) = diagnostics::finished(started, result.is_ok(), status) {
+            diagnostics::record(observations, op, call);
+        }
+        result
+    }
+
+    #[derive(Deserialize)]
+    struct Identity {
+        #[serde(rename = "UserId")]
+        user_id: String,
+        #[serde(rename = "OrganizationId")]
+        organization_id: String,
+    }
+
+    #[derive(Deserialize)]
+    struct UserIdentity {
+        domainname: String,
+    }
+
+    pub(super) fn verify_account(bytes: &[u8], config: &SourceConfig) -> Result<(), Failure> {
+        let user: UserIdentity = serde_json::from_slice(bytes).map_err(|_| Failure::Identity)?;
+        if !account(&user.domainname) || !user.domainname.eq_ignore_ascii_case(&config.account) {
+            return Err(Failure::Account);
+        }
+        Ok(())
+    }
+
+    #[derive(Deserialize)]
+    pub(super) struct BotPage {
+        value: Vec<BotRecord>,
+        #[serde(rename = "@odata.nextLink")]
+        pub(super) next_link: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    struct BotRecord {
+        botid: String,
+        description: Option<String>,
+        name: String,
+        schemaname: String,
+        modifiedon: String,
+        statecode: i64,
+    }
+
+    fn timestamp(value: &str) -> bool {
+        // Dataverse emits UTC ISO-8601; reject free text and unbounded metadata.
+        let bytes = value.as_bytes();
+        if !(20..=28).contains(&bytes.len())
+            || !value.is_ascii()
+            || bytes[4] != b'-'
+            || bytes[7] != b'-'
+            || bytes[10] != b'T'
+            || bytes[13] != b':'
+            || bytes[16] != b':'
+            || bytes[bytes.len() - 1] != b'Z'
+        {
+            return false;
+        }
+        if ![0..4, 5..7, 8..10, 11..13, 14..16, 17..19]
+            .iter()
+            .all(|range| bytes[range.clone()].iter().all(u8::is_ascii_digit))
+        {
+            return false;
+        }
+        if bytes.len() > 20
+            && (bytes[19] != b'.'
+                || bytes.len() == 21
+                || !bytes[20..bytes.len() - 1].iter().all(u8::is_ascii_digit))
+        {
+            return false;
+        }
+        let number = |start, end| value[start..end].parse::<u32>().unwrap_or(u32::MAX);
+        (1..=12).contains(&number(5, 7))
+            && (1..=31).contains(&number(8, 10))
+            && number(11, 13) <= 23
+            && number(14, 16) <= 59
+            && number(17, 19) <= 59
+    }
+
+    pub(super) fn parse_page(bytes: &[u8]) -> Result<BotPage, Failure> {
+        if bytes.len() > RESPONSE_LIMIT {
+            return Err(Failure::Limit);
+        }
+        serde_json::from_slice(bytes).map_err(|_| Failure::Response)
+    }
+
+    pub(super) fn append_page(
+        page: BotPage,
+        config: &SourceConfig,
+        synced_at: u64,
+        agents: &mut BTreeMap<String, CopilotAgent>,
+    ) -> Result<Option<String>, Failure> {
+        let mut page_ids = HashSet::new();
+        for bot in page.value {
+            let bot_id = guid(&bot.botid).map_err(|_| Failure::Response)?;
+            if !text(&bot.name, 1024)
+                || !text(&bot.schemaname, 512)
+                || !timestamp(&bot.modifiedon)
+                || !matches!(bot.statecode, 0 | 1)
+            {
+                return Err(Failure::Response);
+            }
+            let id = scoped_id(config, &bot_id);
+            if !page_ids.insert(id.clone()) {
+                return Err(Failure::Response);
+            }
+            let agent = CopilotAgent {
+                id: id.clone(),
+                name: bot.name,
+                description: format!("Copilot Studio · {}", config.environment_name),
+                model: None,
+                definition: None,
+                source: Some(StudioAgentSource {
+                    provider: "copilot-studio".into(),
+                    tenant_id: config.tenant_id.clone(),
+                    environment_id: config.environment_id.clone(),
+                    environment_name: config.environment_name.clone(),
+                    environment_url: config.environment_url.clone(),
+                    bot_id,
+                    schema_name: bot.schemaname,
+                    declared_description: bot.description.filter(|s| public_description(s)),
+                    modified_at: bot.modifiedon,
+                    state_code: bot.statecode,
+                    last_synced_at: synced_at,
+                }),
+            };
+            // An identical row repeated across page boundaries is safe to deduplicate; a changed
+            // row means this traversal is not a coherent snapshot and must not replace the cache.
+            if let Some(existing) = agents.get(&id) {
+                if existing != &agent {
+                    return Err(Failure::Pagination);
+                }
+            } else {
+                agents.insert(id, agent);
+                if agents.len() > MAX_AGENTS {
+                    return Err(Failure::Limit);
+                }
+            }
+        }
+        Ok(page.next_link)
+    }
+
+    #[cfg(test)]
+    pub(super) fn next_link(config: &SourceConfig, value: &str) -> Result<Url, Failure> {
+        projected_link(config, BOTS, value)
+    }
+
+    fn projected_link(
+        config: &SourceConfig,
+        query: Projection,
+        value: &str,
+    ) -> Result<Url, Failure> {
+        if value.len() > 32 * 1024
+            || value.chars().any(|ch| ch.is_control())
+            || value.contains('\\')
+        {
+            return Err(Failure::Pagination);
+        }
+        let url = Url::parse(value).map_err(|_| Failure::Pagination)?;
+        let base = Url::parse(&config.environment_url).map_err(|_| Failure::Pagination)?;
+        let rest = value.strip_prefix("https://").ok_or(Failure::Pagination)?;
+        let path_start = rest.find('/').ok_or(Failure::Pagination)?;
+        if root_url(&format!("https://{}", &rest[..path_start])).map_err(|_| Failure::Pagination)?
+            != config.environment_url
+        {
+            return Err(Failure::Pagination);
+        }
+        let raw_path = rest[path_start..]
+            .split(['?', '#'])
+            .next()
+            .ok_or(Failure::Pagination)?;
+        if url.origin() != base.origin()
+            || url.path() != query.path
+            || raw_path != query.path
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(Failure::Pagination);
+        }
+        let mut keys = HashSet::new();
+        for (key, value) in url.query_pairs() {
+            if !keys.insert(key.to_string()) {
+                return Err(Failure::Pagination);
+            }
+            match key.as_ref() {
+                "$select" if value == query.select => {}
+                "$orderby" if value == query.id || value.strip_suffix(" asc") == Some(query.id) => {
+                }
+                "$filter" if query.filter == Some(value.as_ref()) => {}
+                "$skiptoken" if !value.is_empty() => {}
+                _ => return Err(Failure::Pagination),
+            }
+        }
+        if !keys.contains("$skiptoken") {
+            return Err(Failure::Pagination);
+        }
+        // Some OData next links contain only a cursor. Reapply the same metadata projection.
+        let mut url = url;
+        if !keys.contains("$select") {
+            url.query_pairs_mut().append_pair("$select", query.select);
+        }
+        if !keys.contains("$orderby") {
+            url.query_pairs_mut().append_pair("$orderby", query.id);
+        }
+        if let Some(filter) = query.filter.filter(|_| !keys.contains("$filter")) {
+            url.query_pairs_mut().append_pair("$filter", filter);
+        }
+        Ok(url)
+    }
+
+    type SourceResult = (Vec<CopilotAgent>, Option<Vec<StudioAsset>>, Vec<String>);
+    fn refresh_with(
+        config: &SourceConfig,
+        mut previous: Option<Snapshot>,
+        synced_at: u64,
+        fetch: impl FnOnce(&mut Observations) -> Result<SourceResult, Failure>,
+    ) -> Snapshot {
+        let mut observations = previous
+            .as_mut()
+            .map(|s| std::mem::take(&mut s.status.observations))
+            .unwrap_or_default();
+        let mut snapshot = match fetch(&mut observations) {
+            Ok((agents, assets, warnings)) => {
+                let mut snapshot = refreshed(config, previous, Ok(agents), synced_at);
+                snapshot.status.assets = assets;
+                snapshot.status.asset_warnings = warnings;
+                snapshot
+            }
+            Err(error) => refreshed(config, previous, Err(error), synced_at),
+        };
+        snapshot.status.observations = observations;
+        snapshot
+    }
+
+    fn fetch_source(
+        config: &SourceConfig,
+        synced_at: u64,
+        observations: &mut Observations,
+    ) -> Result<SourceResult, Failure> {
+        let token = token(config)?;
+        let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|_| Failure::Network)?;
+        let identity_url = Url::parse(&format!("{}/api/data/v9.2/WhoAmI", config.environment_url))
+            .map_err(|_| Failure::Config)?;
+        let mut api = Dataverse {
+            client,
+            token: &token,
+            observations,
+        };
+        let user_id = api.get(Operation::Identity, identity_url, |bytes| {
+            let identity: Identity =
+                serde_json::from_slice(bytes).map_err(|_| Failure::Identity)?;
+            guid(&identity.organization_id).map_err(|_| Failure::Identity)?;
+            guid(&identity.user_id).map_err(|_| Failure::Identity)
+        })?;
+        let user_url = Url::parse(&format!(
+            "{}/api/data/v9.2/systemusers({user_id})?$select=domainname",
+            config.environment_url
+        ))
+        .map_err(|_| Failure::Identity)?;
+        api.get(Operation::VerifyAccount, user_url, |bytes| {
+            verify_account(bytes, config)
+        })?;
+        let mut agents = BTreeMap::new();
+        pages(&mut api, config, BOTS, |bytes| {
+            append_page(parse_page(bytes)?, config, synced_at, &mut agents)
+        })?;
+        let mut assets = None;
+        let mut warnings = Vec::new();
+        if approved_assets(config) {
+            for (kind, name, query) in ASSETS {
+                let mut rows = BTreeMap::new();
+                match pages(&mut api, config, query, |bytes| {
+                    asset_page(bytes, kind, query.id, name, &mut rows)
+                }) {
+                    Ok(()) => assets
+                        .get_or_insert_with(Vec::new)
+                        .extend(rows.into_values()),
+                    Err(failure) => warnings.push(format!("{kind}: {}", asset_reason(failure))),
+                }
+            }
+        }
+        Ok((agents.into_values().collect(), assets, warnings))
+    }
+
+    fn asset_page(
+        bytes: &[u8],
+        kind: &str,
+        id_key: &str,
+        name_key: &str,
+        rows: &mut BTreeMap<String, StudioAsset>,
+    ) -> Result<Option<String>, Failure> {
+        #[derive(Deserialize)]
+        struct Page {
+            value: Vec<serde_json::Value>,
+            #[serde(rename = "@odata.nextLink")]
+            next: Option<String>,
+        }
+        let page: Page = serde_json::from_slice(bytes).map_err(|_| Failure::Response)?;
+        let mut ids = HashSet::new();
+        for row in page.value {
+            let id = guid(row[id_key].as_str().ok_or(Failure::Response)?)
+                .map_err(|_| Failure::Response)?;
+            let name = row[name_key]
+                .as_str()
+                .filter(|s| text(s, 1024))
+                .ok_or(Failure::Response)?;
+            if !ids.insert(id.clone()) {
+                return Err(Failure::Response);
+            }
+            let asset = StudioAsset {
+                id: id.clone(),
+                kind: kind.into(),
+                name: name.into(),
+            };
+            if let Some(existing) = rows.get(&id) {
+                if existing != &asset {
+                    return Err(Failure::Pagination);
+                }
+            } else {
+                rows.insert(id, asset);
+                if rows.len() > MAX_AGENTS {
+                    return Err(Failure::Limit);
+                }
+            }
+        }
+        Ok(page.next)
+    }
+
+    fn pages(
+        api: &mut Dataverse<'_>,
+        config: &SourceConfig,
+        query: Projection,
+        mut append: impl FnMut(&[u8]) -> Result<Option<String>, Failure>,
+    ) -> Result<(), Failure> {
+        let mut url = Url::parse(&format!("{}{}", config.environment_url, query.path))
+            .map_err(|_| Failure::Config)?;
+        url.query_pairs_mut()
+            .append_pair("$select", query.select)
+            .append_pair("$orderby", query.id);
+        if let Some(filter) = query.filter {
+            url.query_pairs_mut().append_pair("$filter", filter);
+        }
+        let mut visited = HashSet::new();
+        let mut cursors = HashSet::new();
+        for _ in 0..MAX_PAGES {
+            if !visited.insert(url.as_str().to_owned()) {
+                return Err(Failure::Pagination);
+            }
+            for (_, cursor) in url.query_pairs().filter(|(key, _)| key == "$skiptoken") {
+                if !cursors.insert(cursor.into_owned()) {
+                    return Err(Failure::Pagination);
+                }
+            }
+            match api.get(query.operation, url, |bytes| {
+                append(bytes)?
+                    .map(|next| projected_link(config, query, &next))
+                    .transpose()
+            })? {
+                None => return Ok(()),
+                Some(next) => url = next,
+            }
+        }
+        Err(Failure::Limit)
+    }
+
+    #[cfg(test)]
+    mod asset_tests {
+        use super::*;
+
+        fn approved() -> SourceConfig {
+            let tenant = "11111111-1111-1111-1111-111111111111";
+            SourceConfig {
+                tenant_id: tenant.into(),
+                environment_id: tenant.into(),
+                environment_name: "test".into(),
+                environment_url: "https://example.crm.dynamics.com".into(),
+                subscription_id: tenant.into(),
+                account: "test@example.com".into(),
+                asset_inventory: true,
+            }
+        }
+
+        #[test]
+        fn diagnostics_capture_http_status_and_keep_last_accepted_page_without_network() {
+            let mut rows = Observations::new();
+            let mut assets = BTreeMap::new();
+            let mut read_page = |status, body| {
+                observed_get(
+                    &mut rows,
+                    Operation::CanvasApps,
+                    || Ok((status, None, body)),
+                    |bytes| {
+                        asset_page(
+                            bytes,
+                            "canvas-app",
+                            "canvasappid",
+                            "displayname",
+                            &mut assets,
+                        )
+                    },
+                )
+            };
+            read_page(200, br#"{"value":[]}"#.as_slice()).unwrap();
+            assert_eq!(read_page(200, b"not-json"), Err(Failure::Response));
+            assert_eq!(
+                read_page(403, b"private-error-body"),
+                Err(Failure::Forbidden)
+            );
+            let history = &rows[&Operation::CanvasApps];
+            assert_eq!(history.last_call.http_status, Some(403));
+            assert_eq!(history.last_failure, Some(history.last_call));
+            assert!(!history.last_call.succeeded);
+            assert_eq!(history.last_success.unwrap().http_status, Some(200));
+            assert!(history.last_success.unwrap().succeeded);
+            let success = history.last_success;
+            assert_eq!(
+                observed_get::<(), &[u8]>(
+                    &mut rows,
+                    Operation::CanvasApps,
+                    || Err(Failure::Network),
+                    |_| unreachable!()
+                ),
+                Err(Failure::Network)
+            );
+            let history = &rows[&Operation::CanvasApps];
+            assert_eq!(history.last_call.http_status, None);
+            assert_eq!(history.last_success, success);
+            let payload = serde_json::to_value(&rows).unwrap();
+            assert_eq!(
+                payload["canvas-apps"]["lastCall"]
+                    .as_object()
+                    .unwrap()
+                    .len(),
+                4
+            );
+            assert!(!payload.to_string().contains("private-error-body"));
+        }
+
+        #[test]
+        fn diagnostics_migrate_v1_without_retiming_cached_errors_or_claiming_success() {
+            let config = approved();
+            let mut previous = refreshed(&config, None, Ok(Vec::new()), 100);
+            previous.status.assets = Some(Vec::new());
+            previous
+                .status
+                .asset_warnings
+                .push("canvas-app: HTTP 403".into());
+            let encoded = serde_json::to_vec(&Cache {
+                schema_version: 1,
+                sources: vec![previous],
+            })
+            .unwrap();
+            let cache = decode_cache(&encoded).unwrap();
+            assert_eq!(cache.schema_version, CACHE_SCHEMA);
+            let migrated = matching_snapshot(&cache, &config, 9000).unwrap().unwrap();
+            assert!(migrated.status.observations.is_empty());
+            assert_eq!(migrated.status.last_synced_at, Some(100));
+            assert_eq!(migrated.status.asset_warnings, ["canvas-app: HTTP 403"]);
+            assert_eq!(migrated.status.state, "stale");
+        }
+
+        #[test]
+        fn diagnostics_survive_refresh_failure_and_cache_roundtrip_in_the_same_scope() {
+            let config = approved();
+            let first = refresh_with(&config, None, 100, |rows| {
+                observed_get(
+                    rows,
+                    Operation::Bots,
+                    || Ok((200, None, br#"{"value":[]}"#.as_slice())),
+                    |bytes| parse_page(bytes).map(|_| (Vec::new(), None, Vec::new())),
+                )
+            });
+            let success = first.status.observations[&Operation::Bots]
+                .last_success
+                .unwrap();
+            let failed = refresh_with(&config, Some(first), 110, |rows| {
+                observed_get(
+                    rows,
+                    Operation::Bots,
+                    || Ok((403, None, b"".as_slice())),
+                    |_| unreachable!(),
+                )
+            });
+            let bytes = serde_json::to_vec(&Cache {
+                schema_version: CACHE_SCHEMA,
+                sources: vec![failed],
+            })
+            .unwrap();
+            let cached = matching_snapshot(&decode_cache(&bytes).unwrap(), &config, now())
+                .unwrap()
+                .unwrap();
+            assert_eq!(cached.status.last_synced_at, Some(100));
+            let history = &cached.status.observations[&Operation::Bots];
+            assert_eq!(history.last_call.http_status, Some(403));
+            assert_eq!(history.last_success, Some(success));
+        }
+
+        #[test]
+        fn studio_asset_cursor_cannot_change_collection_projection_or_filter() {
+            let source = approved();
+            for (_, _, q) in ASSETS {
+                let base = format!("{}{}?$skiptoken=cursor", source.environment_url, q.path);
+                let url = projected_link(&source, q, &base).unwrap();
+                assert!(url
+                    .query_pairs()
+                    .any(|(k, v)| k == "$select" && v == q.select));
+                assert_eq!(
+                    url.query_pairs()
+                        .find(|(k, _)| k == "$filter")
+                        .map(|(_, v)| v.into_owned()),
+                    q.filter.map(String::from)
+                );
+                for bad in [
+                    format!("{base}&$select=*"),
+                    format!("{base}&$filter=true"),
+                    base.replace(q.path, BOTS_PATH),
+                    base.replace("example.", "other."),
+                ] {
+                    assert!(projected_link(&source, q, &bad).is_err());
+                }
+            }
+        }
+
+        #[test]
+        fn studio_asset_cache_distinguishes_uncollected_empty_and_partial() {
+            let source = approved();
+            let mut s = refreshed(&source, None, Ok(Vec::new()), 100);
+            assert!(serde_json::to_value(&s.status)
+                .unwrap()
+                .get("assets")
+                .is_none());
+            s.status.assets = Some(Vec::new());
+            s.status.asset_warnings.push("canvas-app: HTTP 403".into());
+            validate_snapshot(&s, 100).unwrap();
+            let mut rows = BTreeMap::new();
+            let input = br#"{"value":[{"workflowid":"11111111-1111-1111-1111-111111111111","name":"Example","ignored":"not persisted"}]}"#;
+            asset_page(input, "workflow", "workflowid", "name", &mut rows).unwrap();
+            s.status.assets = Some(rows.into_values().collect());
+            validate_snapshot(&s, 100).unwrap();
+            assert!(!serde_json::to_string(&s).unwrap().contains("not persisted"));
+            s.status
+                .asset_warnings
+                .push("workflow: network failure".into());
+            assert!(validate_snapshot(&s, 100).is_err());
+            s.status.asset_warnings.pop();
+            s.status.asset_warnings.push("untrusted detail".into());
+            assert!(validate_snapshot(&s, 100).is_err());
+            s.status.asset_warnings.clear();
+            s.config.asset_inventory = false;
+            assert!(validate_snapshot(&s, 100).is_err());
+            let mut legacy = serde_json::to_value(source).unwrap();
+            legacy.as_object_mut().unwrap().remove("assetInventory");
+            let legacy: SourceConfig = serde_json::from_value(legacy).unwrap();
+            assert!(!approved_assets(&legacy));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2780,5 +5518,661 @@ mod tests {
         assert!(!serde_json::to_string(&session)
             .unwrap()
             .contains("not-returned"));
+    }
+
+    fn studio_config_value() -> Value {
+        json!({
+            "schemaVersion": 1,
+            "sources": [{
+                "tenantId": "11111111-1111-4111-8111-111111111111",
+                "environmentId": "22222222-2222-4222-8222-222222222222",
+                "environmentName": "Test environment",
+                "environmentUrl": "https://example.crm.dynamics.com",
+                "subscriptionId": "33333333-3333-4333-8333-333333333333",
+                "account": "person@example.com"
+            }]
+        })
+    }
+
+    fn studio_source() -> studio_catalog::SourceConfig {
+        studio_catalog::parse_config(&serde_json::to_vec(&studio_config_value()).unwrap())
+            .unwrap()
+            .sources
+            .remove(0)
+    }
+
+    fn studio_bot() -> Value {
+        json!({
+            "botid": "abcdefab-4444-4444-8444-444444444444",
+            "name": "Test agent",
+            "schemaname": "test_agent",
+            "modifiedon": "2026-11-17T17:10:35Z",
+            "statecode": 0
+        })
+    }
+
+    fn studio_rows() -> Vec<CopilotAgent> {
+        let page = studio_catalog::parse_page(
+            &serde_json::to_vec(&json!({"value": [studio_bot()]})).unwrap(),
+        )
+        .unwrap();
+        let mut rows = BTreeMap::new();
+        studio_catalog::append_page(page, &studio_source(), 10_000, &mut rows).unwrap();
+        rows.into_values().collect()
+    }
+
+    fn studio_snapshot() -> studio_catalog::Snapshot {
+        studio_catalog::refreshed(&studio_source(), None, Ok(studio_rows()), 10_000)
+    }
+
+    #[test]
+    fn studio_config_is_strict_and_normalizes_identity() {
+        let mut value = studio_config_value();
+        value["sources"][0]["tenantId"] = json!("ABCDEFAB-1111-4111-8111-111111111111");
+        value["sources"][0]["account"] = json!("Person@Example.COM");
+        value["sources"][0]["environmentUrl"] = json!("https://Example.crm.dynamics.com:443/");
+        let source = studio_catalog::parse_config(&serde_json::to_vec(&value).unwrap())
+            .unwrap()
+            .sources
+            .remove(0);
+        assert_eq!(source.tenant_id, "abcdefab-1111-4111-8111-111111111111");
+        assert_eq!(source.account, "person@example.com");
+        assert_eq!(source.environment_url, "https://example.crm.dynamics.com");
+        for key in ["schemaVersion", "sources"] {
+            let mut value = studio_config_value();
+            value.as_object_mut().unwrap().remove(key);
+            assert!(studio_catalog::parse_config(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
+        for key in [
+            "tenantId",
+            "environmentId",
+            "environmentName",
+            "environmentUrl",
+            "subscriptionId",
+            "account",
+        ] {
+            let mut value = studio_config_value();
+            value["sources"][0].as_object_mut().unwrap().remove(key);
+            assert!(
+                studio_catalog::parse_config(&serde_json::to_vec(&value).unwrap()).is_err(),
+                "{key}"
+            );
+        }
+        let mut value = studio_config_value();
+        value["accessToken"] = json!("not-allowed");
+        assert!(studio_catalog::parse_config(&serde_json::to_vec(&value).unwrap()).is_err());
+        let mut value = studio_config_value();
+        value["sources"][0]["accessToken"] = json!("not-allowed");
+        assert!(studio_catalog::parse_config(&serde_json::to_vec(&value).unwrap()).is_err());
+        let mut value = studio_config_value();
+        value["schemaVersion"] = json!(2);
+        assert!(studio_catalog::parse_config(&serde_json::to_vec(&value).unwrap()).is_err());
+        assert!(studio_catalog::parse_config(&vec![b' '; 128 * 1024 + 1]).is_err());
+    }
+
+    #[test]
+    fn studio_config_rejects_urls_accounts_and_duplicate_sources() {
+        for url in [
+            "http://example.crm.dynamics.com",
+            "https://example.crm.dynamics.com:444",
+            "https://example.crm.dynamics.com/api",
+            "https://example.crm.dynamics.com/?q=1",
+            "https://example.crm.dynamics.com/#fragment",
+            "https://person@example.crm.dynamics.com",
+            "https://@example.crm.dynamics.com",
+            "https://example.crm.dynamics.com.evil.test",
+            "https://example.crm.dynamics.com.",
+            "https://example..crm.dynamics.com",
+            "https://-example.crm.dynamics.com",
+            "https://example-.crm.dynamics.com",
+            "https://127.0.0.1",
+            "https://example.crm.dynamics.com\\",
+            "https://example.crm.dynamics.com/a/../",
+            "https://example.crm.dynamics.com/%2e",
+            " https://example.crm.dynamics.com",
+            "https://example.crm.dynamics.com\n",
+            "https://ex%61mple.crm.dynamics.com",
+            "https://例.crm.dynamics.com",
+        ] {
+            let mut value = studio_config_value();
+            value["sources"][0]["environmentUrl"] = json!(url);
+            assert!(
+                studio_catalog::parse_config(&serde_json::to_vec(&value).unwrap()).is_err(),
+                "{url:?}"
+            );
+        }
+        for account in [
+            "",
+            "person@example.com\n",
+            " person@example.com",
+            "$(whoami)",
+            "x&whoami",
+            "x;whoami",
+            "x\"y",
+            "x`y",
+            "x\0y",
+        ] {
+            let mut value = studio_config_value();
+            value["sources"][0]["account"] = json!(account);
+            assert!(
+                studio_catalog::parse_config(&serde_json::to_vec(&value).unwrap()).is_err(),
+                "{account:?}"
+            );
+        }
+        for key in ["tenantId", "environmentId", "subscriptionId"] {
+            let mut value = studio_config_value();
+            value["sources"][0][key] = json!("--tenant injected");
+            assert!(studio_catalog::parse_config(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
+        for name in ["".to_string(), "a\nb".to_string(), "a".repeat(257)] {
+            let mut value = studio_config_value();
+            value["sources"][0]["environmentName"] = json!(name);
+            assert!(studio_catalog::parse_config(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
+        for same_identity in [true, false] {
+            let mut value = studio_config_value();
+            let mut duplicate = value["sources"][0].clone();
+            if same_identity {
+                duplicate["environmentUrl"] = json!("https://other.crm.dynamics.com");
+            } else {
+                duplicate["environmentId"] = json!("55555555-5555-4555-8555-555555555555");
+            }
+            value["sources"].as_array_mut().unwrap().push(duplicate);
+            assert!(studio_catalog::parse_config(&serde_json::to_vec(&value).unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn studio_scoped_ids_distinguish_tenants_and_environments() {
+        let mut source = studio_source();
+        let bot = "ABCDEFAB-4444-4444-8444-444444444444";
+        let first = studio_catalog::scoped_id(&source, bot);
+        source.tenant_id = "55555555-5555-4555-8555-555555555555".into();
+        let second = studio_catalog::scoped_id(&source, bot);
+        source.environment_id = "66666666-6666-4666-8666-666666666666".into();
+        assert_ne!(first, second);
+        assert_ne!(second, studio_catalog::scoped_id(&source, bot));
+        assert_eq!(first, first.to_ascii_lowercase());
+        assert!(first.ends_with(":abcdefab-4444-4444-8444-444444444444"));
+    }
+
+    #[test]
+    fn studio_token_is_subscription_scoped_and_account_checked_without_fallback() {
+        let source = studio_source();
+        let mut command = quiet::command("unused-test-program");
+        studio_catalog::token_args(&mut command, &source);
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "account",
+                "get-access-token",
+                "--subscription",
+                &source.subscription_id,
+                "--resource",
+                &source.environment_url,
+                "--output",
+                "json",
+                "--only-show-errors",
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg == "--tenant" || arg == "login"));
+        let bytes = serde_json::to_vec(&json!({
+            "tenant": source.tenant_id, "accessToken": "synthetic-token-for-test"
+        }))
+        .unwrap();
+        assert!(studio_catalog::parse_token(&bytes, &source).is_ok());
+        let mut other = source.clone();
+        other.tenant_id = "77777777-7777-4777-8777-777777777777".into();
+        assert_eq!(
+            studio_catalog::parse_token(&bytes, &other),
+            Err(studio_catalog::Failure::Tenant)
+        );
+        assert!(studio_catalog::parse_token(br#"{"accessToken":"secret"}"#, &source).is_err());
+        let bytes = serde_json::to_vec(
+            &json!({"tenant": source.tenant_id, "accessToken": "injected\r\nheader-value"}),
+        )
+        .unwrap();
+        assert_eq!(
+            studio_catalog::parse_token(&bytes, &source),
+            Err(studio_catalog::Failure::Token)
+        );
+        assert!(
+            studio_catalog::verify_account(br#"{"domainname":"PERSON@EXAMPLE.COM"}"#, &source)
+                .is_ok()
+        );
+        assert_eq!(
+            studio_catalog::verify_account(br#"{"domainname":"guest@example.com"}"#, &source),
+            Err(studio_catalog::Failure::Account)
+        );
+        assert!(studio_catalog::verify_account(br#"{"domainname":null}"#, &source).is_err());
+    }
+
+    #[test]
+    fn studio_pagination_rejects_cross_origin_and_non_metadata_queries() {
+        let source = studio_source();
+        let good = "https://example.crm.dynamics.com/api/data/v9.2/bots?$skiptoken=cursor";
+        let url = studio_catalog::next_link(&source, good).unwrap();
+        assert!(url.query_pairs().any(|(key, value)| key == "$select"
+            && value == "botid,name,schemaname,modifiedon,statecode,description"));
+        assert!(url
+            .query_pairs()
+            .any(|(key, value)| key == "$orderby" && value == "botid"));
+        for bad in [
+            "https://evil.test/api/data/v9.2/bots?$skiptoken=x",
+            "http://example.crm.dynamics.com/api/data/v9.2/bots?$skiptoken=x",
+            "https://example.crm.dynamics.com:444/api/data/v9.2/bots?$skiptoken=x",
+            "https://user@example.crm.dynamics.com/api/data/v9.2/bots?$skiptoken=x",
+            "https://@example.crm.dynamics.com/api/data/v9.2/bots?$skiptoken=x",
+            "https://example.crm.dynamics.com/api/data/v9.2/systemusers?$skiptoken=x",
+            "https://example.crm.dynamics.com/api/data/v9.2/bots/?$skiptoken=x",
+            "https://example.crm.dynamics.com/api/data/v9.2/other/../bots?$skiptoken=x",
+            "https://example.crm.dynamics.com/api/data/v9.2/%62ots?$skiptoken=x",
+            "https://example.crm.dynamics.com/api/data/v9.2/bots?$skiptoken=x#secret",
+            "https://example.crm.dynamics.com/api/data/v9.2/bots?$select=description&$skiptoken=x",
+            "https://example.crm.dynamics.com/api/data/v9.2/bots?$expand=topics&$skiptoken=x",
+            "https://example.crm.dynamics.com/api/data/v9.2/bots?$top=1&$skiptoken=x",
+            "https://example.crm.dynamics.com/api/data/v9.2/bots?$skiptoken=x&$skiptoken=y",
+            "https://example.crm.dynamics.com/api/data/v9.2/bots?$skiptoken=",
+            "https://example.crm.dynamics.com/api/data/v9.2/bots",
+            "/api/data/v9.2/bots?$skiptoken=x",
+        ] {
+            assert!(studio_catalog::next_link(&source, bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn studio_purpose_is_optional_bounded_display_prose_in_rows_and_cache() {
+        for value in [
+            None,
+            Some("Reviews support requests."),
+            Some("Authorization: Bearer private"),
+            Some("https://example.test/?sig=private"),
+            Some("<markup>"),
+        ] {
+            let mut bot = studio_bot();
+            if let Some(value) = value {
+                bot["description"] = json!(value);
+            }
+            bot["instructions"] = json!("NEVER COPY");
+            let page =
+                studio_catalog::parse_page(&serde_json::to_vec(&json!({"value": [bot]})).unwrap())
+                    .unwrap();
+            let mut rows = BTreeMap::new();
+            studio_catalog::append_page(page, &studio_source(), 10_000, &mut rows).unwrap();
+            let row = rows.into_values().next().unwrap();
+            assert_eq!(
+                row.source.as_ref().unwrap().declared_description.as_deref(),
+                value.filter(|v| *v == "Reviews support requests.")
+            );
+            assert!(!serde_json::to_string(&row).unwrap().contains("NEVER COPY"));
+            let mut snap = studio_snapshot();
+            snap.agents = vec![row];
+            studio_catalog::validate_snapshot(&snap, 10_100).unwrap();
+            snap.agents[0].source.as_mut().unwrap().declared_description =
+                Some("password: hidden".into());
+            assert!(studio_catalog::validate_snapshot(&snap, 10_100).is_err());
+        }
+    }
+
+    #[test]
+    fn studio_dataverse_rows_are_allowlisted_and_duplicates_are_not_silent() {
+        let source = studio_source();
+        let mut bot = studio_bot();
+        bot["description"] = json!("Bearer private-description");
+        bot["topics"] = json!(["private-topic"]);
+        let mut rows = BTreeMap::new();
+        let page = studio_catalog::parse_page(
+            &serde_json::to_vec(&json!({
+                "@odata.context": "unused-context",
+                "value": [bot], "@odata.nextLink": null
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            studio_catalog::append_page(page, &source, 10_000, &mut rows)
+                .unwrap()
+                .is_none()
+        );
+        let serialized = serde_json::to_string(&rows).unwrap();
+        assert!(!serialized.contains("private-description"));
+        assert!(!serialized.contains("private-topic"));
+        assert_eq!(
+            rows.values().next().unwrap().description,
+            "Copilot Studio · Test environment"
+        );
+        assert!(rows.values().next().unwrap().model.is_none());
+        let page = studio_catalog::parse_page(
+            &serde_json::to_vec(&json!({"value": [studio_bot()]})).unwrap(),
+        )
+        .unwrap();
+        studio_catalog::append_page(page, &source, 10_000, &mut rows).unwrap();
+        assert_eq!(rows.len(), 1);
+        let mut changed = studio_bot();
+        changed["name"] = json!("Changed mid-traversal");
+        let page =
+            studio_catalog::parse_page(&serde_json::to_vec(&json!({"value": [changed]})).unwrap())
+                .unwrap();
+        assert_eq!(
+            studio_catalog::append_page(page, &source, 10_000, &mut rows),
+            Err(studio_catalog::Failure::Pagination)
+        );
+        let page = studio_catalog::parse_page(
+            &serde_json::to_vec(&json!({"value": [studio_bot(), studio_bot()]})).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            studio_catalog::append_page(page, &source, 10_000, &mut BTreeMap::new()),
+            Err(studio_catalog::Failure::Response)
+        );
+    }
+
+    #[test]
+    fn studio_dataverse_rejects_malformed_required_fields() {
+        for body in [
+            r#"{}"#,
+            r#"{"value":null}"#,
+            r#"{"value":[{}]}"#,
+            r#"{"value":[],"value":[]}"#,
+            r#"{"value":[],"@odata.nextLink":42}"#,
+        ] {
+            assert!(studio_catalog::parse_page(body.as_bytes()).is_err());
+        }
+        for (key, value) in [
+            ("botid", json!("not-a-guid")),
+            ("name", json!("")),
+            ("name", json!("bad\nname")),
+            ("schemaname", json!("")),
+            ("modifiedon", json!("not-a-date")),
+            ("modifiedon", json!("2026-13-17T17:10:35Z")),
+            ("statecode", json!(5)),
+            ("statecode", json!("0")),
+        ] {
+            let mut bot = studio_bot();
+            bot[key] = value;
+            let result =
+                studio_catalog::parse_page(&serde_json::to_vec(&json!({"value": [bot]})).unwrap())
+                    .and_then(|page| {
+                        studio_catalog::append_page(
+                            page,
+                            &studio_source(),
+                            10_000,
+                            &mut BTreeMap::new(),
+                        )
+                    });
+            assert!(result.is_err(), "{key}");
+        }
+        for key in ["botid", "name", "schemaname", "modifiedon", "statecode"] {
+            let mut bot = studio_bot();
+            bot.as_object_mut().unwrap().remove(key);
+            assert!(studio_catalog::parse_page(
+                &serde_json::to_vec(&json!({"value": [bot]})).unwrap()
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn studio_cache_invalidates_changed_config_and_rejects_scope_spoofing() {
+        let cache = studio_catalog::Cache {
+            schema_version: 1,
+            sources: vec![studio_snapshot()],
+        };
+        assert!(
+            studio_catalog::matching_snapshot(&cache, &studio_source(), 10_100)
+                .unwrap()
+                .is_some()
+        );
+        for field in [
+            "account",
+            "subscriptionId",
+            "environmentId",
+            "tenantId",
+            "environmentUrl",
+            "environmentName",
+        ] {
+            let mut value = serde_json::to_value(studio_source()).unwrap();
+            value[field] = match field {
+                "account" => json!("other@example.com"),
+                "environmentName" => json!("Other environment"),
+                "environmentUrl" => json!("https://other.crm.dynamics.com"),
+                _ => json!("88888888-8888-4888-8888-888888888888"),
+            };
+            let changed = serde_json::from_value(value).unwrap();
+            assert!(
+                studio_catalog::matching_snapshot(&cache, &changed, 10_100)
+                    .unwrap()
+                    .is_none(),
+                "{field}"
+            );
+        }
+        for field in [
+            "provider",
+            "tenantId",
+            "environmentId",
+            "environmentUrl",
+            "botId",
+            "lastSyncedAt",
+        ] {
+            let mut value = serde_json::to_value(studio_snapshot()).unwrap();
+            value["agents"][0]["source"][field] = if field == "lastSyncedAt" {
+                json!(10_001)
+            } else {
+                json!("spoofed")
+            };
+            if let Ok(invalid) = serde_json::from_value(value) {
+                assert!(
+                    studio_catalog::validate_snapshot(&invalid, 10_100).is_err(),
+                    "{field}"
+                );
+            }
+        }
+        let mut bad = studio_snapshot();
+        bad.agents[0].id = "local-agent".into();
+        assert!(studio_catalog::validate_snapshot(&bad, 10_100).is_err());
+        let mut bad = studio_snapshot();
+        bad.status.error = Some("untrusted-secret-error-body".into());
+        assert!(studio_catalog::validate_snapshot(&bad, 10_100).is_err());
+        let mut bad = studio_snapshot();
+        bad.agents.push(bad.agents[0].clone());
+        bad.status.agent_count = 2;
+        assert!(studio_catalog::validate_snapshot(&bad, 10_100).is_err());
+    }
+
+    #[test]
+    fn studio_cache_retains_last_complete_snapshot_and_ages_it() {
+        let source = studio_source();
+        let previous = studio_snapshot();
+        let cache = studio_catalog::Cache {
+            schema_version: 1,
+            sources: vec![previous.clone()],
+        };
+        let fresh = studio_catalog::matching_snapshot(&cache, &source, 13_600)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fresh.status.state, "ready");
+        let aged = studio_catalog::matching_snapshot(&cache, &source, 13_601)
+            .unwrap()
+            .unwrap();
+        assert_eq!(aged.status.state, "stale");
+        assert_eq!(aged.status.last_synced_at, Some(10_000));
+        assert_eq!(aged.agents, previous.agents);
+        for failure in [
+            studio_catalog::Failure::Account,
+            studio_catalog::Failure::Pagination,
+            studio_catalog::Failure::Retryable,
+        ] {
+            let stale =
+                studio_catalog::refreshed(&source, Some(previous.clone()), Err(failure), 20_000);
+            assert_eq!(stale.agents, previous.agents);
+            assert_eq!(stale.status.state, "stale");
+            assert_eq!(stale.status.last_synced_at, Some(10_000));
+            assert!(stale.status.error.is_some());
+            studio_catalog::validate_snapshot(&stale, 20_000).unwrap();
+        }
+        let absent = studio_catalog::refreshed(
+            &source,
+            None,
+            Err(studio_catalog::Failure::Forbidden),
+            20_000,
+        );
+        assert!(absent.agents.is_empty());
+        assert_eq!(absent.status.state, "unavailable");
+        assert_eq!(absent.status.last_synced_at, None);
+        studio_catalog::validate_snapshot(&absent, 20_000).unwrap();
+        let empty = studio_catalog::refreshed(&source, Some(previous), Ok(Vec::new()), 20_000);
+        assert_eq!(empty.status.state, "ready");
+        assert_eq!(empty.status.agent_count, 0);
+        let stale_empty = studio_catalog::refreshed(
+            &source,
+            Some(empty),
+            Err(studio_catalog::Failure::Network),
+            21_000,
+        );
+        assert_eq!(stale_empty.status.state, "stale");
+        assert_eq!(stale_empty.status.last_synced_at, Some(20_000));
+    }
+
+    #[test]
+    fn agent_card_projects_only_public_metadata() {
+        let text = "---\nname: 'Display name'\nid: dayour-example\nmodel: example-model\ndescription: >-\n  Declared\n  description\nmcps: [calendar, 'command --token PRIVATE']\ntools:\n  required: [search]\n  mcp:\n    files:\n      optional: [list]\n      env: {SECRET: PRIVATE}\ninstructions: PRIVATE\n---\nPRIVATE BODY";
+        let agent = parse_agent_definition(text, "example.md").unwrap();
+        assert_eq!(agent.name, "Display name");
+        assert_eq!(agent.description, "Declared description");
+        assert_eq!(agent.model.as_deref(), Some("example-model"));
+        let def = agent.definition.as_ref().unwrap();
+        assert_eq!(def.declared_id.as_deref(), Some("dayour-example"));
+        assert_eq!(def.tools.len(), 3);
+        assert_eq!(def.tools[2].server.as_deref(), Some("files"));
+        assert_eq!(def.omitted_entries, 1);
+        assert!(!serde_json::to_string(&agent).unwrap().contains("PRIVATE"));
+    }
+
+    #[test]
+    fn studio_contract_keeps_local_agents_compatible_and_cache_roundtrips() {
+        let local = parse_agent_definition(
+            "---\nname: local\ndescription: Local agent\n---\n",
+            "local.md",
+        )
+        .unwrap();
+        assert!(local.source.is_none());
+        let value = serde_json::to_value(&local).unwrap();
+        assert!(value.get("source").is_none());
+        assert_eq!(
+            serde_json::from_value::<CopilotAgent>(value).unwrap(),
+            local
+        );
+        let snapshot = studio_snapshot();
+        let cache = studio_catalog::Cache {
+            schema_version: 1,
+            sources: vec![snapshot.clone()],
+        };
+        let value = serde_json::to_value(&cache).unwrap();
+        assert_eq!(
+            value["sources"][0]["config"]["account"],
+            "person@example.com"
+        );
+        assert_eq!(
+            value["sources"][0]["config"]["subscriptionId"],
+            studio_source().subscription_id
+        );
+        assert_eq!(
+            value["sources"][0]["agents"][0]["source"]["provider"],
+            "copilot-studio"
+        );
+        let decoded: studio_catalog::Cache = serde_json::from_value(value).unwrap();
+        studio_catalog::validate_snapshot(&decoded.sources[0], 10_100).unwrap();
+        assert_eq!(decoded.sources[0].agents, snapshot.agents);
+    }
+
+    #[test]
+    fn studio_guard_rejects_before_workspace_validation_or_runtime_connection() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let state = CopilotRuntimeState::default();
+        let agent = Some(studio_rows()[0].id.clone());
+        for result in [
+            state.new_session(app.handle(), agent.clone(), "invalid-relative-root".into()),
+            state.load_session(
+                app.handle(),
+                agent.clone(),
+                "session".into(),
+                "invalid-relative-root".into(),
+            ),
+            state.resume_session(
+                app.handle(),
+                agent,
+                "session".into(),
+                "invalid-relative-root".into(),
+            ),
+        ] {
+            let error = result.unwrap_err();
+            assert!(error.said.contains("catalog-only"));
+            assert!(error.detail.is_none());
+        }
+        assert!(state
+            .configure(
+                "session".into(),
+                "agent".into(),
+                studio_rows()[0].id.clone()
+            )
+            .unwrap_err()
+            .said
+            .contains("catalog-only"));
+        assert!(state.runtime.lock().unwrap().is_none());
+        assert!(require_local_agent(Some(" STUDIO:untrusted ")).is_err());
+        assert!(require_local_agent(Some("local-agent")).is_ok());
+        assert!(require_local_agent(None).is_ok());
+    }
+
+    #[test]
+    #[ignore = "Requires explicitly approved real studio-sources.json and existing Azure CLI authentication"]
+    fn studio_catalog_refresh_live() {
+        let catalog = studio_catalog::catalog(true).expect("Configured Studio refresh failed");
+        for source in &catalog.sources {
+            print!(
+                "{} bots={} state={}",
+                source.environment_name, source.agent_count, source.state
+            );
+            for kind in ["workflow", "canvas-app", "model-driven-app"] {
+                if let Some(rows) = source.assets.as_ref().filter(|_| {
+                    !source
+                        .asset_warnings
+                        .iter()
+                        .any(|w| w.starts_with(&format!("{kind}: ")))
+                }) {
+                    print!(" {kind}={}", rows.iter().filter(|r| r.kind == kind).count());
+                } else {
+                    print!(" {kind}=uncollected");
+                }
+            }
+            println!(
+                " error={:?} assetWarnings={:?}",
+                source.error, source.asset_warnings
+            );
+        }
+        println!(
+            "sources={} agents={} warnings={}",
+            catalog.sources.len(),
+            catalog.agents.len(),
+            catalog.warnings.len()
+        );
+        assert!(!catalog.sources.is_empty(), "No Studio sources configured");
+        assert!(
+            catalog
+                .sources
+                .iter()
+                .all(|source| source.state == "ready" && source.asset_warnings.is_empty()),
+            "Some Studio sources did not refresh successfully"
+        );
+        assert!(
+            catalog.warnings.is_empty(),
+            "Catalog persistence or validation reported a warning"
+        );
     }
 }

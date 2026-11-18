@@ -97,6 +97,32 @@ A failed replay clears its incomplete display and reports that the conversation
 did not open. The durable local draft and complete-opening recovery changes
 above supersede this version's runtime-ID-only draft handling.
 
+### Agent memory and Harvest
+
+The agent dashboard's Harvest controls save pins, review status, dismissals and
+explicitly imported flashcard references per agent. Darbot stores the version 1
+ledger under `harvest` in its OS-managed local app-data directory, using a hashed
+agent identifier as the filename. This is separate from conversation drafts and
+the optional Copilot SDK runtime-memory setting.
+
+On first access, Darbot copies a valid legacy WebView ledger only if that agent
+does not already have a native ledger. It leaves the original in place and does
+not replace an existing, corrupt or unsupported native ledger. If a write
+fails, the UI reports the error and keeps the last saved state. Draft feedback
+moves to the recorded session when it opens; if that session already has
+feedback, the recorded session's decisions take precedence.
+
+Flashcards are reference data, not prompt instructions. Import and export are
+explicit, and the flashcard format and existing UI controls are unchanged.
+Harvest does not write to external session archives, send their contents, or
+collect cross-session word-shape data.
+
+Set `DARBOT_3DKG_ROOT` to a trusted local archive directory to include its
+read-only inventory. Darbot does not probe a machine-specific drive by default.
+Copilot Studio is configured separately. Workflow and app metadata are not
+queried unless the local catalog configuration explicitly enables
+`assetInventory` for the individual source.
+
 ### Agent conversation links and incremental history in desktop 0.0.18
 
 Importing agents now links existing conversations for those workspace agents and
@@ -124,6 +150,14 @@ not truncated. This bounds rendering when importing an entire agent catalog.
 
 ### Workspace surfaces in desktop 0.0.17
 
+The current desktop also supports a floating widget. **Widget** enters the
+frameless live tile, **Chat** / **Tile** flips faces without remounting the
+conversation, and **Wide** selects a 640 by 480 logical-pixel, Duo-like view.
+**Portrait** returns to the narrow tile; **Expand** restores the full-window
+bounds. Text, agent icons, tabs, and composer spacing adapt to both viewport
+dimensions. **Pin** is optional always-on-top; closing hides to tray, and
+Windows sign-in autostart is not added.
+
 **New agent** and **New chat** sit beside the Darbot mark at the top of the left
 sidebar. Copilot CLI remains available as the built-in agent even when no custom
 agents are imported. The sidebar groups each agent's chats and keeps
@@ -141,8 +175,12 @@ Copilot session. Adding a skill or command only inserts text and does not start
 or run a session.
 
 **Import agents** is available from Settings and Profile, not the sidebar.
-Profile's **Model providers** section describes the actual Copilot connection;
-model and reasoning settings remain runtime-negotiated in Settings. Other
+Profile's **Model providers** section describes the actual Copilot connection.
+Click an agent's sidebar icon to inspect its settings, history, and chat
+disclosure. Model, reasoning, and mode controls remain runtime-negotiated and
+appear only for the inspected agent's active session. Inspecting another agent
+does not switch or reconfigure the current session. General appearance and
+working-folder settings stay in **Settings**. Other
 providers still require the separate container deployment setup. Profile-scoped
 multi-provider routing, lavamem, OneDrive/MSAL, and an independent terminal are
 not implemented by these UI tabs.
@@ -531,6 +569,27 @@ transport state rather than the primary navigation. It needs:
 Unsupported capabilities are hidden or disabled with an explanation. They are
 not represented by controls that fail after being clicked.
 
+### Desktop UI semantic object model
+
+`desktop/src/ui-semantic-model.ts` owns the versioned Workspace/Canvas/CLI
+surface list, the Layer 1 sidepane description, and MCP-compatible tool schemas
+for desktop controls, setup/import flows, SDK actions, and native menu actions.
+Each action has a stable `data-ui-action` reference, an input JSON Schema
+(`type: object`, explicit properties and required fields, no extra fields), a
+title, description, MCP annotations, surface, platform, effect, and a
+`humanOnly` marker. `desktop/src/ui-semantic-model.test.ts` checks every
+interactive React control and the native menus against this catalog, so new
+controls require an explicit action schema.
+
+The schemas are **declarations, not executable MCP tools**. No MCP server
+registers them, there are no tool handlers or success-shaped output schemas,
+and descriptions or MCP annotations are not an authorization mechanism.
+Credential entry, permission decisions, prompts, process control, clipboard
+access, and other stateful actions remain user-operated. A future MCP adapter
+must add authenticated session scoping, consent, argument validation, explicit
+errors, and real handlers before exposing any action. This work does not add
+sidepane selection or user-customized layer variations.
+
 ## Error handling
 
 User-facing failures carry a short action and technical detail:
@@ -584,6 +643,10 @@ Release verification against the actual installed CLI must include:
 - new personal-agent creation and persistent left-sidebar chat navigation;
 - successful prompts with multiple selected agents and real enabled skills;
 - profile, negotiated model/reasoning settings and persisted UI preferences;
+- portrait/wide widget transitions, flip, pin, full-window bounds restoration,
+  and draft preservation in the installed Windows desktop app;
+- dense agent rows and non-clipping tabs/composer at 640 by 480 logical pixels,
+  including Windows display scaling and keyboard access to agent settings;
 - React loading, warning, login, ready and unsupported-capability states;
 - process cleanup when the app quits or the runtime is switched;
 - content-only screenshots of the installed release, with credentials and

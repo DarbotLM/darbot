@@ -149,8 +149,12 @@ export function HarnessPicker({
       )}
       {failure && <Failure problem={failure} />}
       {!loading && !failure && (
-        <details open={open} onToggle={(e) => setOpen(e.currentTarget.open)}>
-          <summary>
+        <details
+          data-ui-action="setup_framework_options"
+          open={open}
+          onToggle={(e) => setOpen(e.currentTarget.open)}
+        >
+          <summary data-ui-action="setup_framework_options">
             {picked && picked.id !== DEFAULT_HARNESS
               ? `Using ${picked.name}`
               : "Choose the agent framework"}
@@ -168,6 +172,7 @@ export function HarnessPicker({
               >
                 <input
                   type="radio"
+                  data-ui-action="setup_select_framework"
                   name="harness"
                   className="tile-input"
                   value={row.id}
@@ -197,6 +202,7 @@ export function HarnessPicker({
               <label htmlFor="agent-url">AG-UI endpoint</label>
               <input
                 id="agent-url"
+                data-ui-action="setup_select_framework"
                 value={byoAgentUrl}
                 onChange={(event) =>
                   onChoose({
@@ -213,11 +219,17 @@ export function HarnessPicker({
       )}
 
       <div className="row">
-        <button type="button" className="quiet" onClick={onBack}>
+        <button
+          type="button"
+          className="quiet"
+          data-ui-action="setup_back"
+          onClick={onBack}
+        >
           Back
         </button>
         <button
           type="button"
+          data-ui-action="setup_continue"
           disabled={
             loading ||
             failure !== null ||

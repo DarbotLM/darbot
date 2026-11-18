@@ -464,6 +464,7 @@ export function ProviderPicker({
               <input
                 type="radio"
                 name="provider"
+                data-ui-action="setup_select_provider"
                 className="tile-input"
                 value={r.id}
                 checked={open === r.id}
@@ -524,6 +525,7 @@ export function ProviderPicker({
                   type="button"
                   key={option}
                   role="tab"
+                  data-ui-action="setup_select_login"
                   aria-selected={login === option}
                   className={login === option ? "on" : ""}
                   onClick={() => setLogin(option)}
@@ -546,7 +548,12 @@ export function ProviderPicker({
                   Your plan will be used.
                 </p>
                 {!token && (
-                  <button type="button" disabled={busy} onClick={beginSignIn}>
+                  <button
+                    type="button"
+                    data-ui-action="setup_sign_in_provider"
+                    disabled={busy}
+                    onClick={beginSignIn}
+                  >
                     Sign in again with {row.name}
                   </button>
                 )}
@@ -576,7 +583,12 @@ export function ProviderPicker({
                     box with no link is then a dead end. */}
                 <p className="fallback">
                   Didn't open?{" "}
-                  <a href={signInUrl} target="_blank" rel="noreferrer">
+                  <a
+                    data-ui-action="open_external_link"
+                    href={signInUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
                     Open the sign-in page
                   </a>
                 </p>
@@ -586,6 +598,7 @@ export function ProviderPicker({
                       <label htmlFor="code">Code from your browser</label>
                       <input
                         id="code"
+                        data-ui-action="setup_finish_provider_sign_in"
                         value={code}
                         onChange={(e) => setCode(e.target.value)}
                         autoComplete="off"
@@ -594,6 +607,7 @@ export function ProviderPicker({
                     </div>
                     <button
                       type="button"
+                      data-ui-action="setup_finish_provider_sign_in"
                       disabled={busy || code.trim().length === 0}
                       onClick={finishSignIn}
                     >
@@ -612,7 +626,12 @@ export function ProviderPicker({
                   Opens {row.name} in your browser. Nothing is typed here and no
                   key is stored.
                 </p>
-                <button type="button" disabled={busy} onClick={beginSignIn}>
+                <button
+                  type="button"
+                  data-ui-action="setup_sign_in_provider"
+                  disabled={busy}
+                  onClick={beginSignIn}
+                >
                   {busy ? "Starting…" : `Sign in with ${row.name}`}
                 </button>
                 {!busy &&
@@ -621,6 +640,7 @@ export function ProviderPicker({
                     <button
                       type="button"
                       className="quiet"
+                      data-ui-action="setup_reuse_provider_sign_in"
                       onClick={() =>
                         setReuse({ provider: row.id, login: "plan" })
                       }
@@ -648,6 +668,7 @@ export function ProviderPicker({
                   <button
                     type="button"
                     className="quiet"
+                    data-ui-action="setup_reuse_provider_key"
                     onClick={() => {
                       setApiKey("");
                       setReuse({ provider: row.id, login: "api-key" });
@@ -660,6 +681,7 @@ export function ProviderPicker({
                 <label htmlFor="key">{row.name} API key</label>
                 <input
                   id="key"
+                  data-ui-action="setup_provider_key"
                   type="password"
                   value={apiKey}
                   onChange={(e) => setApiKey(e.target.value)}
@@ -678,6 +700,7 @@ export function ProviderPicker({
                   <button
                     type="button"
                     className="quiet"
+                    data-ui-action="setup_drop_endpoint_key"
                     onClick={() => setReuseEndpointKey(false)}
                   >
                     Continue without the saved key
@@ -688,6 +711,7 @@ export function ProviderPicker({
                 <label htmlFor="base">Base URL</label>
                 <input
                   id="base"
+                  data-ui-action="setup_endpoint_url"
                   value={baseUrl}
                   onChange={(e) => {
                     const next = e.target.value;
@@ -706,12 +730,15 @@ export function ProviderPicker({
                 />
               </div>
               <details className="field">
-                <summary>Advanced compatible endpoint options</summary>
+                <summary data-ui-action="inspect_details">
+                  Advanced compatible endpoint options
+                </summary>
                 <label htmlFor="container-base">
                   Container Base URL, if different
                 </label>
                 <input
                   id="container-base"
+                  data-ui-action="setup_container_endpoint_url"
                   value={containerBaseUrl}
                   onChange={(e) => setContainerBaseUrl(e.target.value)}
                   placeholder="http://ollama:11434/v1"
@@ -727,6 +754,7 @@ export function ProviderPicker({
                 <label htmlFor="model">Model name</label>
                 <input
                   id="model"
+                  data-ui-action="setup_model_name"
                   value={model}
                   onChange={(e) => setModel(e.target.value)}
                   placeholder="the name the endpoint knows it by"
@@ -737,6 +765,7 @@ export function ProviderPicker({
                 <label htmlFor="ekey">API key, if the endpoint needs one</label>
                 <input
                   id="ekey"
+                  data-ui-action="setup_provider_key"
                   type="password"
                   value={apiKey}
                   onChange={(e) => setApiKey(e.target.value)}
@@ -799,6 +828,7 @@ export function ProviderPicker({
                   </p>
                   <button
                     type="button"
+                    data-ui-action="setup_sign_in_provider"
                     disabled={busy}
                     onClick={signInToCopilot}
                   >
@@ -811,7 +841,9 @@ export function ProviderPicker({
                 ...(copilotInventory?.warnings ?? []),
               ].length > 0 && (
                 <details className="copilot-warnings">
-                  <summary>Copilot CLI warnings</summary>
+                  <summary data-ui-action="inspect_details">
+                    Copilot CLI warnings
+                  </summary>
                   <ul>
                     {[
                       ...(copilotStatus?.warnings ?? []),
@@ -832,6 +864,7 @@ export function ProviderPicker({
             <p className="caution">
               {row.caution.says}{" "}
               <a
+                data-ui-action="open_external_link"
                 href={row.caution.reads_more_at}
                 target="_blank"
                 rel="noreferrer"
@@ -844,11 +877,17 @@ export function ProviderPicker({
       )}
 
       <div ref={actionsRef} className="row provider-actions">
-        <button type="button" className="quiet" onClick={onBack}>
+        <button
+          type="button"
+          className="quiet"
+          data-ui-action="setup_back"
+          onClick={onBack}
+        >
           Back
         </button>
         <button
           type="button"
+          data-ui-action="setup_continue"
           disabled={
             loadingProviders ||
             providerFailure !== null ||

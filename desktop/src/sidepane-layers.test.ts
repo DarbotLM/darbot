@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { expect, mock, test } from "bun:test";
 import {
   COPILOT_WORKSPACE_SIDEPANE,
   defineSidepane,
@@ -45,6 +45,9 @@ test("layers are ordered by region and then declared order", () => {
     "first",
     "second",
   ]);
+  expect(Object.isFrozen(spec)).toBe(true);
+  expect(Object.isFrozen(spec.layers)).toBe(true);
+  expect(spec.layers.every(Object.isFrozen)).toBe(true);
 });
 
 test("invalid sidepane descriptions are rejected", () => {
@@ -71,6 +74,38 @@ test("invalid sidepane descriptions are rejected", () => {
     }),
   ).toThrow(/without being collapsible/);
   expect(() => sidepaneLayer(COPILOT_WORKSPACE_SIDEPANE, "missing")).toThrow();
+});
+
+test("sidepane declarations reject malformed shapes, unsafe keys, and coercion", () => {
+  const invalid = (value: unknown) => () =>
+    defineSidepane(value as Parameters<typeof defineSidepane>[0]);
+  const spec = (layer: unknown) => ({
+    id: "demo",
+    label: "Demo",
+    layers: [layer],
+  });
+  const layer = { id: "agent", title: "Agent", region: "body" };
+  expect(invalid(null)).toThrow(/must be an object/);
+  expect(invalid({ ...spec(layer), extra: true })).toThrow(
+    /unsupported fields/,
+  );
+  expect(invalid(spec({ ...layer, other: true }))).toThrow(
+    /unsupported fields/,
+  );
+  expect(invalid(spec(null))).toThrow(/must be an object/);
+  expect(invalid({ ...spec(layer), id: "demo:other" })).toThrow(/identifier/);
+  expect(invalid(spec({ ...layer, id: " agent" }))).toThrow(/identifier/);
+  expect(invalid(spec({ ...layer, collapsible: "false" }))).toThrow(/boolean/);
+  expect(invalid(spec({ ...layer, expandedByDefault: "true" }))).toThrow(
+    /boolean/,
+  );
+  expect(invalid(spec({ ...layer, region: "aside" }))).toThrow(/must sit in/);
+  expect(invalid(spec({ ...layer, order: -1 }))).toThrow(
+    /non-negative integer/,
+  );
+  expect(invalid(spec({ ...layer, order: 1.5 }))).toThrow(
+    /non-negative integer/,
+  );
 });
 
 test("agent groups collapse by default and open for the active agent", () => {
@@ -134,24 +169,80 @@ test("disclosure state round-trips through storage", () => {
   );
   writeSidepaneDisclosure(disclosure, store);
   expect(readSidepaneDisclosure(store)).toEqual(disclosure);
-});
-
-test("unreadable saved layouts fall back to defaults instead of failing", () => {
-  expect(
-    readSidepaneDisclosure(
-      storage({ [SIDEPANE_DISCLOSURE_STORAGE_KEY]: "{not json" }),
-    ),
-  ).toEqual(emptySidepaneDisclosure());
   expect(
     readSidepaneDisclosure(
       storage({
-        [SIDEPANE_DISCLOSURE_STORAGE_KEY]: JSON.stringify({
-          schemaVersion: 99,
-          groups: {},
-        }),
+        [SIDEPANE_DISCLOSURE_STORAGE_KEY]:
+          '{"schemaVersion":1,"groups":{"agents:architect":true}}',
       }),
     ),
-  ).toEqual(emptySidepaneDisclosure());
+  ).toEqual(disclosure);
+});
+
+test("unusual agent IDs remain usable without corrupting saved choices", () => {
+  const store = storage();
+  let disclosure = setSidepaneGroupExpanded(
+    emptySidepaneDisclosure(),
+    SIDEPANE_AGENT_LAYER,
+    "architect",
+    true,
+  );
+  disclosure = setSidepaneGroupExpanded(
+    disclosure,
+    SIDEPANE_AGENT_LAYER,
+    " agent with unsupported metadata ",
+    true,
+  );
+  expect(
+    isSidepaneGroupExpanded(
+      disclosure,
+      SIDEPANE_AGENT_LAYER,
+      " agent with unsupported metadata ",
+    ),
+  ).toBe(true);
+  const warn = console.warn;
+  const warnings = mock(() => {});
+  console.warn = warnings;
+  try {
+    writeSidepaneDisclosure(disclosure, store);
+    expect(warnings).toHaveBeenCalledTimes(1);
+  } finally {
+    console.warn = warn;
+  }
+  expect(readSidepaneDisclosure(store)).toEqual(
+    setSidepaneGroupExpanded(
+      emptySidepaneDisclosure(),
+      SIDEPANE_AGENT_LAYER,
+      "architect",
+      true,
+    ),
+  );
+});
+
+test("unreadable saved layouts fall back to defaults instead of failing", () => {
+  const warn = console.warn;
+  const warnings = mock(() => {});
+  console.warn = warnings;
+  try {
+    expect(
+      readSidepaneDisclosure(
+        storage({ [SIDEPANE_DISCLOSURE_STORAGE_KEY]: "{not json" }),
+      ),
+    ).toEqual(emptySidepaneDisclosure());
+    expect(
+      readSidepaneDisclosure(
+        storage({
+          [SIDEPANE_DISCLOSURE_STORAGE_KEY]: JSON.stringify({
+            schemaVersion: 99,
+            groups: {},
+          }),
+        }),
+      ),
+    ).toEqual(emptySidepaneDisclosure());
+    expect(warnings).toHaveBeenCalledTimes(2);
+  } finally {
+    console.warn = warn;
+  }
   expect(() =>
     validateSidepaneDisclosure({
       schemaVersion: 1,
@@ -161,6 +252,27 @@ test("unreadable saved layouts fall back to defaults instead of failing", () => 
   expect(() =>
     validateSidepaneDisclosure({ schemaVersion: 1, groups: {}, extra: 1 }),
   ).toThrow(/unsupported fields/);
+  expect(() =>
+    validateSidepaneDisclosure({
+      schemaVersion: 1,
+      groups: { "agents:": true },
+    }),
+  ).toThrow(/group keys are invalid/);
+  expect(() =>
+    validateSidepaneDisclosure({
+      schemaVersion: 1,
+      groups: { "agents: agent ": true },
+    }),
+  ).toThrow(/group keys are invalid/);
+  expect(() =>
+    validateSidepaneDisclosure({
+      schemaVersion: 1,
+      groups: { "agents:architect": true, "agents:architect:mobile": false },
+    }),
+  ).not.toThrow();
+  expect(() => sidepaneGroupKey("agents:other", "architect")).toThrow(
+    /identifier/,
+  );
 });
 
 test("the workspace sidepane composes the expected layers", () => {

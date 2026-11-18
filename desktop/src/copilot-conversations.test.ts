@@ -29,6 +29,25 @@ function chat(
   };
 }
 
+test("a reused session ID cannot import another folder's or agent's draft", () => {
+  const existing = { ...chat("same", "local:a"), draft: "private" };
+  const entries = [
+    { ...existing, cwd: "C:\\different" },
+    chat("same", "local:b"),
+  ];
+  const rows = conversationHistoryRows([existing], entries);
+  expect(new Set(rows.map((row) => row.conversationId)).size).toBe(3);
+  expect(rows.filter((row) => row.draft)).toEqual([existing]);
+  const linked = mergeLinkedConversations(
+    [existing],
+    entries,
+    ["local:a", "local:b"],
+    null,
+  );
+  expect(linked.filter((row) => row.draft)).toEqual([existing]);
+  expect(linked).toHaveLength(3);
+});
+
 test("linking includes only requested agents and the built-in CLI", () => {
   const history = [
     chat("one"),
@@ -112,6 +131,7 @@ test("linked references contain metadata only and never copy extra runtime paylo
     "conversationId",
     "cwd",
     "draft",
+    "provider",
     "sessionId",
     "title",
     "updatedAt",
@@ -127,7 +147,7 @@ test("untitled history does not overwrite an existing useful title", () => {
   };
   expect(
     mergeLinkedConversations([existing], [item], ["architect"], null),
-  ).toEqual([existing]);
+  ).toEqual([{ ...existing, provider: "copilot-cli" }]);
   expect(
     mergeLinkedConversations([], [item], ["architect"], null)[0].title,
   ).toBe("Untitled conversation");

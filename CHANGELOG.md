@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Persist desktop Harvest decisions and validated flashcard
+  references per agent in Darbot's app data. Keep the original WebView ledger
+  during migration, and report storage errors without replacing existing data.
+- Add a floating desktop live-tile/workspace flipcard with optional pinning,
+  hide-to-tray behavior, and portrait or 640 by 480 wide widget shapes.
+- Scale widget typography and spacing to both viewport dimensions, retain the
+  agents pane in wide mode, and condense agent rows into lightly overlapping
+  visual layers without changing conversation ownership.
+- Open agent-specific actions, history, disclosure, and negotiated session
+  settings from agent icons; keep general settings separate.
+
 ## 0.0.21
 
 - Add an explicit optional Copilot SDK background workspace panel with native

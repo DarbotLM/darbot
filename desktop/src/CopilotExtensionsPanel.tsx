@@ -13,6 +13,7 @@ type ExtensionPlugin = {
   enabled: boolean;
   version?: string | null;
   canToggle: boolean;
+  origin: string;
 };
 
 type ExtensionTask = {
@@ -102,6 +103,17 @@ export function CopilotExtensionsPanel({ cwd }: { cwd: string }) {
       if (!taskAgent && agents[0]) setTaskAgent(agents[0].id);
     } catch (error) {
       setProblem(asProblem(error));
+      // Some failed operations retire the owned SDK client. Don't leave a
+      // disconnected workspace showing live controls.
+      if (snapshot) {
+        try {
+          setSnapshot(
+            await invoke<ExtensionSnapshot | null>("copilot_extensions_status"),
+          );
+        } catch {
+          setSnapshot(null);
+        }
+      }
     } finally {
       setBusy(false);
     }
@@ -145,6 +157,7 @@ export function CopilotExtensionsPanel({ cwd }: { cwd: string }) {
           <label className="copilot-checkbox-row">
             <input
               type="checkbox"
+              data-ui-action="sdk_memory"
               checked={memoryEnabled}
               onChange={(event) => setMemoryEnabled(event.target.checked)}
               disabled={busy}
@@ -154,7 +167,12 @@ export function CopilotExtensionsPanel({ cwd }: { cwd: string }) {
               <small>Off by default. This is not Darbot lavamem.</small>
             </span>
           </label>
-          <button type="button" onClick={connect} disabled={busy}>
+          <button
+            type="button"
+            data-ui-action="sdk_connect"
+            onClick={connect}
+            disabled={busy}
+          >
             {busy ? "Connecting..." : "Connect SDK workspace"}
           </button>
         </div>
@@ -167,6 +185,7 @@ export function CopilotExtensionsPanel({ cwd }: { cwd: string }) {
             <button
               type="button"
               className="quiet"
+              data-ui-action="sdk_refresh"
               onClick={() =>
                 void run({
                   kind: "refresh",
@@ -180,6 +199,7 @@ export function CopilotExtensionsPanel({ cwd }: { cwd: string }) {
             <button
               type="button"
               className="quiet"
+              data-ui-action="sdk_list_remote"
               onClick={() =>
                 void run({
                   kind: "list-remote",
@@ -193,6 +213,7 @@ export function CopilotExtensionsPanel({ cwd }: { cwd: string }) {
             <button
               type="button"
               className="quiet"
+              data-ui-action="sdk_disconnect"
               onClick={() =>
                 void run(
                   { kind: "disconnect", connectionId: snapshot.connectionId },
@@ -213,6 +234,7 @@ export function CopilotExtensionsPanel({ cwd }: { cwd: string }) {
                 <>
                   <div className="copilot-extension-form">
                     <select
+                      data-ui-action="sdk_select_task_agent"
                       value={taskAgent}
                       onChange={(event) => setTaskAgent(event.target.value)}
                       disabled={busy || agents.length === 0}
@@ -226,12 +248,14 @@ export function CopilotExtensionsPanel({ cwd }: { cwd: string }) {
                       ))}
                     </select>
                     <input
+                      data-ui-action="sdk_set_task_name"
                       value={taskName}
                       onChange={(event) => setTaskName(event.target.value)}
                       placeholder="Task name"
                       maxLength={128}
                     />
                     <textarea
+                      data-ui-action="sdk_set_task_prompt"
                       value={taskPrompt}
                       onChange={(event) => setTaskPrompt(event.target.value)}
                       placeholder="Task prompt"
@@ -240,6 +264,7 @@ export function CopilotExtensionsPanel({ cwd }: { cwd: string }) {
                     />
                     <button
                       type="button"
+                      data-ui-action="sdk_start_task"
                       onClick={() => {
                         void run({
                           kind: "start-task",
@@ -274,6 +299,7 @@ export function CopilotExtensionsPanel({ cwd }: { cwd: string }) {
                           <button
                             type="button"
                             className="quiet"
+                            data-ui-action="sdk_cancel_task"
                             onClick={() =>
                               void run({
                                 kind: "cancel-task",
@@ -299,11 +325,16 @@ export function CopilotExtensionsPanel({ cwd }: { cwd: string }) {
             </div>
             <div>
               <h3>Plugins</h3>
+              <p className="hint">
+                This CLI profile only. Enabled means configured for new
+                sessions; inventory does not run plugins or verify their service
+                sign-in.
+              </p>
               {unavailable(snapshot.plugins) ? (
                 <p className="caution">{unavailable(snapshot.plugins)}</p>
               ) : plugins.length === 0 ? (
                 <p className="hint">
-                  No toggleable marketplace plugins were reported.
+                  The CLI reported no installed plugins in this profile.
                 </p>
               ) : (
                 <ul className="copilot-extension-list">
@@ -311,11 +342,19 @@ export function CopilotExtensionsPanel({ cwd }: { cwd: string }) {
                     <li key={plugin.id}>
                       <span>
                         <strong>{plugin.name}</strong>
-                        <small>{plugin.version ?? "Installed"}</small>
+                        <small>
+                          {plugin.origin} ·{" "}
+                          {plugin.enabled ? "Enabled" : "Disabled"}
+                          {plugin.version ? ` · ${plugin.version}` : ""}
+                          {!plugin.canToggle
+                            ? " · Not toggleable through this SDK"
+                            : ""}
+                        </small>
                       </span>
                       <button
                         type="button"
                         className="quiet"
+                        data-ui-action="sdk_toggle_plugin"
                         onClick={() =>
                           void run({
                             kind: "set-plugin-enabled",
@@ -336,7 +375,9 @@ export function CopilotExtensionsPanel({ cwd }: { cwd: string }) {
           </div>
           {remoteSessions.length > 0 && (
             <details className="copilot-runtime-warnings" open>
-              <summary>Remote sessions discovered</summary>
+              <summary data-ui-action="inspect_details">
+                Remote sessions discovered
+              </summary>
               <ul>
                 {remoteSessions.map((remote) => (
                   <li key={remote.id}>

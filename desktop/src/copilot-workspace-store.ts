@@ -3,8 +3,9 @@ import type {
   CopilotWorkspaceChat,
 } from "./copilot-types";
 import type { Problem } from "./Problem";
+import { requireLocalAgent } from "./copilot-types";
 
-export const WORKSPACE_SCHEMA_VERSION = 1;
+export const WORKSPACE_SCHEMA_VERSION = 2;
 export const WORKSPACE_STORAGE_KEY = "darbot:copilot:workspace";
 export const MAX_DRAFT_LENGTH = 32_000;
 const LEGACY_STORAGE_KEY = "darbot:copilot:preferences";
@@ -69,6 +70,13 @@ function onlyKeys(
 }
 
 function metadata(value: Record<string, unknown>) {
+  if (value.provider !== undefined && value.provider !== "copilot-cli") {
+    throw new Error(
+      "This conversation belongs to an unsupported provider. Its original data was not changed.",
+    );
+  }
+  const agentId = text(value.agentId, "Conversation agent", 1024, true);
+  requireLocalAgent(agentId);
   const updatedAt = value.updatedAt;
   if (
     updatedAt !== undefined &&
@@ -85,17 +93,28 @@ function metadata(value: Record<string, unknown>) {
   }
   return {
     cwd: text(value.cwd, "Conversation working folder", 32_768),
-    agentId: text(value.agentId, "Conversation agent", 1024, true),
+    agentId,
+    provider: "copilot-cli" as const,
     agentName: text(value.agentName, "Conversation agent name", 1024),
     title: text(value.title, "Conversation title", 32_000),
     updatedAt: updatedAt ?? null,
   };
 }
 
+export function sessionScope(chat: {
+  agentId: string;
+  cwd: string;
+  sessionId: string | null;
+}) {
+  return JSON.stringify([chat.agentId, chat.cwd, chat.sessionId]);
+}
+
 export function conversationFromHistory(
   item: CopilotHistorySession,
 ): CopilotWorkspaceChat {
+  requireLocalAgent(item.agentId);
   return {
+    provider: "copilot-cli",
     conversationId: `copilot:${item.sessionId}`,
     sessionId: item.sessionId,
     cwd: item.cwd,
@@ -112,7 +131,9 @@ export function createConversationDraft(
   agentId: string,
   agentName: string,
 ): CopilotWorkspaceChat {
+  requireLocalAgent(agentId);
   return {
+    provider: "copilot-cli",
     conversationId: crypto.randomUUID(),
     sessionId: null,
     cwd,
@@ -133,7 +154,10 @@ export function validateConversationWorkspace(
     ["schemaVersion", "activeConversationId", "chats"],
     "Saved Copilot workspace",
   );
-  if (data.schemaVersion !== WORKSPACE_SCHEMA_VERSION) {
+  if (
+    data.schemaVersion !== 1 &&
+    data.schemaVersion !== WORKSPACE_SCHEMA_VERSION
+  ) {
     throw new Error(
       "Unsupported Copilot workspace version. Use the Darbot version that saved it.",
     );
@@ -158,6 +182,7 @@ export function validateConversationWorkspace(
         "title",
         "updatedAt",
         "draft",
+        "provider",
       ],
       "Saved conversation",
     );
@@ -166,18 +191,20 @@ export function validateConversationWorkspace(
       item.sessionId === null
         ? null
         : text(item.sessionId, "Runtime session ID", 512);
+    const info = metadata(item);
+    const scope = sessionScope({ ...info, sessionId });
     if (
       ids.has(conversationId) ||
-      (sessionId !== null && sessions.has(sessionId))
+      (sessionId !== null && sessions.has(scope))
     ) {
       throw new Error(
         "Saved Copilot workspace contains duplicate conversation or runtime session IDs.",
       );
     }
     ids.add(conversationId);
-    if (sessionId !== null) sessions.add(sessionId);
+    if (sessionId !== null) sessions.add(scope);
     return {
-      ...metadata(item),
+      ...info,
       conversationId,
       sessionId,
       draft: text(item.draft, "Conversation draft", MAX_DRAFT_LENGTH, true),

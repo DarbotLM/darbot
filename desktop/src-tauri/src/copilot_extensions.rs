@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use github_copilot_sdk::handler::{PermissionHandler, PermissionResult};
@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{AppHandle, Runtime};
 
-use crate::copilot::{self, CopilotAgent, CopilotPermissionOrigin};
+use crate::copilot::{self, record_transport, CopilotAgent, CopilotPermissionOrigin, Operation};
 use crate::copilot_client::{ClientConsent, ConsentDecision};
 use crate::problem::Problem;
 
@@ -47,6 +47,7 @@ pub struct ExtensionPlugin {
     pub enabled: bool,
     pub version: Option<String>,
     pub can_toggle: bool,
+    pub origin: &'static str,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -168,6 +169,22 @@ struct Workspace {
     cached: Mutex<Option<ExtensionSnapshot>>,
 }
 
+enum RpcAccess {
+    Read(Operation),
+    Mutation,
+}
+
+async fn observe_read<T>(
+    cwd: &str,
+    operation: Operation,
+    future: impl std::future::Future<Output = Result<T, Problem>>,
+) -> Result<T, Problem> {
+    let started = Instant::now();
+    let result = future.await;
+    record_transport(Some(cwd), operation, started, result.is_ok());
+    result
+}
+
 impl Workspace {
     fn shutdown(&self) {
         self.closed.store(true, Ordering::SeqCst);
@@ -178,7 +195,7 @@ impl Workspace {
     async fn rpc<T>(
         &self,
         operation: &str,
-        mutation: bool,
+        access: RpcAccess,
         future: impl std::future::Future<Output = Result<T, github_copilot_sdk::Error>>,
     ) -> Result<T, Problem> {
         if self.closed.load(Ordering::SeqCst) {
@@ -186,24 +203,33 @@ impl Workspace {
                 "The SDK background workspace is disconnected.",
             ));
         }
-        let result = match tokio::time::timeout(RPC_TIMEOUT, future).await {
-            Ok(Ok(value)) => return Ok(value),
-            Ok(Err(error)) => sdk_problem(operation, error),
-            Err(_) => Problem::plain(format!("SDK {operation} exceeded its one-minute deadline.")),
+        let call = async {
+            tokio::time::timeout(RPC_TIMEOUT, future)
+                .await
+                .map_err(|_| {
+                    Problem::plain(format!("SDK {operation} exceeded its one-minute deadline."))
+                })?
+                .map_err(|error| sdk_problem(operation, error))
         };
-        if mutation {
-            self.shutdown();
-            return Err(Problem::with(
-                format!("{} The SDK workspace was stopped to avoid leaving untracked background work. ACP conversations were not changed.", result.said),
-                result.detail.unwrap_or_default(),
-            ));
+        if let RpcAccess::Read(op) = access {
+            return observe_read(&self.cwd, op, call).await;
         }
-        Err(result)
+        call.await.map_err(|problem| {
+            self.shutdown();
+            Problem::with(
+                format!("{} The SDK workspace was stopped to avoid leaving untracked background work. ACP conversations were not changed.", problem.said),
+                problem.detail.unwrap_or_default(),
+            )
+        })
     }
 
     async fn tasks(&self) -> Result<Vec<ExtensionTask>, Problem> {
         let list = self
-            .rpc("task listing", false, self.session.rpc().tasks().list())
+            .rpc(
+                "task listing",
+                RpcAccess::Read(Operation::SdkTasks),
+                self.session.rpc().tasks().list(),
+            )
             .await?;
         if list.tasks.len() > MAX_ROWS {
             return Err(Problem::plain("The SDK returned more than 200 background tasks; the list was not silently truncated."));
@@ -213,7 +239,11 @@ impl Workspace {
 
     async fn plugins(&self) -> Result<Vec<InstalledPluginInfo>, Problem> {
         let list = self
-            .rpc("plugin listing", false, self.client.rpc().plugins().list())
+            .rpc(
+                "plugin listing",
+                RpcAccess::Read(Operation::SdkPlugins),
+                self.client.rpc().plugins().list(),
+            )
             .await?;
         if list.plugins.len() > MAX_ROWS {
             return Err(Problem::plain("The SDK returned more than 200 plugins."));
@@ -223,7 +253,11 @@ impl Workspace {
 
     async fn agents(&self) -> Result<Vec<CopilotAgent>, Problem> {
         let list = self
-            .rpc("agent listing", false, self.session.rpc().agent().list())
+            .rpc(
+                "agent listing",
+                RpcAccess::Read(Operation::SdkAgents),
+                self.session.rpc().agent().list(),
+            )
             .await?;
         if list.agents.len() > MAX_ROWS {
             return Err(Problem::plain("The SDK returned more than 200 agents."));
@@ -237,6 +271,8 @@ impl Workspace {
                     name: bounded(&agent.display_name, 512, "agent name")?,
                     description: bounded(&agent.description, MAX_TEXT, "agent description")?,
                     model: None,
+                    definition: None,
+                    source: None,
                 })
             })
             .collect()
@@ -340,21 +376,23 @@ impl ExtensionState {
             ));
         }
         let cwd = copilot::workspace(Some(cwd))?.cwd;
-        let client = Client::start(client_options(Path::new(&cwd)))
-            .await
-            .map_err(|error| sdk_problem("startup", error))?;
+        let client = start_client(Path::new(&cwd)).await?;
         let id = format!("sdk-{:032x}", rand::random::<u128>());
         let closed = Arc::new(AtomicBool::new(false));
         let prepared = async {
-            let status = tokio::time::timeout(RPC_TIMEOUT, client.get_status()).await
-                .map_err(|_| Problem::plain("SDK status timed out."))?
-                .map_err(|error| sdk_problem("status", error))?;
-            let auth = tokio::time::timeout(RPC_TIMEOUT, client.get_auth_status()).await
-                .map_err(|_| Problem::plain("SDK authentication status timed out."))?
-                .map_err(|error| sdk_problem("authentication status", error))?;
-            if !auth.is_authenticated {
-                return Err(Problem::plain("Sign in through Copilot CLI before starting an SDK workspace. Darbot does not collect its tokens."));
-            }
+            let status = observe_read(&cwd, Operation::SdkStatus, async {
+                tokio::time::timeout(RPC_TIMEOUT, client.get_status()).await
+                    .map_err(|_| Problem::plain("SDK status timed out."))?
+                    .map_err(|error| sdk_problem("status", error))
+            }).await?;
+            observe_read(&cwd, Operation::SdkVerifyAuth, async {
+                let auth = tokio::time::timeout(RPC_TIMEOUT, client.get_auth_status()).await
+                    .map_err(|_| Problem::plain("SDK authentication status timed out."))?
+                    .map_err(|error| sdk_problem("authentication status", error))?;
+                if auth.is_authenticated { Ok(()) } else {
+                    Err(Problem::plain("Sign in through Copilot CLI before starting an SDK workspace. Darbot does not collect its tokens."))
+                }
+            }).await?;
             let permissions = NativePermissions {
                 app: app.clone(),
                 consent: Arc::clone(&consent),
@@ -456,7 +494,7 @@ impl ExtensionState {
                 workspace
                     .rpc(
                         "starting a background agent",
-                        true,
+                        RpcAccess::Mutation,
                         workspace
                             .session
                             .rpc()
@@ -482,7 +520,7 @@ impl ExtensionState {
                 let result = workspace
                     .rpc(
                         "task cancellation",
-                        true,
+                        RpcAccess::Mutation,
                         workspace
                             .session
                             .rpc()
@@ -505,7 +543,7 @@ impl ExtensionState {
                 let result = workspace
                     .rpc(
                         "task message",
-                        true,
+                        RpcAccess::Mutation,
                         workspace
                             .session
                             .rpc()
@@ -535,7 +573,7 @@ impl ExtensionState {
                 let result = workspace
                     .rpc(
                         "fleet start",
-                        true,
+                        RpcAccess::Mutation,
                         workspace.session.rpc().fleet().start(request),
                     )
                     .await?;
@@ -564,13 +602,13 @@ impl ExtensionState {
                     workspace
                         .rpc(
                             "plugin enable",
-                            true,
+                            RpcAccess::Mutation,
                             workspace
                                 .client
                                 .rpc()
                                 .plugins()
                                 .enable(PluginsEnableRequest {
-                                    names: vec![plugin_id],
+                                    names: vec![plugin_id.clone()],
                                     working_directory: Some(workspace.cwd.clone()),
                                 }),
                         )
@@ -579,25 +617,30 @@ impl ExtensionState {
                     workspace
                         .rpc(
                             "plugin disable",
-                            true,
+                            RpcAccess::Mutation,
                             workspace
                                 .client
                                 .rpc()
                                 .plugins()
                                 .disable(PluginsDisableRequest {
-                                    names: vec![plugin_id],
+                                    names: vec![plugin_id.clone()],
                                     working_directory: Some(workspace.cwd.clone()),
                                 }),
                         )
                         .await?;
                 }
+                // This RPC acknowledges even unknown names. Check the effective
+                // setting rather than presenting an ignored request as success.
+                let snapshot = workspace.snapshot().await;
+                verify_toggle(&snapshot.plugins, &plugin_id, enabled)?;
+                return Ok(Some(snapshot));
             }
             ExtensionAction::ListRemote { .. } => {
                 let result =
                     workspace
                         .rpc(
                             "remote session discovery",
-                            false,
+                            RpcAccess::Read(Operation::SdkRemote),
                             workspace.client.rpc().sessions().list_with_params(
                                 SessionsListRequest {
                                     source: Some(SessionSource::Remote),
@@ -675,9 +718,28 @@ impl<R: Runtime> PermissionHandler for NativePermissions<R> {
     }
 }
 
-fn client_options(cwd: &Path) -> ClientOptions {
+// A host launch setting, never an IPC field or a path read from a plugin.
+fn sdk_program(explicit: Option<PathBuf>) -> Result<PathBuf, Problem> {
+    let Some(path) = explicit else {
+        return Ok("copilot".into());
+    };
+    let name = if cfg!(windows) {
+        "copilot.exe"
+    } else {
+        "copilot"
+    };
+    if !path.is_absolute()
+        || path.file_name() != Some(std::ffi::OsStr::new(name))
+        || !path.is_file()
+    {
+        return Err(Problem::plain("DARBOT_COPILOT_SDK_CLI must point to an existing absolute Copilot CLI executable. No other CLI was started."));
+    }
+    Ok(path)
+}
+
+fn client_options(cwd: &Path, program: &Path) -> ClientOptions {
     ClientOptions::new()
-        .with_program(CliProgram::Path(PathBuf::from("copilot")))
+        .with_program(CliProgram::Path(program.to_owned()))
         .with_transport(Transport::Stdio)
         .with_cwd(cwd)
         .with_extra_args(["--no-auto-update"])
@@ -689,6 +751,117 @@ fn client_options(cwd: &Path) -> ClientOptions {
                 .with_integration_name("native-sdk-extensions")
                 .with_integration_version(SCHEMA_VERSION.to_string()),
         )
+}
+
+async fn start_client(cwd: &Path) -> Result<Client, Problem> {
+    let program = sdk_program(std::env::var_os("DARBOT_COPILOT_SDK_CLI").map(PathBuf::from))?;
+    let started = Instant::now();
+    let result =
+        tokio::time::timeout(RPC_TIMEOUT, Client::start(client_options(cwd, &program))).await;
+    if let Some(cwd) = cwd.to_str() {
+        record_transport(
+            Some(cwd),
+            Operation::SdkStart,
+            started,
+            result.as_ref().is_ok_and(Result::is_ok),
+        );
+    }
+    let result =
+        result.map_err(|_| Problem::plain("The Copilot CLI did not start within one minute."))?;
+    match result {
+        Err(error)
+            if matches!(
+                error.kind(),
+                github_copilot_sdk::ErrorKind::Protocol(
+                    github_copilot_sdk::ProtocolErrorKind::VersionMismatch { .. }
+                )
+            ) =>
+        {
+            let mut problem = sdk_problem("startup", error);
+            // Inventory is still supported by the CLI itself. Never downgrade the
+            // negotiated protocol, start a session, or attempt a plugin operation.
+            let started = Instant::now();
+            let inventory = cli_inventory(cwd, &program).await;
+            if let Some(cwd) = cwd.to_str() {
+                record_transport(
+                    Some(cwd),
+                    Operation::FallbackPlugins,
+                    started,
+                    inventory.is_ok(),
+                );
+            }
+            problem.detail = Some(match inventory {
+                Ok(rows) if rows.is_empty() => {
+                    "CLI inventory: no installed plugins in this profile.".into()
+                }
+                Ok(rows) => format!(
+                    "CLI inventory (not a runtime health check):\n{}",
+                    rows.iter()
+                        .map(|p| format!(
+                            "{} · {} · {}",
+                            p.name,
+                            p.origin,
+                            if p.enabled { "enabled" } else { "disabled" }
+                        ))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ),
+                Err(reason) => reason.said,
+            });
+            Err(problem)
+        }
+        other => other.map_err(|error| sdk_problem("startup", error)),
+    }
+}
+
+async fn cli_inventory(cwd: &Path, program: &Path) -> Result<Vec<ExtensionPlugin>, Problem> {
+    use std::process::Stdio;
+    use tokio::io::AsyncReadExt;
+    let read = async {
+        let mut command = crate::quiet::command(program);
+        command
+            .args(["--no-auto-update", "plugin", "list", "--json"])
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .stdout(Stdio::piped());
+        let mut child = tokio::process::Command::from(command)
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|_| {
+                Problem::plain("Could not start the installed CLI for plugin inventory.")
+            })?;
+        let mut bytes = Vec::new();
+        const LIMIT: u64 = 256 * 1024;
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| Problem::plain("Missing CLI inventory output."))?
+            .take(LIMIT + 1)
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|_| Problem::plain("Could not read CLI inventory."))?;
+        if bytes.len() as u64 > LIMIT {
+            return Err(Problem::plain(
+                "CLI plugin inventory exceeded its size limit.",
+            ));
+        }
+        if !child.wait().await.is_ok_and(|s| s.success()) {
+            return Err(Problem::plain(
+                "CLI plugin inventory failed. Check whether plugin list --json is supported.",
+            ));
+        }
+        let rows: Vec<InstalledPluginInfo> = serde_json::from_slice(&bytes).map_err(|_| {
+            Problem::plain("The CLI returned an unsupported plugin inventory format.")
+        })?;
+        if rows.len() > MAX_ROWS {
+            return Err(Problem::plain("CLI inventory exceeds 200 plugins."));
+        }
+        rows.into_iter().map(project_plugin).collect()
+    };
+    tokio::time::timeout(Duration::from_secs(10), read)
+        .await
+        .map_err(|_| Problem::plain("CLI plugin inventory exceeded ten seconds."))?
 }
 
 fn permission_details(data: &PermissionRequestData) -> Result<Value, Problem> {
@@ -770,9 +943,43 @@ fn validate_details(value: &Value, depth: usize) -> Result<(), Problem> {
 }
 
 fn sdk_problem(operation: &str, error: github_copilot_sdk::Error) -> Problem {
+    use github_copilot_sdk::ErrorKind;
+    if let ErrorKind::Protocol(github_copilot_sdk::ProtocolErrorKind::VersionMismatch {
+        server,
+        min,
+        max,
+    }) = error.kind()
+    {
+        return Problem::plain(format!("Copilot CLI reports protocol {server}; Darbot SDK {SDK_VERSION} supports {min}–{max}. Use a reviewed, compatible CLI/SDK pair for the background workspace. This is not a plugin or sign-in failure."));
+    }
+    let cause = match error.kind() {
+        ErrorKind::BinaryNotFound { .. } => {
+            "Copilot CLI was not found. Check the installed CLI on PATH."
+        }
+        ErrorKind::Rpc { code: -32601 } => {
+            "The CLI does not support this SDK operation. Check CLI/SDK compatibility."
+        }
+        ErrorKind::Rpc { code: -32602 } => {
+            "The CLI rejected the operation parameters. Check CLI/SDK compatibility."
+        }
+        ErrorKind::Rpc { .. } => {
+            "The CLI returned an error; this does not establish a plugin failure."
+        }
+        ErrorKind::GitHubTokenProvider => {
+            "GitHub authentication could not be obtained. Check the CLI's own sign-in status."
+        }
+        _ if error.is_transport_failure() => {
+            "The SDK transport failed. Reconnect the background workspace."
+        }
+        _ => "The operation failed. Check the installed CLI and SDK versions.",
+    };
+    // RPC messages can include credentials, absolute paths and plugin-supplied text.
     Problem::with(
-        format!("Copilot SDK {operation} failed. ACP remains available."),
-        error.to_string(),
+        format!("Copilot SDK {operation}: {cause}"),
+        error
+            .rpc_code()
+            .map(|n| format!("JSON-RPC {n}"))
+            .unwrap_or_default(),
     )
 }
 
@@ -799,13 +1006,48 @@ fn required(value: &str, limit: usize, label: &str) -> Result<String, Problem> {
     bounded(value, limit, label)
 }
 
+fn inventory_atom(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
+}
+
+fn verify_toggle(
+    plugins: &Feature<Vec<ExtensionPlugin>>,
+    id: &str,
+    enabled: bool,
+) -> Result<(), Problem> {
+    match plugins {
+        Feature::Unavailable { problem } => Err(problem.clone()),
+        Feature::Available { data } => match data.iter().find(|plugin| plugin.id == id) {
+            Some(plugin) if plugin.enabled == enabled => Ok(()),
+            Some(_) => Err(Problem::plain("The CLI did not apply that plugin setting. Check the profile and repository settings before retrying.")),
+            None => Err(Problem::plain("The plugin is no longer listed in this CLI profile. Refresh its inventory.")),
+        },
+    }
+}
+
 fn project_plugin(plugin: InstalledPluginInfo) -> Result<ExtensionPlugin, Problem> {
-    let name = required(&plugin.name, 256, "plugin name")?;
-    let marketplace = bounded(&plugin.marketplace, 256, "plugin marketplace")?;
-    let can_toggle = !marketplace.is_empty()
-        && plugin.source.as_deref() != Some("builtin")
-        && plugin.direct_source_id.is_none();
-    let id = if marketplace.is_empty() {
+    let name = plugin.name;
+    let marketplace = plugin.marketplace;
+    if !inventory_atom(&name)
+        || (!marketplace.is_empty() && !inventory_atom(&marketplace))
+        || plugin
+            .direct_source_id
+            .as_deref()
+            .is_some_and(|id| !inventory_atom(id))
+    {
+        return Err(Problem::plain(
+            "The CLI returned an unsupported plugin identifier. Check inventory in the CLI.",
+        ));
+    }
+    let builtin = plugin.source.as_deref() == Some("builtin");
+    let can_toggle = !marketplace.is_empty() && !builtin && plugin.direct_source_id.is_none();
+    let id = if builtin {
+        format!("builtin:{name}")
+    } else if marketplace.is_empty() {
         format!(
             "direct:{}",
             plugin.direct_source_id.as_deref().unwrap_or(&name)
@@ -817,8 +1059,19 @@ fn project_plugin(plugin: InstalledPluginInfo) -> Result<ExtensionPlugin, Proble
         id,
         name,
         enabled: plugin.enabled,
-        version: plugin.version,
+        version: plugin.version.filter(|v| {
+            v.len() <= 64
+                && v.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+        }),
         can_toggle,
+        origin: if builtin {
+            "Built-in"
+        } else if marketplace.is_empty() {
+            "Direct install"
+        } else {
+            "Marketplace"
+        },
     })
 }
 
@@ -916,7 +1169,10 @@ mod tests {
 
     #[test]
     fn explicit_installed_stdio_runtime_keeps_authentication_and_remote_export_cli_owned() {
-        let options = client_options(Path::new("C:\\project"));
+        let default_program = sdk_program(None).unwrap();
+        assert!(sdk_program(Some("copilot".into())).is_err());
+        assert!(sdk_program(Some(std::env::current_exe().unwrap())).is_err());
+        let options = client_options(Path::new("C:\\project"), &default_program);
         assert!(
             matches!(options.program, CliProgram::Path(ref path) if path == Path::new("copilot"))
         );
@@ -940,22 +1196,74 @@ mod tests {
     }
 
     #[test]
+    fn plugin_inventory_preserves_origin_without_exposing_manifest_paths() {
+        let project = |value| project_plugin(serde_json::from_value(value).unwrap());
+        let builtin = project(
+            json!({"name":"browser-use","marketplace":"","enabled":false,"source":"builtin"}),
+        )
+        .unwrap();
+        assert_eq!(builtin.id, "builtin:browser-use");
+        assert!(!builtin.can_toggle);
+        let direct = project(
+            json!({"name":"browser-use","marketplace":"","enabled":true,"directSourceId":"abcd"}),
+        )
+        .unwrap();
+        assert_ne!(direct.id, builtin.id);
+        assert!(!direct.can_toggle);
+        let market = project(json!({"name":"tool","marketplace":"local","enabled":false,"installedFrom":"private/path","version":"https://private/path"})).unwrap();
+        assert!(market.version.is_none() && market.can_toggle);
+        assert!(!serde_json::to_string(&market).unwrap().contains("private"));
+        let rows = Feature::Available { data: vec![market] };
+        assert!(verify_toggle(&rows, "tool@local", false).is_ok());
+        assert!(verify_toggle(&rows, "tool@local", true).is_err());
+        assert!(verify_toggle(&rows, "missing@local", false).is_err());
+        assert!(project(json!({"name":"bad\nname","marketplace":"local","enabled":true})).is_err());
+    }
+
+    #[test]
+    fn sdk_unsupported_errors_keep_only_the_code() {
+        let error = github_copilot_sdk::Error::with_message(
+            github_copilot_sdk::ErrorKind::Rpc { code: -32601 },
+            "private",
+        );
+        let problem = sdk_problem("plugin listing", error);
+        assert!(problem.said.contains("does not support"));
+        assert_eq!(problem.detail.as_deref(), Some("JSON-RPC -32601"));
+    }
+
+    #[test]
     #[ignore = "Requires the installed real Copilot CLI; reads status only, never starts a session or changes authentication."]
     fn installed_sdk_transport_handshake() {
         tauri::async_runtime::block_on(async {
             let cwd = std::env::current_dir().unwrap();
-            let client = Client::start(client_options(&cwd))
-                .await
-                .expect("installed CLI SDK startup");
-            let result = tokio::time::timeout(RPC_TIMEOUT, client.get_status()).await;
+            let client = start_client(&cwd).await.expect("installed CLI SDK startup");
+            let result = tokio::time::timeout(RPC_TIMEOUT, async {
+                let status = client
+                    .get_status()
+                    .await
+                    .map_err(|e| sdk_problem("status", e))?;
+                let auth = client
+                    .get_auth_status()
+                    .await
+                    .map_err(|e| sdk_problem("auth status", e))?;
+                let plugins = client
+                    .rpc()
+                    .plugins()
+                    .list()
+                    .await
+                    .map_err(|e| sdk_problem("plugin listing", e))?;
+                Ok::<_, Problem>((status, auth.is_authenticated, plugins.plugins.len()))
+            })
+            .await;
             client.force_stop();
-            let status = result
+            let (status, authenticated, plugins) = result
                 .expect("bounded SDK status")
                 .expect("real SDK status");
             assert!(!status.version.is_empty());
+            assert!(inventory_atom(&status.version));
             assert!(status.protocol_version >= 3);
             println!(
-                "Installed CLI SDK handshake: version {}, protocol {}.",
+                "Installed CLI SDK handshake: version {}, protocol {}, authenticated {authenticated}, {plugins} inventory rows.",
                 status.version, status.protocol_version
             );
         });

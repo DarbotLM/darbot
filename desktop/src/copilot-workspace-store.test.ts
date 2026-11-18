@@ -58,6 +58,7 @@ test("legacy migration preserves agent ownership and leaves import none distinct
       ...legacyChat,
       conversationId: "copilot:legacy-runtime",
       draft: "",
+      provider: "copilot-cli",
     });
     expect(result.workspace.activeConversationId).toBeNull();
     writeConversationWorkspace(result.workspace, store);
@@ -184,4 +185,49 @@ test("storage access failures are explicit", () => {
   expect(() =>
     writeConversationWorkspace(emptyConversationWorkspace(), denied),
   ).toThrow("Storage denied");
+});
+
+test("version one migrates in memory without rewriting or losing the original draft", () => {
+  const original = {
+    schemaVersion: 1,
+    activeConversationId: "retained",
+    chats: [
+      {
+        ...legacyChat,
+        conversationId: "retained",
+        draft: "Keep my unsent work",
+      },
+    ],
+  };
+  const raw = JSON.stringify(original);
+  const store = storage({ [WORKSPACE_STORAGE_KEY]: raw });
+  const result = readConversationWorkspace(store);
+  expect(result.ok).toBe(true);
+  if (!result.ok) throw new Error(result.problem.said);
+  expect(result.workspace.schemaVersion).toBe(2);
+  expect(result.workspace.chats[0]).toEqual({
+    ...original.chats[0],
+    provider: "copilot-cli",
+  });
+  expect(store.getItem(WORKSPACE_STORAGE_KEY)).toBe(raw);
+});
+
+test("cloud catalog identities and provider records cannot become local runtime sessions", () => {
+  const id =
+    "studio:11111111-1111-1111-1111-111111111111:22222222-2222-2222-2222-222222222222:33333333-3333-3333-3333-333333333333";
+  expect(() => createConversationDraft("C:\\workspace", id, "Cloud")).toThrow(
+    "Copilot Studio",
+  );
+  const draft = createConversationDraft("C:\\workspace", "", "CLI");
+  for (const chat of [
+    { ...draft, agentId: id },
+    { ...draft, provider: "copilot-studio" },
+  ]) {
+    expect(() =>
+      validateConversationWorkspace({
+        ...emptyConversationWorkspace(),
+        chats: [chat],
+      }),
+    ).toThrow();
+  }
 });

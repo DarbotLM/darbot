@@ -27,7 +27,7 @@ export function Welcome({ onStart }: { onStart: () => void }) {
         browser for you.
       </p>
       <div className="row">
-        <button type="button" onClick={onStart}>
+        <button type="button" data-ui-action="setup_begin" onClick={onStart}>
           Set up darbot
         </button>
       </div>

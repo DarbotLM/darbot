@@ -3,7 +3,11 @@ import type {
   CopilotHistorySession,
   CopilotWorkspaceChat,
 } from "./copilot-types";
-import { conversationFromHistory } from "./copilot-workspace-store";
+import {
+  conversationFromHistory,
+  sessionScope,
+} from "./copilot-workspace-store";
+import { isStudioAgentId } from "./copilot-types";
 
 export const CHAT_PREVIEW_LIMIT = 5;
 
@@ -14,18 +18,26 @@ export function conversationHistoryRows(
   const bySession = new Map(
     chats
       .filter((chat) => chat.sessionId !== null)
-      .map((chat) => [chat.sessionId, chat]),
+      .map((chat) => [sessionScope(chat), chat]),
   );
-  const recorded = new Set(history.map((chat) => chat.sessionId));
+  const local = [
+    ...new Map(
+      history
+        .filter((chat) => !isStudioAgentId(chat.agentId))
+        .map((chat) => [sessionScope(chat), chat]),
+    ).values(),
+  ];
+  const recorded = new Set(local.map(sessionScope));
   return [
     ...chats.filter(
-      (chat) => chat.sessionId === null || !recorded.has(chat.sessionId),
+      (chat) => chat.sessionId === null || !recorded.has(sessionScope(chat)),
     ),
-    ...history.map((chat) => {
-      const previous = bySession.get(chat.sessionId);
+    ...local.map((chat) => {
+      const previous = bySession.get(sessionScope(chat));
       return {
         ...conversationFromHistory(chat),
-        conversationId: previous?.conversationId ?? `copilot:${chat.sessionId}`,
+        conversationId:
+          previous?.conversationId ?? `record:${sessionScope(chat)}`,
         draft: previous?.draft ?? "",
       };
     }),
@@ -37,9 +49,13 @@ export function mergeHistoryBatch(
   batch: readonly CopilotHistorySession[],
 ): CopilotHistory {
   const sessions = new Map(
-    (current?.sessions ?? []).map((session) => [session.sessionId, session]),
+    (current?.sessions ?? []).map((session) => [
+      JSON.stringify([session.cwd, session.sessionId]),
+      session,
+    ]),
   );
-  for (const session of batch) sessions.set(session.sessionId, session);
+  for (const session of batch)
+    sessions.set(JSON.stringify([session.cwd, session.sessionId]), session);
   const agents = new Map<string, CopilotHistory["agents"][number]>();
   for (const session of sessions.values()) {
     const agent = agents.get(session.agentId);
@@ -70,28 +86,38 @@ export function mergeLinkedConversations(
   importedAgentIds: readonly string[],
   activeConversationId: string | null,
 ): CopilotWorkspaceChat[] {
-  const allowed = new Set(["", ...importedAgentIds]);
+  const allowed = new Set([
+    "",
+    ...importedAgentIds.filter((id) => !isStudioAgentId(id)),
+  ]);
   const chats = new Map(current.map((chat) => [chat.conversationId, chat]));
   const bySession = new Map(
     current
       .filter((chat) => chat.sessionId !== null)
-      .map((chat) => [chat.sessionId, chat]),
+      .map((chat) => [sessionScope(chat), chat]),
+  );
+  const active = current.find(
+    (chat) => chat.conversationId === activeConversationId,
   );
   for (const item of history) {
     if (item.agentId === "__unavailable__" || !allowed.has(item.agentId)) {
       continue;
     }
-    const previous = bySession.get(item.sessionId);
+    if (active?.sessionId === item.sessionId && active.cwd === item.cwd)
+      continue;
+    const key = sessionScope(item);
+    const previous = bySession.get(key);
     if (previous?.conversationId === activeConversationId) continue;
-    const conversationId =
-      previous?.conversationId ?? `copilot:${item.sessionId}`;
-    chats.set(conversationId, {
+    const conversationId = previous?.conversationId ?? crypto.randomUUID();
+    const linked = {
       ...conversationFromHistory(item),
       conversationId,
       draft: previous?.draft ?? "",
       title: item.title?.trim() || previous?.title || "Untitled conversation",
       updatedAt: item.updatedAt ?? previous?.updatedAt ?? null,
-    });
+    };
+    chats.set(conversationId, linked);
+    bySession.set(key, linked);
   }
   return [...chats.values()].sort((left, right) => {
     if (left.conversationId === right.conversationId) return 0;

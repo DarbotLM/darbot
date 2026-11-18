@@ -1,6 +1,7 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
+import { DesktopWindow } from "./DesktopWindow";
 import { bootstrapTheme } from "./copilot-preferences";
 import "./styles.css";
 
@@ -13,6 +14,8 @@ if (!root)
 
 createRoot(root).render(
   <StrictMode>
-    <App />
+    <DesktopWindow>
+      <App />
+    </DesktopWindow>
   </StrictMode>,
 );

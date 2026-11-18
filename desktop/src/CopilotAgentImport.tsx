@@ -1,6 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useEffect, useState } from "react";
-import type { CopilotAgentCatalog } from "./copilot-types";
+import {
+  agentSourceLabel,
+  type CopilotAgentCatalog,
+  type StudioSourceStatus,
+} from "./copilot-types";
 import { asProblem, InlineFailure, type Problem } from "./Problem";
 
 export function CopilotAgentImport({
@@ -8,11 +12,13 @@ export function CopilotAgentImport({
   firstRun = false,
   onComplete,
   onBack,
+  onCatalogLoaded,
 }: {
   existingIds?: string[];
   firstRun?: boolean;
   onComplete: (ids: string[]) => void;
   onBack: () => void;
+  onCatalogLoaded?: (catalog: CopilotAgentCatalog) => void;
 }) {
   const [catalog, setCatalog] = useState<CopilotAgentCatalog | null>(null);
   const [failure, setFailure] = useState<Problem | null>(null);
@@ -27,7 +33,10 @@ export function CopilotAgentImport({
     setFailure(null);
     invoke<CopilotAgentCatalog>("copilot_agents")
       .then((result) => {
-        if (active) setCatalog(result);
+        if (active) {
+          setCatalog(result);
+          onCatalogLoaded?.(result);
+        }
       })
       .catch((error) => {
         if (active) setFailure(asProblem(error));
@@ -41,7 +50,9 @@ export function CopilotAgentImport({
   const visible = (catalog?.agents ?? []).filter(
     (agent) =>
       !search ||
-      `${agent.name} ${agent.description ?? ""}`.toLowerCase().includes(search),
+      `${agent.name} ${agent.description ?? ""} ${agentSourceLabel(agent)}`
+        .toLowerCase()
+        .includes(search),
   );
   const Heading = firstRun ? "h1" : "h2";
 
@@ -51,15 +62,16 @@ export function CopilotAgentImport({
         {firstRun && <p className="steps-of">Step 3 of 3</p>}
         <Heading id="copilot-import-title">Import agents (optional)</Heading>
         <p className="hint">
-          Choose personal Copilot agents for this workspace, or start with none.
-          Selected agents and the built-in Copilot CLI will have their recorded
-          conversations linked. Definitions and message bodies stay with
-          Copilot; nothing is moved or deleted.
+          Choose local Copilot agents, or inspect configured Copilot Studio
+          sources. Local conversations stay with Copilot CLI. Cloud agents are
+          indexed by tenant and environment; their definitions and transcripts
+          are not imported.
         </p>
       </header>
       <label htmlFor="copilot-import-search">Search agents</label>
       <input
         id="copilot-import-search"
+        data-ui-action="imports_search"
         type="search"
         placeholder="Find an agent by name or description"
         value={query}
@@ -71,11 +83,12 @@ export function CopilotAgentImport({
             ? `${catalog.agents.length} available. ${selected.length} selected.`
             : failure
               ? "Agent discovery failed."
-              : "Reading personal agents..."}
+              : "Reading local agents and configured cloud sources..."}
         </span>
         <button
           type="button"
           className="quiet"
+          data-ui-action="imports_select_shown"
           disabled={
             !catalog || visible.every((agent) => existing.has(agent.id))
           }
@@ -95,18 +108,21 @@ export function CopilotAgentImport({
         <button
           type="button"
           className="quiet"
+          data-ui-action="imports_clear"
           disabled={selected.length === 0}
           onClick={() => setSelected([])}
         >
           Clear
         </button>
       </div>
+      <StudioSources sources={catalog?.sources ?? []} />
       {failure && (
         <div>
           <InlineFailure problem={failure} />
           <button
             type="button"
             className="quiet"
+            data-ui-action="imports_retry"
             onClick={() => setAttempt((value) => value + 1)}
           >
             Retry
@@ -119,6 +135,7 @@ export function CopilotAgentImport({
             <label>
               <input
                 type="checkbox"
+                data-ui-action="imports_toggle_agent"
                 checked={existing.has(agent.id) || selected.includes(agent.id)}
                 disabled={existing.has(agent.id)}
                 onChange={(event) =>
@@ -136,19 +153,22 @@ export function CopilotAgentImport({
                     ? "Already in this workspace"
                     : agent.description || "Personal Copilot agent"}
                 </span>
+                <span>{agentSourceLabel(agent)}</span>
               </span>
             </label>
           </li>
         ))}
         {catalog && visible.length === 0 && (
           <li className="copilot-resource-empty">
-            No matching personal agents. You can create one on your canvas.
+            No matching agents in the available sources.
           </li>
         )}
       </ul>
       {!!catalog?.warnings.length && (
         <details className="copilot-runtime-warnings">
-          <summary>Agent discovery warnings</summary>
+          <summary data-ui-action="inspect_details">
+            Agent discovery warnings
+          </summary>
           <ul>
             {catalog.warnings.map((warning) => (
               <li key={warning}>{warning}</li>
@@ -157,11 +177,17 @@ export function CopilotAgentImport({
         </details>
       )}
       <footer className="copilot-import-actions">
-        <button type="button" className="quiet" onClick={onBack}>
+        <button
+          type="button"
+          className="quiet"
+          data-ui-action="imports_back"
+          onClick={onBack}
+        >
           {firstRun ? "Back" : "Cancel"}
         </button>
         <button
           type="button"
+          data-ui-action="imports_skip"
           className={selected.length ? "quiet" : undefined}
           onClick={() => onComplete([])}
         >
@@ -169,12 +195,48 @@ export function CopilotAgentImport({
         </button>
         <button
           type="button"
+          data-ui-action="imports_confirm"
           disabled={!selected.length}
           onClick={() => onComplete(selected)}
         >
           Import selected ({selected.length})
         </button>
       </footer>
+    </section>
+  );
+}
+
+export function StudioSources({
+  sources,
+}: {
+  sources: readonly StudioSourceStatus[];
+}) {
+  if (!sources.length) return null;
+  return (
+    <section
+      className="copilot-source-status"
+      aria-label="Copilot Studio source coverage"
+    >
+      <strong>Copilot Studio sources ({sources.length})</strong>
+      {sources.map((source) => (
+        <p key={`${source.tenantId}:${source.environmentId}`}>
+          <strong>{source.environmentName}</strong>: {source.agentCount} agents
+          {" / "}
+          {source.state}
+          {" / "}
+          {source.lastSyncedAt === null
+            ? "never synced"
+            : `last synced ${new Date(source.lastSyncedAt * 1000).toLocaleString()}`}
+          <br />
+          {source.environmentUrl} / tenant {source.tenantId}
+          {source.error && (
+            <>
+              <br />
+              <span role="alert">{source.error}</span>
+            </>
+          )}
+        </p>
+      ))}
     </section>
   );
 }

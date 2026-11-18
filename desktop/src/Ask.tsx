@@ -66,6 +66,7 @@ export function Ask({
         <label htmlFor="question">Your question</label>
         <input
           id="question"
+          data-ui-action="setup_ask"
           value={question}
           onChange={(event) => {
             setQuestion(event.target.value);
@@ -100,11 +101,20 @@ export function Ask({
 
       <div className="row">
         {answer === null ? (
-          <button type="button" onClick={ask} disabled={asking || !canAsk}>
+          <button
+            type="button"
+            data-ui-action="setup_ask"
+            onClick={ask}
+            disabled={asking || !canAsk}
+          >
             {asking ? "Asking…" : "Ask"}
           </button>
         ) : (
-          <button type="button" onClick={onOpen}>
+          <button
+            type="button"
+            data-ui-action="setup_show_darbot"
+            onClick={onOpen}
+          >
             Start using darbot
           </button>
         )}
@@ -117,6 +127,7 @@ export function Ask({
           <button
             type="button"
             className="quiet"
+            data-ui-action="setup_change_model"
             disabled={asking}
             onClick={() => {
               onBack();
@@ -129,6 +140,7 @@ export function Ask({
           <button
             type="button"
             className="quiet"
+            data-ui-action="setup_ask"
             onClick={ask}
             disabled={asking}
           >

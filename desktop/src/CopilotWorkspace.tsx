@@ -2,14 +2,34 @@ import { getVersion } from "@tauri-apps/api/app";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
+  type CSSProperties,
+  Fragment,
+  type ReactNode,
   useCallback,
   useEffect,
   useEffectEvent,
+  useId,
   useMemo,
   useRef,
   useState,
 } from "react";
-import { CopilotAgentImport } from "./CopilotAgentImport";
+import { CopilotAgentIcon, AgentAttributeIcon } from "./CopilotAgentIcon";
+import {
+  AgentDashboard,
+  ArchiveTiles,
+  useSessionEvidence,
+} from "./AgentDashboard";
+import { HistorySources, useHistorySources } from "./HistorySources";
+import {
+  acpKey,
+  countLabel,
+  groupArchive,
+  projectAgentHistory,
+  type AgentHistory,
+} from "./history-sources";
+import { promoteDraft } from "./session-harvest";
+import { ResourceDiagnostics } from "./ResourceDiagnostics";
+import { CopilotAgentImport, StudioSources } from "./CopilotAgentImport";
 import { CopilotExtensionsPanel } from "./CopilotExtensionsPanel";
 import {
   conversationHistoryRows,
@@ -38,6 +58,7 @@ import {
   type ConfigOption,
   type ConfigOptionValue,
   type CopilotAgentSummary,
+  type CopilotAgentCatalog,
   type CopilotAvailableCommand,
   type CopilotHistory,
   type CopilotHistoryProgress,
@@ -54,6 +75,15 @@ import {
   findConfigOption,
   isConfigValueDisabled,
   mergeToolActivity,
+  agentSourceLabel,
+  buildFleetCard,
+  fleetCardSchema,
+  fleetDisplayId,
+  fleetIdentity,
+  FLEET_TABS,
+  type FleetTab,
+  isStudioAgentId,
+  studioAgentUrl,
 } from "./copilot-types";
 import {
   type ConversationWorkspace,
@@ -62,8 +92,10 @@ import {
   emptyConversationWorkspace,
   MAX_DRAFT_LENGTH,
   readConversationWorkspace,
+  sessionScope,
   writeConversationWorkspace,
 } from "./copilot-workspace-store";
+import { useDesktopWindow } from "./DesktopWindow";
 import copilotIconLicense from "./marks/copilot.LICENSE.txt?raw";
 import { asProblem, Failure, InlineFailure, type Problem } from "./Problem";
 import {
@@ -71,9 +103,12 @@ import {
   readSidepaneDisclosure,
   SIDEPANE_AGENT_LAYER,
   type SidepaneDisclosure,
+  type SidepaneRegion,
   setSidepaneGroupExpanded,
+  sidepaneRegion,
   writeSidepaneDisclosure,
 } from "./sidepane-layers";
+import { DESKTOP_SEMANTIC_MODEL } from "./ui-semantic-model";
 import { BrandLockup } from "./Welcome";
 
 type Message = {
@@ -93,6 +128,7 @@ type DialogKind =
   | "conversations"
   | "import"
   | "create-agent"
+  | "agent"
   | null;
 
 /** Config options the runtime negotiates but that Darbot deliberately never surfaces. */
@@ -146,7 +182,6 @@ const CAPABILITY_LABELS: Record<string, string> = {
 const DEFAULT_AGENT_CHOICE: CopilotAgentSummary = {
   id: "",
   name: "Copilot CLI",
-  description: "The default Copilot agent.",
 };
 
 function updateKind(update: Record<string, unknown>): string {
@@ -224,13 +259,399 @@ type InsertableResource = {
   group: "Command" | "Skill";
 };
 
-const WORKSPACE_SURFACES = [
-  { id: "workspace", label: "Your workspace" },
-  { id: "canvas", label: "Your canvas" },
-  { id: "cli", label: "Your CLI" },
-] as const;
+const WORKSPACE_SURFACES = DESKTOP_SEMANTIC_MODEL.surfaces;
+const WORKSPACE_SIDEPANE = DESKTOP_SEMANTIC_MODEL.sidepane;
 
 type WorkspaceSurface = (typeof WORKSPACE_SURFACES)[number]["id"];
+
+function renderSidepaneRegion(
+  region: SidepaneRegion,
+  content: Readonly<Record<string, ReactNode>>,
+): ReactNode {
+  return sidepaneRegion(WORKSPACE_SIDEPANE, region).map((layer) => {
+    const node = content[layer.id];
+    if (node == null) {
+      throw new Error(`Sidepane layer "${layer.id}" needs a renderer.`);
+    }
+    return <Fragment key={layer.id}>{node}</Fragment>;
+  });
+}
+
+const CARD_TABS = [...FLEET_TABS, "Full card"] as const;
+const FLEET_PAGE_SIZE = 24;
+
+function FleetTile({
+  agent,
+  build,
+  history,
+  sessionActions,
+  diagnostics,
+}: {
+  agent: CopilotAgentSummary;
+  build: () => ReturnType<typeof buildFleetCard>;
+  history: AgentHistory;
+  sessionActions: () => ReactNode;
+  diagnostics: () => ReactNode;
+}) {
+  const [back, setBack] = useState(false);
+  const [tab, setTab] = useState<FleetTab | "Full card">("overview");
+  const [schema, setSchema] = useState(false);
+  const [notice, setNotice] = useState("");
+  const id = useId();
+  const flip = useRef<HTMLButtonElement>(null);
+  const cloud = isStudioAgentId(agent.id);
+  const card = build();
+  const displayId = card.agentcard_ID;
+  const {
+    overview,
+    tools,
+    model,
+    sessions,
+    freshness,
+    source,
+    runtime,
+    facets,
+  } = card.tabs;
+  const toolNames = [
+    ...new Set(
+      tools.declarations?.map((t) =>
+        t.server ? `${t.server}/${t.name}` : t.name,
+      ),
+    ),
+  ];
+  const purpose = overview.description ?? "No public purpose reported.";
+  const indexed = countLabel(history.summary);
+  const modified =
+    freshness.modifiedAt ??
+    (freshness.definitionModifiedAtUnix == null
+      ? null
+      : new Date(freshness.definitionModifiedAtUnix * 1000).toISOString());
+  const origin =
+    source.definitionFile ?? source.studio?.schemaName ?? "Not reported";
+  const facts: [string, string | undefined | null][] = cloud
+    ? [
+        ["Schema", origin],
+        ["Environment", source.studio?.environmentName],
+        [
+          "Catalog state",
+          source.studio
+            ? source.studio.stateCode === 0
+              ? "Active"
+              : "Inactive"
+            : null,
+        ],
+        ["Modified", modified?.slice(0, 10)],
+        ["Bot ID", source.studio?.botId],
+        ["Sessions", indexed],
+      ]
+    : [
+        [
+          runtime.observedModel ? "Session model" : "Declared model",
+          runtime.observedModel ?? model.declared,
+        ],
+        [
+          "Tools / MCP",
+          toolNames.join(", ") ||
+            (tools.status === "inspected" && !tools.withheldCount
+              ? "None declared"
+              : null),
+        ],
+        ["Definition", source.definitionFile?.split(/[\\/]/).pop()],
+        ["Sessions", indexed],
+        [
+          "Runtime",
+          runtime.activeSessionId
+            ? "Open CLI session"
+            : runtime.provider
+              ? "CLI history"
+              : null,
+        ],
+        ["File modified", modified?.slice(0, 10)],
+      ];
+  const header = (reverse: boolean) => (
+    <header className="fleet-head">
+      <div className="fleet-eyebrow">
+        {reverse
+          ? "Interoperability / back"
+          : cloud
+            ? "Copilot Studio"
+            : "Copilot CLI"}
+      </div>
+      <div className="fleet-identity">
+        <CopilotAgentIcon agent={agent} />
+        <h3>{agent.name}</h3>
+      </div>
+    </header>
+  );
+  const footer = (
+    <footer className="fleet-foot">
+      {displayId} · {source.provider}
+    </footer>
+  );
+  const value =
+    tab === "Full card"
+      ? schema
+        ? fleetCardSchema
+        : card
+      : schema
+        ? fleetCardSchema.properties.tabs.properties[tab]
+        : card.tabs[tab];
+  const json = back ? JSON.stringify(value, null, 2) : "";
+
+  function selectTab(next: typeof tab) {
+    setTab(next);
+    setNotice("");
+  }
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(json);
+      setNotice("Copied JSON");
+    } catch {
+      setNotice("Copy unavailable. Select the JSON to copy it manually.");
+    }
+  }
+  return (
+    <li
+      className="fleet-tile"
+      data-agent-id={agent.id}
+      data-back={back}
+      data-ui-action="inspect_details"
+      onKeyDown={(event) => {
+        if (back && event.key === "Escape") {
+          event.stopPropagation();
+          setBack(false);
+          flip.current?.focus();
+        }
+      }}
+    >
+      <button
+        type="button"
+        ref={flip}
+        className="quiet fleet-flip"
+        data-ui-action="inspect_details"
+        aria-expanded={back}
+        aria-label={`${back ? "Back to summary" : "Flip AgentCard"}: ${agent.name} ${displayId}`}
+        onClick={() => {
+          setBack(!back);
+          setNotice("");
+        }}
+      >
+        <span>{back ? "← Back" : "Flip card ↻"}</span>
+      </button>
+      <div className="fleet-rotator">
+        <div className="fleet-face fleet-front" inert={back}>
+          {header(false)}
+          <p className="fleet-story">{purpose}</p>
+          <dl className="fleet-metrics">
+            {facts.map(([label, fact]) => (
+              <div key={label}>
+                <dt>
+                  <AgentAttributeIcon name={label} />
+                  {label}
+                </dt>
+                <dd title={fact ?? undefined}>
+                  {label === "Sessions" ? (
+                    <button
+                      className="quiet fleet-count"
+                      type="button"
+                      data-ui-action="inspect_details"
+                      aria-label={`${fact} · History sources for ${agent.name}`}
+                      onClick={() => {
+                        selectTab("sessions");
+                        setSchema(false);
+                        setBack(true);
+                      }}
+                    >
+                      {fact} · History sources
+                    </button>
+                  ) : (
+                    (fact ?? "Not reported")
+                  )}
+                </dd>
+              </div>
+            ))}
+          </dl>
+          <ul className="fleet-facets" aria-label="Provenance weights">
+            {facets.entries.slice(0, 3).map((f) => (
+              <li key={f.facet}>
+                {f.facet}
+                <meter min={0} max={3} value={f.weight} aria-label={f.facet} />
+                {f.weight}/3
+              </li>
+            ))}
+          </ul>
+          {footer}
+        </div>
+        {back && (
+          <section
+            className="fleet-face fleet-back"
+            aria-label={`${agent.name} AgentCard`}
+          >
+            {header(true)}
+            <div
+              role="tablist"
+              aria-label="AgentCard details"
+              className="fleet-tabs"
+            >
+              {CARD_TABS.map((item, index) => (
+                <button
+                  key={item}
+                  type="button"
+                  role="tab"
+                  className="quiet"
+                  data-ui-action="inspect_details"
+                  aria-selected={tab === item}
+                  tabIndex={tab === item ? 0 : -1}
+                  id={`${id}-${index}`}
+                  aria-controls={`${id}-panel`}
+                  onClick={() => selectTab(item)}
+                  onKeyDown={(event) => {
+                    const n = CARD_TABS.length;
+                    const next =
+                      event.key === "ArrowRight"
+                        ? (index + 1) % n
+                        : event.key === "ArrowLeft"
+                          ? (index + n - 1) % n
+                          : event.key === "Home"
+                            ? 0
+                            : event.key === "End"
+                              ? n - 1
+                              : -1;
+                    if (next < 0) return;
+                    event.preventDefault();
+                    selectTab(CARD_TABS[next]);
+                    document.getElementById(`${id}-${next}`)?.focus();
+                  }}
+                >
+                  {item}
+                </button>
+              ))}
+            </div>
+            <div
+              role="tabpanel"
+              className="fleet-content"
+              id={`${id}-panel`}
+              aria-labelledby={`${id}-${CARD_TABS.indexOf(tab)}`}
+            >
+              {tab === "sessions" && !schema && sessionActions()}
+              {tab === "tools" && !schema && diagnostics()}
+              <div className="fleet-toolbar">
+                <button
+                  type="button"
+                  className="quiet"
+                  data-ui-action="inspect_details"
+                  aria-pressed={schema}
+                  onClick={() => {
+                    setSchema(!schema);
+                    setNotice("");
+                  }}
+                >
+                  {schema ? "Show instance" : "Show schema"}
+                </button>
+                <button
+                  type="button"
+                  className="quiet"
+                  data-ui-action="fleet_copy_json"
+                  onClick={() => void copy()}
+                >
+                  Copy JSON
+                </button>
+              </div>
+              {notice && <small role="status">{notice}</small>}
+              {!schema && (
+                <p className="fleet-detail-note">
+                  {tab === "facets"
+                    ? facets.rubric
+                    : tab === "overview"
+                      ? purpose
+                      : tab === "environment"
+                        ? card.tabs.environment.scope
+                        : tab === "sessions"
+                          ? `${indexed} · ${sessions.indexScope ?? "No local index scope"}`
+                          : tab === "runtime"
+                            ? "Runtime observations only; no terminal is inferred."
+                            : `${agent.name} · ${tab}`}
+                </p>
+              )}
+              {/* biome-ignore lint/a11y/noNoninteractiveTabindex: keyboard access to the scrollable JSON document */}
+              <pre key={`${tab}-${schema}`} tabIndex={0}>
+                {json}
+              </pre>
+            </div>
+            {footer}
+          </section>
+        )}
+      </div>
+    </li>
+  );
+}
+
+function CliFlipCard({
+  title,
+  badge,
+  header,
+  reverse,
+  children,
+}: {
+  title: string;
+  badge?: string;
+  header: ReactNode;
+  reverse: ReactNode;
+  children: ReactNode;
+}) {
+  const [back, setBack] = useState(false);
+  const flip = useRef<HTMLButtonElement>(null);
+  const id = useId();
+  return (
+    <section
+      className={`cli-flipcard ${badge ? "cli-agentcard" : "cli-livetile"}`}
+      aria-label={title}
+      data-back={back}
+      data-ui-action="inspect_details"
+      onKeyDown={(event) => {
+        if (event.key !== "Escape" || !back) return;
+        event.stopPropagation();
+        setBack(false);
+        flip.current?.focus();
+      }}
+    >
+      <header className="cli-flipcard-header">
+        <div>{header}</div>
+        <button
+          ref={flip}
+          type="button"
+          className="quiet cli-flipcard-pill"
+          data-ui-action="inspect_details"
+          aria-label={`Flip ${title}`}
+          aria-pressed={back}
+          aria-controls={id}
+          onClick={() => setBack((value) => !value)}
+        >
+          {badge && (
+            <span className="cli-flipcard-badge" aria-hidden="true">
+              {badge}
+            </span>
+          )}
+          <span>{back ? "Front" : "Back"}</span>
+        </button>
+      </header>
+      <div className="cli-flipcard-stage" id={id}>
+        <div className="cli-flipcard-rotator">
+          <div className="cli-flipcard-face" inert={back} aria-hidden={back}>
+            {children}
+          </div>
+          <div
+            className="cli-flipcard-face cli-flipcard-reverse"
+            inert={!back}
+            aria-hidden={!back}
+          >
+            {reverse}
+          </div>
+        </div>
+      </div>
+    </section>
+  );
+}
 
 export function CopilotWorkspace({
   onBack,
@@ -239,6 +660,8 @@ export function CopilotWorkspace({
   onBack: () => void;
   initialConversationAgentIds?: readonly string[];
 }) {
+  const desktopWindow = useDesktopWindow();
+  const { setAvailable, showWorkspace } = desktopWindow;
   const [surface, setSurface] = useState<WorkspaceSurface>("workspace");
   const [location, setLocation] = useState<CopilotWorkspaceLocation | null>(
     null,
@@ -248,6 +671,11 @@ export function CopilotWorkspace({
   const [resolvingLocation, setResolvingLocation] = useState(true);
 
   const [inventory, setInventory] = useState<CopilotInventory | null>(null);
+  const [fleetPage, setFleetPage] = useState(0);
+  const [fleetSearch, setFleetSearch] = useState("");
+  const [refreshingCatalog, setRefreshingCatalog] = useState(false);
+  const [catalogProblem, setCatalogProblem] = useState<Problem | null>(null);
+  const [studioLinkStatus, setStudioLinkStatus] = useState("");
   const [status, setStatus] = useState<CopilotStatus | null>(null);
   const [appVersion, setAppVersion] = useState<string | null>(null);
   const [availableCommands, setAvailableCommands] = useState<
@@ -282,6 +710,13 @@ export function CopilotWorkspace({
     () => activeConversation?.agentId ?? readStoredAgentId(),
   );
   const [session, setSession] = useState<CopilotSession | null>(null);
+  const [dashboardId, setDashboardId] = useState<string | null>(null);
+  const [dashboardProblem, setDashboardProblem] = useState<Problem | null>(
+    null,
+  );
+  const evidence = useSessionEvidence();
+  const sources = useHistorySources();
+  const archive = useMemo(() => groupArchive(sources.index), [sources.index]);
   const [sessionAgentId, setSessionAgentId] = useState("");
   const [configOptions, setConfigOptions] = useState<ConfigOption[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -320,8 +755,22 @@ export function CopilotWorkspace({
     useState<SidepaneDisclosure>(() => readSidepaneDisclosure());
 
   const [openDialog, setOpenDialog] = useState<DialogKind>(null);
+  const [inspectedAgentId, setInspectedAgentId] = useState("");
+  useEffect(() => {
+    setAvailable(location !== null);
+    return () => setAvailable(false);
+  }, [location, setAvailable]);
+  useEffect(() => {
+    if (permissions.length > 0 || openDialog !== null) showWorkspace();
+  }, [permissions.length, openDialog, showWorkspace]);
   const [resourceFilter, setResourceFilter] = useState("");
   const [sessionsPage, setSessionsPage] = useState<CopilotHistory | null>(null);
+  const historyIndexScope = "all local folders";
+  const allRows = useMemo(
+    () => conversationHistoryRows(chats, sessionsPage?.sessions ?? []),
+    [chats, sessionsPage],
+  );
+  const rowsByAgent = useMemo(() => groupWorkspaceChats(allRows), [allRows]);
   const [sessionsProblem, setSessionsProblem] = useState<Problem | null>(null);
   const [sessionsLoading, setSessionsLoading] = useState(false);
   const [sessionsAllFolders, setSessionsAllFolders] = useState(true);
@@ -358,6 +807,7 @@ export function CopilotWorkspace({
   const conversationsDialogRef = useRef<HTMLDialogElement | null>(null);
   const importDialogRef = useRef<HTMLDialogElement | null>(null);
   const createAgentDialogRef = useRef<HTMLDialogElement | null>(null);
+  const agentDialogRef = useRef<HTMLDialogElement | null>(null);
   const permissionDialogRef = useRef<HTMLDialogElement | null>(null);
 
   useEffect(() => {
@@ -393,8 +843,8 @@ export function CopilotWorkspace({
   useEffect(() => {
     try {
       writeSidepaneDisclosure(sidepaneDisclosure);
-    } catch {
-      // The column still renders; the choice simply will not survive a restart.
+    } catch (error) {
+      console.warn("Sidepane disclosure could not be saved.", error);
     }
   }, [sidepaneDisclosure]);
 
@@ -445,6 +895,7 @@ export function CopilotWorkspace({
   }
 
   function updateDraft(text: string) {
+    if (dashboardId !== null) return;
     if (text.length > MAX_DRAFT_LENGTH) {
       setFailure({
         said: `Drafts are limited to ${MAX_DRAFT_LENGTH.toLocaleString()} characters. Shorten the draft before adding more text.`,
@@ -483,14 +934,72 @@ export function CopilotWorkspace({
     }
   }
 
-  function rememberChat(
+  function applyCatalog(catalog: CopilotAgentCatalog) {
+    setInventory((current) => ({
+      ...(current ?? { skills: [], plugins: [], mcpServers: [] }),
+      agents: catalog.agents,
+      sources: catalog.sources ?? [],
+      warnings: catalog.warnings,
+    }));
+  }
+
+  async function refreshCatalog() {
+    if (refreshingCatalog) return;
+    setRefreshingCatalog(true);
+    setCatalogProblem(null);
+    try {
+      const catalog = await invoke<CopilotAgentCatalog>("copilot_agents");
+      if (mountedRef.current) applyCatalog(catalog);
+    } catch (error) {
+      if (mountedRef.current) setCatalogProblem(asProblem(error));
+    } finally {
+      if (mountedRef.current) setRefreshingCatalog(false);
+    }
+  }
+
+  async function copyStudioLink(agent: CopilotAgentSummary) {
+    setStudioLinkStatus("");
+    try {
+      await navigator.clipboard.writeText(studioAgentUrl(agent));
+      setStudioLinkStatus(`Copied the Copilot Studio link for ${agent.name}.`);
+    } catch (error) {
+      setFailure(asProblem(error));
+    }
+  }
+
+  async function rememberChat(
     next: CopilotSession,
     requestedAgent: string,
     conversationId: string,
     title?: string | null,
   ) {
     const option = findConfigOption(next.configOptions, "agent");
-    const agentId = option?.currentValue ?? requestedAgent;
+    const agentId = requestedAgent;
+    let memoryProblem: Problem | null = null;
+    if (
+      chats.some(
+        (chat) =>
+          chat.agentId === agentId &&
+          chat.conversationId === conversationId &&
+          chat.sessionId === null,
+      )
+    ) {
+      const owner = fleet.filter((agent) => agent.id === agentId);
+      if (owner.length === 1) {
+        try {
+          await promoteDraft(
+            fleetIdentity(owner[0]),
+            conversationId,
+            acpKey(next.sessionId),
+          );
+        } catch (error) {
+          memoryProblem = {
+            said: `Could not move draft review decisions to the recorded session. Existing memory was kept. ${asProblem(error).said}`,
+          };
+        }
+      }
+    }
+    if (!mountedRef.current) return memoryProblem;
     const agentName = !agentId
       ? "Copilot CLI"
       : (option?.options.find((value) => value.value === agentId)?.name ??
@@ -518,21 +1027,25 @@ export function CopilotWorkspace({
         ...current.filter(
           (item) =>
             item.conversationId !== conversationId &&
-            item.sessionId !== next.sessionId,
+            sessionScope(item) !== sessionScope(chat),
         ),
       ];
     });
+    return memoryProblem;
   }
 
-  async function selectWorkspaceAgent(agentId: string) {
-    if (busy) return;
-    const recent = chats.find((chat) => chat.agentId === agentId);
-    if (recent) {
-      await loadSession(recent);
-    } else if (await closeSessionSafely()) {
-      selectConversation(null);
-      setSelectedAgentId(agentId);
-      writeStoredAgentId(agentId);
+  function selectWorkspaceAgent(agentId: string) {
+    if (isStudioAgentId(agentId)) {
+      openAgentSettings(agentId);
+      return;
+    }
+    if (busy || operationRef.current) return;
+    setDashboardId(agentId);
+    setDashboardProblem(null);
+    setSurface("workspace");
+    setSessionsAllFolders(true);
+    if (!historyRequestRef.current && (!sessionsPage || sessionsProblem)) {
+      void fetchHistory(true);
     }
   }
 
@@ -573,7 +1086,7 @@ export function CopilotWorkspace({
       const next = await invoke<CopilotWorkspaceLocation>("copilot_workspace", {
         cwd: candidate,
       });
-      if (!mountedRef.current) return next;
+      if (!mountedRef.current) return null;
       setLocation(next);
       setLocationInput(next.cwd);
       writeStoredCwd(next.cwd);
@@ -598,6 +1111,7 @@ export function CopilotWorkspace({
         });
       } catch (error) {
         setFailure(asProblem(error));
+        if (dashboardId !== null) setDashboardProblem(asProblem(error));
         return false;
       }
     }
@@ -849,6 +1363,7 @@ export function CopilotWorkspace({
       },
     );
     const runtimeErrors = listen<Problem>("copilot:runtime-error", (event) => {
+      if (!sessionIdRef.current && !creatingSessionRef.current) return;
       setFailure(event.payload);
       sessionIdRef.current = null;
       setSession(null);
@@ -925,23 +1440,52 @@ export function CopilotWorkspace({
   }
 
   function applySessionConfig(options: ConfigOption[]) {
-    const visible = sanitizeConfigOptions(options);
-    setConfigOptions(visible);
-    const agent = findConfigOption(visible, "agent");
-    if (agent) {
-      setSessionAgentId(agent.currentValue);
-      setSelectedAgentId(agent.currentValue);
-      writeStoredAgentId(agent.currentValue);
-    }
+    setConfigOptions(sanitizeConfigOptions(options));
+  }
+
+  async function verifyOpenedSession(
+    next: CopilotSession,
+    chat: CopilotWorkspaceChat,
+  ) {
+    if (
+      next.cwd === chat.cwd &&
+      (!chat.sessionId || next.sessionId === chat.sessionId) &&
+      (findConfigOption(next.configOptions, "agent")?.currentValue ??
+        chat.agentId) === chat.agentId
+    )
+      return;
+    sessionIdRef.current = null;
+    await invoke("copilot_session_close", {
+      sessionId: next.sessionId,
+      agent: chat.agentId || null,
+    });
+    throw new Error(
+      "Copilot returned a different agent, folder or session. Check the local CLI configuration before retrying.",
+    );
   }
 
   async function startDraft(agentId: string) {
-    if (!location || operationRef.current || !savedWorkspace.ok) return;
+    if (isStudioAgentId(agentId)) {
+      setFailure({
+        said: "Open this agent in Copilot Studio. Cloud conversations are not local CLI sessions.",
+      });
+      openAgentSettings(agentId);
+      return;
+    }
+    if (
+      !location ||
+      busy ||
+      operationRef.current ||
+      !savedWorkspace.ok ||
+      localBlock(agentId)
+    )
+      return;
     operationRef.current = true;
     setBusy(true);
     setFailure(null);
     try {
       if (!(await closeSessionSafely())) return;
+      setDashboardId(null);
       const agent =
         inventory?.agents.find((item) => item.id === agentId) ??
         createdAgents.find((item) => item.id === agentId);
@@ -963,6 +1507,15 @@ export function CopilotWorkspace({
   async function startSession(
     chat: CopilotWorkspaceChat,
   ): Promise<CopilotSession | null> {
+    if (
+      isStudioAgentId(chat.agentId) ||
+      (chat.provider && chat.provider !== "copilot-cli")
+    ) {
+      setFailure({
+        said: "This conversation cannot be routed to Copilot CLI.",
+      });
+      return null;
+    }
     setSurface("workspace");
     setBusy(true);
     setFailure(null);
@@ -978,7 +1531,8 @@ export function CopilotWorkspace({
         cwd: chat.cwd,
         agent: chat.agentId || null,
       });
-      if (!mountedRef.current) return next;
+      if (!mountedRef.current) return null;
+      await verifyOpenedSession(next, chat);
       sessionIdRef.current = next.sessionId;
       setSession(next);
       setSessionAgentId(chat.agentId);
@@ -1009,15 +1563,30 @@ export function CopilotWorkspace({
     target: CopilotHistorySession | CopilotWorkspaceChat,
     sending = false,
   ): Promise<CopilotSession | null> {
-    if (!savedWorkspace.ok || (operationRef.current && !sending)) return null;
+    if (
+      !savedWorkspace.ok ||
+      isStudioAgentId(target.agentId) ||
+      localBlock(target.agentId) ||
+      ((busy || operationRef.current) && !sending)
+    )
+      return null;
     if (!sending) operationRef.current = true;
-    const chat =
+    const record =
       "conversationId" in target
         ? target
-        : (chats.find((item) => item.sessionId === target.sessionId) ??
+        : (chats.find((item) => sessionScope(item) === sessionScope(target)) ??
           conversationFromHistory(target));
+    const chat = record.conversationId.startsWith("record:")
+      ? { ...record, conversationId: crypto.randomUUID() }
+      : record;
     setSurface("workspace");
-    if (chat.sessionId !== null && chat.sessionId === session?.sessionId) {
+    if (
+      chat.sessionId !== null &&
+      chat.sessionId === session?.sessionId &&
+      chat.agentId === sessionAgentId &&
+      chat.cwd === session.cwd
+    ) {
+      setDashboardId(null);
       setOpenDialog(null);
       activeChatRef.current?.scrollIntoView({
         block: "nearest",
@@ -1028,14 +1597,20 @@ export function CopilotWorkspace({
     }
     setBusy(true);
     setFailure(null);
+    setDashboardProblem(null);
     try {
       const closed = await closeSessionSafely();
       if (!closed) return null;
+      if (dashboardId !== null) setDashboardId(chat.agentId);
       selectConversation(chat);
       if (chat.sessionId === null) {
         const nextLocation = await resolveLocation(chat.cwd, true);
-        if (!nextLocation) return null;
+        if (!nextLocation)
+          throw new Error(
+            "The draft's folder could not be opened. Check that the recorded folder exists and retry.",
+          );
         setOpenDialog(null);
+        setDashboardId(null);
         setStatusText("Draft saved locally");
         return null;
       }
@@ -1048,18 +1623,27 @@ export function CopilotWorkspace({
       const next = await invoke<CopilotSession>("copilot_session_load", {
         sessionId: chat.sessionId,
         cwd: chat.cwd,
-        agent: chat.agentId === "__unavailable__" ? null : chat.agentId,
+        agent: chat.agentId || null,
       });
       if (!mountedRef.current) return null;
+      await verifyOpenedSession(next, chat);
       setSession(next);
       setSessionAgentId(chat.agentId);
       applySessionConfig(next.configOptions ?? []);
-      rememberChat(next, chat.agentId, chat.conversationId, chat.title);
+      const memoryProblem = await rememberChat(
+        next,
+        chat.agentId,
+        chat.conversationId,
+        chat.title,
+      );
+      if (!mountedRef.current) return null;
+      if (memoryProblem) setFailure(memoryProblem);
       setPrompt(chat.draft);
       if (location) setLocation({ ...location, cwd: next.cwd });
       setLocationInput(next.cwd);
       writeStoredCwd(next.cwd);
       setOpenDialog(null);
+      setDashboardId(null);
       setStatusText("Ready");
       return next;
     } catch (error) {
@@ -1073,6 +1657,7 @@ export function CopilotWorkspace({
         toolCallMessageIds.current.clear();
         setStatusText("Conversation not opened");
         setFailure(asProblem(error));
+        if (dashboardId !== null) setDashboardProblem(asProblem(error));
       }
       return null;
     } finally {
@@ -1122,6 +1707,7 @@ export function CopilotWorkspace({
 
   /** Inserting a skill never creates a runtime session or submits a prompt. */
   async function insertMention(name: string) {
+    if (dashboardId !== null) return;
     setSurface("workspace");
     insertTextAtCursor(`/${name} `);
     setOpenDialog(null);
@@ -1131,6 +1717,7 @@ export function CopilotWorkspace({
     const text = prompt.trim();
     if (
       !text ||
+      dashboardId !== null ||
       !location ||
       busy ||
       !eventsReady ||
@@ -1159,12 +1746,21 @@ export function CopilotWorkspace({
       operationRef.current = false;
       return;
     }
-    rememberChat(activeSession, chat.agentId, chat.conversationId, chat.title);
+    const memoryProblem = await rememberChat(
+      activeSession,
+      chat.agentId,
+      chat.conversationId,
+      chat.title,
+    );
+    if (!mountedRef.current) {
+      operationRef.current = false;
+      return;
+    }
     setSurface("workspace");
     const optimisticId = nextMessageId.current++;
     setPrompt("");
     setBusy(true);
-    setFailure(null);
+    setFailure(memoryProblem);
     setMessages((current) => [
       ...current,
       { id: optimisticId, role: "user", text },
@@ -1175,9 +1771,7 @@ export function CopilotWorkspace({
         {
           sessionId: activeSession.sessionId,
           prompt: text,
-          agent:
-            findConfigOption(activeSession.configOptions, "agent")
-              ?.currentValue || null,
+          agent: chat.agentId || null,
         },
       );
       if (mountedRef.current) {
@@ -1262,8 +1856,9 @@ export function CopilotWorkspace({
     const request = crypto.randomUUID();
     historyRequestRef.current = request;
     historyLinkAgentIdsRef.current = linkAgentIds ?? null;
+    // Keep the all-folders ACP snapshot intact when the History dialog filters rows.
+    setSessionsAllFolders(allFolders);
     setSessionsLoading(true);
-    setSessionsPage(null);
     setSessionsProblem(null);
     setHistoryProgress("Reading conversation history...");
     setVisibleHistoryCount(50);
@@ -1274,7 +1869,7 @@ export function CopilotWorkspace({
     }
     try {
       const page = await invoke<CopilotHistory>("copilot_history", {
-        cwd: allFolders ? null : (location?.cwd ?? null),
+        cwd: null,
         requestId: request,
       });
       if (!mountedRef.current || request !== historyRequestRef.current) return;
@@ -1321,17 +1916,20 @@ export function CopilotWorkspace({
     setHistorySearch("");
     setVisibleHistoryCount(50);
     setOpenDialog("conversations");
-    if (!sessionsLoading && (!sessionsPage || !sessionsAllFolders)) {
-      setSessionsAllFolders(true);
+    setSessionsAllFolders(true);
+    if (
+      !isStudioAgentId(agentId) &&
+      !sessionsLoading &&
+      (sessionsProblem || !sessionsPage)
+    ) {
       void fetchHistory(true);
     }
   }
 
-  function setAllFoldersAndRefetch(allFolders: boolean) {
+  function filterHistoryFolders(allFolders: boolean) {
     setSessionsAllFolders(allFolders);
     setHistoryAgent("__all__");
-    setSessionsPage(null);
-    void fetchHistory(allFolders);
+    setVisibleHistoryCount(50);
   }
 
   function openDialogFrom(kind: Exclude<DialogKind, null>) {
@@ -1340,6 +1938,11 @@ export function CopilotWorkspace({
     if (kind === "conversations" && !sessionsLoading) {
       void fetchHistory(sessionsAllFolders);
     }
+  }
+
+  function openAgentSettings(agentId: string) {
+    setInspectedAgentId(agentId);
+    openDialogFrom("agent");
   }
 
   /** Wired to each `<dialog>`'s native `close` event so Escape stays in sync with React state. */
@@ -1374,9 +1977,9 @@ export function CopilotWorkspace({
 
   const resolveInitialLocation = useEffectEvent(() => {
     if (!savedWorkspace.ok) return;
-    void resolveLocation(readStoredCwd());
+    void resolveLocation(activeConversation?.cwd ?? readStoredCwd());
   });
-  const linkInitialHistory = useEffectEvent((agentIds: readonly string[]) =>
+  const linkInitialHistory = useEffectEvent((agentIds?: readonly string[]) =>
     fetchHistory(true, agentIds),
   );
 
@@ -1389,13 +1992,17 @@ export function CopilotWorkspace({
       !eventsReady ||
       !savedWorkspace.ok ||
       !location ||
-      initialLinkStartedRef.current ||
-      initialConversationAgentIds.length === 0
+      initialLinkStartedRef.current
     )
       return;
     initialLinkStartedRef.current = true;
-    setSurface("canvas");
-    void linkInitialHistory(initialConversationAgentIds);
+    if (initialConversationAgentIds.length && !conversationIdRef.current)
+      setSurface("canvas");
+    void linkInitialHistory(
+      initialConversationAgentIds.length
+        ? initialConversationAgentIds
+        : undefined,
+    );
   }, [eventsReady, location, initialConversationAgentIds, savedWorkspace.ok]);
 
   // main.tsx already applied this theme before first paint, but had no UI yet to show a failure
@@ -1451,7 +2058,9 @@ export function CopilotWorkspace({
     if (!inventory || session || activeConversationId !== null) return;
     const validIds = new Set([
       "",
-      ...inventory.agents.map((agent) => agent.id),
+      ...inventory.agents
+        .filter((agent) => !isStudioAgentId(agent.id))
+        .map((agent) => agent.id),
       ...createdAgents.map((agent) => agent.id),
     ]);
     setSelectedAgentId((current) => (validIds.has(current) ? current : ""));
@@ -1467,6 +2076,7 @@ export function CopilotWorkspace({
       ["conversations", conversationsDialogRef.current],
       ["import", importDialogRef.current],
       ["create-agent", createAgentDialogRef.current],
+      ["agent", agentDialogRef.current],
     ];
     for (const [kind, element] of entries) {
       if (!element) continue;
@@ -1486,18 +2096,66 @@ export function CopilotWorkspace({
   // to re-read something earlier gets yanked back down mid-read.
   // biome-ignore lint/correctness/useExhaustiveDependencies: Appended messages and tab changes require remeasuring the scroll container.
   useEffect(() => {
-    if (!autoScrollEnabled || !stickToBottom) return;
+    if (dashboardId !== null || !autoScrollEnabled || !stickToBottom) return;
     const container = messagesRef.current;
     if (!container) return;
     container.scrollTop = container.scrollHeight;
-  }, [messages, autoScrollEnabled, stickToBottom, surface]);
+  }, [messages, autoScrollEnabled, stickToBottom, surface, dashboardId]);
+
+  const acpComplete =
+    !!sessionsPage &&
+    !sessionsLoading &&
+    !sessionsProblem &&
+    !sessionsPage.warnings.length &&
+    !rowsByAgent.has("__unavailable__");
+  const { index, loading: archiveLoading, failed: archiveFailed } = sources;
+  const project = useMemo(() => {
+    const cache = new Map<string, AgentHistory>();
+    return (agent: CopilotAgentSummary, ambiguous: boolean) => {
+      const key = JSON.stringify([
+        fleetIdentity(agent),
+        agent.id,
+        agent.source?.tenantId,
+        agent.source?.environmentId,
+        agent.source?.botId,
+        ambiguous,
+      ]);
+      let history = cache.get(key);
+      if (!history) {
+        history = projectAgentHistory(
+          agent,
+          ambiguous,
+          rowsByAgent.get(agent.id) ?? [],
+          sessionAgentId === agent.id ? (session?.sessionId ?? null) : null,
+          archive,
+          { index, failed: archiveFailed, loading: archiveLoading },
+          acpComplete,
+        );
+        cache.set(key, history);
+      }
+      return history;
+    };
+  }, [
+    rowsByAgent,
+    sessionAgentId,
+    session?.sessionId,
+    archive,
+    index,
+    archiveFailed,
+    archiveLoading,
+    acpComplete,
+  ]);
 
   if (!savedWorkspace.ok) {
     return (
       <main className="copilot-main">
         <div className="copilot-workspace copilot-repair">
           <Failure problem={savedWorkspace.problem} />
-          <button type="button" onClick={onBack}>
+          <button
+            type="button"
+            data-ui-action="settings_open_setup"
+            onClick={onBack}
+          >
             Back
           </button>
         </div>
@@ -1525,17 +2183,23 @@ export function CopilotWorkspace({
                 <div className="row">
                   <input
                     id="copilot-location-input"
+                    data-ui-action="settings_folder"
                     type="text"
                     value={locationInput}
                     onChange={(event) => setLocationInput(event.target.value)}
                     placeholder="C:\path\to\project"
                   />
-                  <button type="button" onClick={() => void applyLocation()}>
+                  <button
+                    type="button"
+                    data-ui-action="settings_folder"
+                    onClick={() => void applyLocation()}
+                  >
                     Apply
                   </button>
                   <button
                     type="button"
                     className="quiet"
+                    data-ui-action="settings_browse_folder"
                     onClick={() => void browseLocation()}
                   >
                     Browse...
@@ -1543,6 +2207,7 @@ export function CopilotWorkspace({
                   <button
                     type="button"
                     className="quiet"
+                    data-ui-action="settings_reset_folder"
                     onClick={() => void resetLocationToHome()}
                   >
                     Use home folder
@@ -1579,10 +2244,12 @@ export function CopilotWorkspace({
         DEFAULT_AGENT_CHOICE,
         ...Array.from(
           new Map(
-            [...(inventory?.agents ?? []), ...createdAgents].map((agent) => [
-              agent.id,
-              agent,
-            ]),
+            [
+              ...(inventory?.agents ?? []).filter(
+                (agent) => !isStudioAgentId(agent.id),
+              ),
+              ...createdAgents,
+            ].map((agent) => [agent.id, agent]),
           ).values(),
         ),
       ];
@@ -1595,38 +2262,157 @@ export function CopilotWorkspace({
       : [],
   );
 
-  const effectiveAgentId = session ? sessionAgentId : selectedAgentId;
+  const effectiveAgentId =
+    dashboardId ?? (session ? sessionAgentId : selectedAgentId);
   const currentAgent: CopilotAgentSummary =
+    inventory?.agents.find((agent) => agent.id === effectiveAgentId) ??
     agentChoices.find((agent) => agent.id === effectiveAgentId) ??
     (effectiveAgentId
       ? { id: effectiveAgentId, name: effectiveAgentId }
       : DEFAULT_AGENT_CHOICE);
   const sidebarAgents = [
-    ...new Set(["", ...importedAgentIds, ...chats.map((chat) => chat.agentId)]),
+    ...new Set([
+      "",
+      ...importedAgentIds,
+      ...(inventory?.agents ?? [])
+        .filter((agent) => isStudioAgentId(agent.id))
+        .map((agent) => agent.id),
+      ...chats.map((chat) => chat.agentId),
+    ]),
   ].map<CopilotAgentSummary>(
     (id) =>
+      (isStudioAgentId(id)
+        ? inventory?.agents.find((agent) => agent.id === id)
+        : undefined) ??
       agentChoices.find((agent) => agent.id === id) ??
       createdAgents.find((agent) => agent.id === id) ?? {
         id,
         name: chats.find((chat) => chat.agentId === id)?.agentName ?? id,
       },
   );
-  const activeChat = activeConversation;
+  // The canvas is an inventory; sidebar imports remain a personal working set.
+  const catalogAgents = [...createdAgents, ...(inventory?.agents ?? [])];
+  const catalogIds = new Set(catalogAgents.map((a) => a.id));
+  const fleet = [
+    ...new Map(
+      [
+        ...[...agentChoices, ...sidebarAgents].filter(
+          (a) => !catalogIds.has(a.id),
+        ),
+        ...catalogAgents,
+      ].map((a) => [fleetIdentity(a), a]),
+    ).values(),
+  ];
+  const runtimeCounts = new Map<string, number>();
+  for (const agent of fleet)
+    runtimeCounts.set(agent.id, (runtimeCounts.get(agent.id) ?? 0) + 1);
+  function localBlock(id: string) {
+    if (isStudioAgentId(id)) return "Open this cloud agent in Copilot Studio.";
+    if (id === "__unavailable__")
+      return "The recorded agent is unknown. Choose a known local agent for a new chat.";
+    if ((runtimeCounts.get(id) ?? 0) > 1)
+      return "Multiple local definitions share this runtime ID. Resolve the duplicate before opening a chat.";
+    if (disabledAgentIds.has(id))
+      return "The local CLI reports this agent is disabled. Enable it before opening a chat.";
+    return null;
+  }
+  const activeChat = dashboardId === null ? activeConversation : undefined;
+  const runtimeContext =
+    session && sessionAgentId === effectiveAgentId
+      ? [
+          `Session ${session.sessionId} · ${session.cwd}`,
+          `Commands: ${
+            availableCommands
+              .filter((c) => !HIDDEN_COMMAND_NAMES.has(c.name))
+              .map((c) => c.name)
+              .join(", ") || "none reported"
+          }`,
+          `Observed tool activity: ${[...new Set(messages.flatMap((m) => (m.toolActivity ? [m.toolActivity.title] : [])))].slice(0, 5).join(", ") || "none reported"}`,
+          ...configOptions
+            .filter((o) => o.id !== "agent")
+            .map((o) => `${o.name ?? o.id}: ${o.currentValue}`),
+        ].join(" · ")
+      : null;
+  const visibleStatus = dashboardId === null ? statusText : "Browsing history";
+  const fleetQuery = fleetSearch.trim().toLowerCase();
+  const matchingFleet = fleetQuery
+    ? fleet.filter((a) =>
+        [
+          a.name,
+          a.id,
+          a.definition?.declaredId,
+          a.definition?.file,
+          a.source?.environmentName,
+          fleetIdentity(a),
+          fleetDisplayId(fleetIdentity(a)),
+        ].some((value) => value?.toLowerCase().includes(fleetQuery)),
+      )
+    : fleet;
+  const page = Math.min(
+    fleetPage,
+    Math.max(0, Math.ceil(matchingFleet.length / FLEET_PAGE_SIZE) - 1),
+  );
+  const pageStart = page * FLEET_PAGE_SIZE;
+  const inspectedAgent =
+    sidebarAgents.find((agent) => agent.id === inspectedAgentId) ??
+    currentAgent;
+  const inspectedChats = chatsByAgent.get(inspectedAgent.id) ?? [];
+  const inspectedGroupId = inspectedAgent.id || "copilot-cli";
+  const inspectedChatsExpanded =
+    inspectedChats.length > 0 &&
+    isSidepaneGroupExpanded(
+      sidepaneDisclosure,
+      SIDEPANE_AGENT_LAYER,
+      inspectedGroupId,
+      inspectedChats.some(
+        (chat) => chat.conversationId === activeConversationId,
+      ),
+    );
 
   const currentPermission = permissions[0] ?? null;
   const historyQuery = historySearch.trim().toLowerCase();
-  const historyRows = conversationHistoryRows(
-    chats,
-    sessionsPage?.sessions ?? [],
-  ).filter((item) => sessionsAllFolders || item.cwd === workspace.cwd);
-  const historyAgents = Array.from(
-    groupWorkspaceChats(historyRows),
-    ([id, conversations]) => ({
-      id,
-      name: conversations[0].agentName,
-      count: conversations.length,
-    }),
-  ).sort((left, right) => left.name.localeCompare(right.name));
+  function historyFor(agent: CopilotAgentSummary) {
+    return project(agent, (runtimeCounts.get(agent.id) ?? 0) > 1);
+  }
+  function dashboard(agent: CopilotAgentSummary, compact = false) {
+    return (
+      <AgentDashboard
+        key={fleetIdentity(agent)}
+        agent={agent}
+        compact={compact}
+        history={historyFor(agent)}
+        sources={sources}
+        busy={busy || !eventsReady}
+        blocked={localBlock(agent.id)}
+        loading={!isStudioAgentId(agent.id) && sessionsLoading}
+        evidence={evidence}
+        runtime={effectiveAgentId === agent.id ? runtimeContext : null}
+        onContinue={(chat) => void loadSession(chat)}
+        onNew={() => void startDraft(agent.id)}
+        onHistory={() => openAgentHistory(agent.id)}
+      />
+    );
+  }
+  const historyRows = allRows.filter(
+    (item) => sessionsAllFolders || item.cwd === workspace.cwd,
+  );
+  const historyAgents =
+    openDialog === "conversations"
+      ? [
+          ...new Map([
+            ...historyRows.map(
+              (row) =>
+                [
+                  row.agentId,
+                  { id: row.agentId, name: row.agentName },
+                ] as const,
+            ),
+            ...fleet.map((agent) => [agent.id, agent] as const),
+          ]).values(),
+        ].sort((left, right) => left.name.localeCompare(right.name))
+      : [];
+  const filterAgent = historyAgents.find((a) => a.id === historyAgent);
+  const filterProjection = filterAgent && historyFor(filterAgent);
   const filteredHistory = historyRows.filter(
     (item) =>
       (historyAgent === "__all__" || item.agentId === historyAgent) &&
@@ -1638,7 +2424,7 @@ export function CopilotWorkspace({
 
   const resourceFilterLower = resourceFilter.trim().toLowerCase();
   const resourceByName = new Map<string, InsertableResource>();
-  for (const command of availableCommands) {
+  for (const command of runtimeContext ? availableCommands : []) {
     if (HIDDEN_COMMAND_NAMES.has(command.name)) continue;
     resourceByName.set(command.name.toLowerCase(), {
       key: `command:${command.name}`,
@@ -1669,10 +2455,10 @@ export function CopilotWorkspace({
             .includes(resourceFilterLower),
       )
     : insertableResources;
-  const conversationMessages = messages.filter(
+  const conversationMessages = (dashboardId === null ? messages : []).filter(
     (message) => message.role !== "activity",
   );
-  const activityMessages = messages.filter(
+  const activityMessages = (dashboardId === null ? messages : []).filter(
     (message) => message.role === "activity",
   );
   const agentManagement = (
@@ -1686,6 +2472,7 @@ export function CopilotWorkspace({
         <button
           type="button"
           className="quiet"
+          data-ui-action="workspace_open_dialog"
           disabled={busy || sessionsLoading}
           onClick={() => openDialogFrom("import")}
         >
@@ -1694,6 +2481,7 @@ export function CopilotWorkspace({
         <button
           type="button"
           className="quiet"
+          data-ui-action="workspace_link_history"
           disabled={busy || sessionsLoading || !eventsReady}
           onClick={() => void fetchHistory(true, importedAgentIds)}
         >
@@ -1708,201 +2496,360 @@ export function CopilotWorkspace({
       {sessionsProblem && <InlineFailure problem={sessionsProblem} />}
     </section>
   );
+  const sessionConfiguration = (
+    <section>
+      <h3>Session configuration</h3>
+      {session &&
+      sessionAgentId === inspectedAgent.id &&
+      (modelOption || reasoningOption || modeOption) ? (
+        [modelOption, reasoningOption, modeOption].map((option) =>
+          option ? (
+            <Fragment key={option.id}>
+              <label htmlFor={`copilot-config-${option.id}`}>
+                {option.name ?? configOptionLabel(option.id)}
+              </label>
+              <select
+                id={`copilot-config-${option.id}`}
+                data-ui-action="settings_configure_session"
+                value={option.currentValue}
+                disabled={busy}
+                onChange={(event) =>
+                  void configureSession(option.id, event.target.value)
+                }
+              >
+                {visibleConfigOptionValues(option).map((value) => (
+                  <option
+                    key={value.value}
+                    value={value.value}
+                    disabled={isConfigValueDisabled(value)}
+                  >
+                    {value.name}
+                  </option>
+                ))}
+              </select>
+            </Fragment>
+          ) : null,
+        )
+      ) : (
+        <p className="hint">
+          Open this agent's conversation to see its negotiated model, reasoning
+          and mode settings. These apply to that conversation, not the agent
+          definition.
+        </p>
+      )}
+    </section>
+  );
 
   return (
-    <main className="copilot-main">
-      <div className="copilot-workspace copilot-canvas-workspace">
-        <aside className="copilot-sidebar" aria-label="Agents and chats">
-          <header className="copilot-sidebar-header">
+    <main
+      className={`copilot-main copilot-flip-stage${desktopWindow.front ? " is-front" : ""}`}
+    >
+      {desktopWindow.widget && (
+        <section
+          className="copilot-live-tile"
+          aria-label="Live agent tile"
+          inert={!desktopWindow.front}
+          aria-hidden={!desktopWindow.front}
+        >
+          <div className="copilot-live-tile-header">
             <BrandLockup />
-            <div className="copilot-sidebar-actions">
+            <span className="copilot-runtime-state" role="status">
+              {dashboardId === null && permissions.length > 0
+                ? "Permission needed"
+                : busy
+                  ? "Working"
+                  : visibleStatus}
+            </span>
+          </div>
+          <h1>{currentAgent.name}</h1>
+          <p className="copilot-live-tile-summary">
+            {activeChat?.title ||
+              currentAgent.description ||
+              "Ready for your next task."}
+          </p>
+          <div className="copilot-live-tile-metrics">
+            <span>{fleet.length.toLocaleString()} agents</span>
+            <span>{chats.length.toLocaleString()} chats</span>
+            <span>{activityMessages.length.toLocaleString()} activities</span>
+          </div>
+          <section
+            className="copilot-live-tile-preview"
+            aria-label="Latest response"
+          >
+            {[...conversationMessages]
+              .reverse()
+              .find((message) => message.role === "assistant")
+              ?.text.slice(-320) ||
+              (busy
+                ? "The agent is working. Open chat to follow its activity."
+                : "Open chat to continue this conversation.")}
+          </section>
+          {dashboardId === null && failure && (
+            <InlineFailure problem={failure} />
+          )}
+          <nav className="copilot-live-tile-agents" aria-label="Widget agents">
+            {sidebarAgents.map((agent) => (
               <button
-                type="button"
-                disabled={busy || !eventsReady}
-                onClick={() => openDialogFrom("create-agent")}
-              >
-                New agent
-              </button>
-              <button
+                key={agent.id}
                 type="button"
                 className="quiet"
-                disabled={
-                  busy || !eventsReady || disabledAgentIds.has(effectiveAgentId)
-                }
-                onClick={() => void startDraft(effectiveAgentId)}
-                title={`New chat with ${currentAgent.name}`}
+                data-ui-action="sidebar_select_agent"
+                aria-pressed={effectiveAgentId === agent.id}
+                disabled={busy}
+                title={`${agent.name} / ${agentSourceLabel(agent)}`}
+                onClick={() => void selectWorkspaceAgent(agent.id)}
               >
-                New chat
+                <CopilotAgentIcon agent={agent} />
+                {agent.name}
+                {isStudioAgentId(agent.id) && (
+                  <span className="copilot-agent-source">
+                    {agent.source?.environmentName ?? "Source unavailable"}
+                  </span>
+                )}
               </button>
-            </div>
+            ))}
+          </nav>
+          <button
+            type="button"
+            data-ui-action="window_flip"
+            onClick={showWorkspace}
+          >
+            Open chat
+          </button>
+        </section>
+      )}
+      <div
+        className="copilot-workspace copilot-canvas-workspace"
+        inert={desktopWindow.front}
+        aria-hidden={desktopWindow.front}
+      >
+        <aside
+          className="copilot-sidebar"
+          aria-label={WORKSPACE_SIDEPANE.label}
+        >
+          <header className="copilot-sidebar-header">
+            {renderSidepaneRegion("header", {
+              brand: <BrandLockup />,
+              compose: (
+                <div className="copilot-sidebar-actions">
+                  <button
+                    type="button"
+                    data-ui-action="workspace_open_dialog"
+                    disabled={busy || !eventsReady}
+                    onClick={() => openDialogFrom("create-agent")}
+                  >
+                    New agent
+                  </button>
+                  <button
+                    type="button"
+                    className="quiet"
+                    data-ui-action="workspace_new_chat"
+                    disabled={
+                      busy || !eventsReady || !!localBlock(effectiveAgentId)
+                    }
+                    onClick={() => void startDraft(effectiveAgentId)}
+                    title={`New chat with ${currentAgent.name}`}
+                  >
+                    New chat
+                  </button>
+                </div>
+              ),
+            })}
           </header>
-          <nav className="copilot-chat-navigation" aria-label="Workspace chats">
-            <h2>Agents</h2>
-            {(linkingConversations || linkStatus) && (
-              <p className="copilot-chat-link-status" role="status">
-                {linkingConversations ? historyProgress : linkStatus}
-              </p>
-            )}
-            <ul className="copilot-sidebar-groups">
-              {sidebarAgents.map((agent) => {
-                const agentChats = chatsByAgent.get(agent.id) ?? [];
-                const preview = previewAgentChats(
-                  agentChats,
-                  activeConversationId,
-                );
-                const groupId = agent.id || "copilot-cli";
-                const holdsActiveChat = agentChats.some(
-                  (chat) => chat.conversationId === activeConversationId,
-                );
-                // An agent normally runs one conversation, so groups stay collapsed
-                // until asked for. The group holding the open chat is never hidden.
-                const chatsExpanded =
-                  agentChats.length > 0 &&
-                  isSidepaneGroupExpanded(
-                    sidepaneDisclosure,
-                    SIDEPANE_AGENT_LAYER,
-                    groupId,
-                    holdsActiveChat,
-                  );
-                const chatsId = `copilot-agent-chats-${groupId}`;
-                return (
-                  <li key={groupId} data-agent-id={agent.id}>
-                    <div className="copilot-sidebar-agent">
-                      <button
-                        type="button"
-                        className="quiet copilot-disclosure"
-                        aria-expanded={chatsExpanded}
-                        aria-controls={chatsId}
-                        disabled={agentChats.length === 0}
-                        title={
-                          agentChats.length === 0
-                            ? `${agent.name} has no chats yet`
-                            : chatsExpanded
-                              ? `Hide ${agent.name} chats`
-                              : `Show ${agentChats.length.toLocaleString()} ${agent.name} chats`
-                        }
-                        onClick={() =>
-                          toggleAgentChats(agent.id, !chatsExpanded)
-                        }
+          {renderSidepaneRegion("body", {
+            agents: (
+              <nav
+                className="copilot-chat-navigation"
+                aria-label={SIDEPANE_AGENT_LAYER.title}
+                // biome-ignore lint/a11y/noNoninteractiveTabindex: Hidden scrollbar still needs keyboard access.
+                tabIndex={0}
+              >
+                <h2>{SIDEPANE_AGENT_LAYER.title}</h2>
+                {(linkingConversations || linkStatus) && (
+                  <p className="copilot-chat-link-status" role="status">
+                    {linkingConversations ? historyProgress : linkStatus}
+                  </p>
+                )}
+                <ul className="copilot-sidebar-groups">
+                  {sidebarAgents.map((agent, layer) => {
+                    const agentChats = chatsByAgent.get(agent.id) ?? [];
+                    const preview = previewAgentChats(
+                      agentChats,
+                      activeConversationId,
+                    );
+                    const groupId = agent.id || "copilot-cli";
+                    const holdsActiveChat = agentChats.some(
+                      (chat) => chat.conversationId === activeConversationId,
+                    );
+                    // An agent normally runs one conversation, so groups stay collapsed
+                    // until asked for. The active group opens unless explicitly collapsed.
+                    const chatsExpanded =
+                      agentChats.length > 0 &&
+                      isSidepaneGroupExpanded(
+                        sidepaneDisclosure,
+                        SIDEPANE_AGENT_LAYER,
+                        groupId,
+                        holdsActiveChat,
+                      );
+                    const chatsId = `copilot-agent-chats-${groupId}`;
+                    const layerStyle: CSSProperties & {
+                      "--agent-layer": number;
+                    } = { "--agent-layer": sidebarAgents.length - layer };
+                    return (
+                      <li
+                        key={groupId}
+                        data-agent-id={agent.id}
+                        style={layerStyle}
                       >
-                        <span aria-hidden="true">›</span>
-                        <span className="sr-only">
-                          {chatsExpanded
-                            ? `Hide ${agent.name} chats`
-                            : `Show ${agent.name} chats`}
-                        </span>
-                      </button>
-                      <button
-                        type="button"
-                        className="quiet copilot-agent-name"
-                        aria-pressed={effectiveAgentId === agent.id}
-                        disabled={busy}
-                        title={agent.description || agent.name}
-                        onClick={() => void selectWorkspaceAgent(agent.id)}
-                      >
-                        {agent.name}
-                      </button>
-                      {agentChats.length > 0 && (
-                        <span className="copilot-chat-count" aria-hidden="true">
-                          {agentChats.length.toLocaleString()}
-                        </span>
-                      )}
-                      <button
-                        type="button"
-                        className="quiet copilot-new-chat"
-                        aria-label={`New chat with ${agent.name}`}
-                        disabled={
-                          busy || !eventsReady || disabledAgentIds.has(agent.id)
-                        }
-                        onClick={() => void startDraft(agent.id)}
-                      >
-                        New
-                      </button>
-                    </div>
-                    {agentChats.length === 0 && (
-                      <p className="hint">No chats yet</p>
-                    )}
-                    <ul
-                      className="copilot-sidebar-chats"
-                      id={chatsId}
-                      hidden={!chatsExpanded}
-                    >
-                      {preview.map((chat) => (
-                        <li key={chat.conversationId}>
+                        <div className="copilot-sidebar-agent">
                           <button
-                            ref={
-                              chat.conversationId === activeConversationId
-                                ? activeChatRef
-                                : null
-                            }
                             type="button"
-                            className="quiet"
-                            aria-current={
-                              chat.conversationId === activeConversationId
-                                ? "true"
-                                : undefined
-                            }
-                            disabled={busy || !eventsReady}
-                            title={chat.title}
-                            onClick={() => void loadSession(chat)}
+                            className="quiet copilot-agent-icon-button"
+                            data-ui-action="workspace_inspect_agent"
+                            aria-label={`Settings for ${agent.name}`}
+                            aria-haspopup="dialog"
+                            title={`Settings for ${agent.name}`}
+                            onClick={() => openAgentSettings(agent.id)}
                           >
-                            {chat.sessionId === null
-                              ? `Draft: ${chat.title}`
-                              : chat.title}
+                            <CopilotAgentIcon agent={agent} />
                           </button>
-                        </li>
-                      ))}
-                      {agentChats.length > preview.length && (
-                        <li>
                           <button
                             type="button"
-                            className="quiet"
+                            className="quiet copilot-agent-name"
+                            data-ui-action="sidebar_select_agent"
+                            aria-pressed={effectiveAgentId === agent.id}
+                            disabled={busy}
+                            title={`${agent.name} / ${agentSourceLabel(agent)}`}
+                            onClick={() => void selectWorkspaceAgent(agent.id)}
+                          >
+                            {agent.name}
+                            {isStudioAgentId(agent.id) && (
+                              <span className="copilot-agent-source">
+                                {agent.source?.environmentName ??
+                                  "Source unavailable"}
+                              </span>
+                            )}
+                          </button>
+                          <button
+                            type="button"
+                            className="quiet copilot-chat-count"
+                            data-ui-action="workspace_view_agent_history"
+                            aria-label={`History sources for ${agent.name}: ${countLabel(historyFor(agent).summary)}`}
+                            title={`${countLabel(historyFor(agent).summary)} · History sources`}
                             onClick={() => openAgentHistory(agent.id)}
                           >
-                            View all {agentChats.length.toLocaleString()} chats
+                            {historyFor(agent).summary.known === null
+                              ? "?"
+                              : `${historyFor(agent).summary.coverage === "complete" ? "" : "≥"}${historyFor(agent).summary.known}`}
                           </button>
-                        </li>
-                      )}
-                    </ul>
-                  </li>
-                );
-              })}
-            </ul>
-          </nav>
-          <div className="copilot-sidebar-tools">
-            <button
-              type="button"
-              className="quiet"
-              onClick={() => openDialogFrom("resources")}
-            >
-              Resources
-            </button>
-            <button
-              type="button"
-              className="quiet"
-              onClick={() => openDialogFrom("conversations")}
-            >
-              History
-            </button>
-            <button
-              type="button"
-              className="quiet"
-              onClick={() => openDialogFrom("settings")}
-            >
-              Settings
-            </button>
-            <button
-              type="button"
-              className="quiet"
-              onClick={() => openDialogFrom("profile")}
-            >
-              Profile
-            </button>
-          </div>
+                        </div>
+                        <ul
+                          className="copilot-sidebar-chats"
+                          id={chatsId}
+                          hidden={!chatsExpanded}
+                        >
+                          {preview.map((chat) => (
+                            <li key={chat.conversationId}>
+                              <button
+                                ref={
+                                  chat.conversationId === activeConversationId
+                                    ? activeChatRef
+                                    : null
+                                }
+                                type="button"
+                                className="quiet"
+                                data-ui-action="workspace_open_chat"
+                                aria-current={
+                                  chat.conversationId === activeConversationId
+                                    ? "true"
+                                    : undefined
+                                }
+                                disabled={busy || !eventsReady}
+                                title={chat.title}
+                                onClick={() => void loadSession(chat)}
+                              >
+                                {chat.sessionId === null
+                                  ? `Draft: ${chat.title}`
+                                  : chat.title}
+                              </button>
+                            </li>
+                          ))}
+                          {agentChats.length > preview.length && (
+                            <li>
+                              <button
+                                type="button"
+                                className="quiet"
+                                data-ui-action="workspace_view_agent_history"
+                                onClick={() => openAgentHistory(agent.id)}
+                              >
+                                View all {agentChats.length.toLocaleString()}{" "}
+                                chats
+                              </button>
+                            </li>
+                          )}
+                        </ul>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </nav>
+            ),
+          })}
+          {renderSidepaneRegion("footer", {
+            tools: (
+              <div className="copilot-sidebar-tools">
+                <button
+                  type="button"
+                  className="quiet"
+                  data-ui-action="workspace_open_dialog"
+                  onClick={() => openDialogFrom("resources")}
+                >
+                  Resources
+                </button>
+                <button
+                  type="button"
+                  className="quiet"
+                  data-ui-action="workspace_open_dialog"
+                  onClick={() => openDialogFrom("conversations")}
+                >
+                  History
+                </button>
+                <button
+                  type="button"
+                  className="quiet"
+                  data-ui-action="workspace_open_dialog"
+                  onClick={() => openDialogFrom("settings")}
+                >
+                  Settings
+                </button>
+                <button
+                  type="button"
+                  className="quiet"
+                  data-ui-action="workspace_open_dialog"
+                  onClick={() => openDialogFrom("profile")}
+                >
+                  Profile
+                </button>
+              </div>
+            ),
+          })}
         </aside>
         <section className="copilot-canvas" aria-label="Copilot workspace">
-          <header className="copilot-canvas-header">
+          <header className="copilot-canvas-header" data-surface={surface}>
             <h1 className="sr-only">Darbot with GitHub Copilot</h1>
+            {desktopWindow.widget && (
+              <button
+                type="button"
+                className="quiet copilot-agent-icon-button"
+                data-ui-action="workspace_inspect_agent"
+                aria-label={`Settings for ${currentAgent.name}`}
+                aria-haspopup="dialog"
+                title={`Settings for ${currentAgent.name}`}
+                onClick={() => openAgentSettings(currentAgent.id)}
+              >
+                <CopilotAgentIcon agent={currentAgent} />
+              </button>
+            )}
             <div
               className="copilot-surface-tabs"
               role="tablist"
@@ -1915,6 +2862,7 @@ export function CopilotWorkspace({
                   type="button"
                   role="tab"
                   className="quiet"
+                  data-ui-action="workspace_select_surface"
                   aria-selected={surface === item.id}
                   aria-controls={`copilot-panel-${item.id}`}
                   tabIndex={surface === item.id ? 0 : -1}
@@ -1957,19 +2905,44 @@ export function CopilotWorkspace({
                 <div>
                   <h2>{activeChat?.title ?? currentAgent.name}</h2>
                   <p>
-                    {session
-                      ? currentAgent.name
-                      : activeChat?.sessionId
-                        ? "Open the saved conversation to continue"
-                        : activeChat
-                          ? "Draft saved locally; Copilot starts when you send"
-                          : "Start a new conversation"}
+                    {dashboardId !== null
+                      ? "Agent dashboard"
+                      : session
+                        ? currentAgent.name
+                        : activeChat?.sessionId
+                          ? "Open the saved conversation to continue"
+                          : activeChat
+                            ? "Draft saved locally; Copilot starts when you send"
+                            : "Start a new conversation"}
                   </p>
                 </div>
                 <span className="copilot-runtime-state" aria-live="polite">
-                  {busy ? (openingSession ? "Opening" : "Working") : statusText}
+                  {busy
+                    ? openingSession
+                      ? "Opening"
+                      : "Working"
+                    : visibleStatus}
                 </span>
               </div>
+              {dashboardId === null && runtimeContext && (
+                <details>
+                  <summary data-ui-action="inspect_details">
+                    Negotiated session context
+                  </summary>
+                  <p>{runtimeContext}</p>
+                </details>
+              )}
+              {activeChat?.sessionId && !session && !busy && (
+                <button
+                  type="button"
+                  className="quiet"
+                  data-ui-action="workspace_open_chat"
+                  disabled={!eventsReady || !!localBlock(activeChat.agentId)}
+                  onClick={() => void loadSession(activeChat)}
+                >
+                  Open selected session: {activeChat.title}
+                </button>
+              )}
               <div className="copilot-messages-wrap">
                 <div
                   ref={messagesRef}
@@ -1980,9 +2953,41 @@ export function CopilotWorkspace({
                   }
                   aria-live="polite"
                   aria-busy={busy}
+                  data-ui-action="workspace_scroll_messages"
                   onScroll={handleMessagesScroll}
                 >
-                  {conversationMessages.length === 0 ? (
+                  {dashboardId !== null ||
+                  (activeChat?.sessionId && !session && !busy) ? (
+                    <>
+                      {dashboardId !== null && dashboardProblem && (
+                        <InlineFailure problem={dashboardProblem} />
+                      )}
+                      {dashboardId !== null && dashboardProblem && (
+                        <p>
+                          Check that Copilot CLI supports this agent and folder,
+                          then retry Continue or start a new draft.
+                        </p>
+                      )}
+                      {sessionsProblem && (
+                        <>
+                          <InlineFailure problem={sessionsProblem} />
+                          <button
+                            type="button"
+                            className="quiet"
+                            data-ui-action="workspace_view_agent_history"
+                            disabled={sessionsLoading}
+                            onClick={() => {
+                              setSessionsAllFolders(true);
+                              void fetchHistory(true);
+                            }}
+                          >
+                            Retry reading history
+                          </button>
+                        </>
+                      )}
+                      {dashboard(currentAgent)}
+                    </>
+                  ) : conversationMessages.length === 0 ? (
                     <div className="copilot-empty">
                       <h2>
                         {busy
@@ -2014,6 +3019,7 @@ export function CopilotWorkspace({
                   <button
                     type="button"
                     className="copilot-jump-latest"
+                    data-ui-action="workspace_jump_latest"
                     onClick={jumpToLatest}
                   >
                     Jump to latest
@@ -2024,6 +3030,7 @@ export function CopilotWorkspace({
                 <button
                   type="button"
                   className="quiet copilot-activity-link"
+                  data-ui-action="workspace_select_surface"
                   onClick={() => setSurface("cli")}
                 >
                   View CLI activity ({activityMessages.length})
@@ -2040,113 +3047,261 @@ export function CopilotWorkspace({
               tabIndex={0}
             >
               <div className="copilot-surface-heading">
-                <h2>Your agents and conversations</h2>
+                <h2>Agent fleet</h2>
                 <p className="hint">
-                  Open a conversation or start a new task with an agent.
+                  Local agents run in Copilot CLI. Configured cloud agents are
+                  indexed here and opened in their own Copilot Studio
+                  environment.
                 </p>
-              </div>
-              <ul className="copilot-agent-canvas">
-                {sidebarAgents.map((agent) => {
-                  const agentChats = chatsByAgent.get(agent.id) ?? [];
-                  const preview = previewAgentChats(
-                    agentChats,
-                    activeConversationId,
-                  );
-                  return (
-                    <li
-                      key={agent.id || "copilot-cli"}
-                      data-agent-id={agent.id}
-                    >
-                      <h3>{agent.name}</h3>
-                      <p>{agent.description || "Copilot agent"}</p>
-                      <ul className="copilot-canvas-chats">
-                        {preview.map((chat) => (
-                          <li key={chat.conversationId}>
-                            <button
-                              type="button"
-                              className="quiet"
-                              title={chat.title}
-                              disabled={busy || !eventsReady}
-                              onClick={() => void loadSession(chat)}
-                            >
-                              {chat.sessionId === null
-                                ? `Draft: ${chat.title}`
-                                : chat.title}
-                            </button>
-                          </li>
-                        ))}
-                      </ul>
-                      {agentChats.length === 0 && (
-                        <p className="hint">No linked conversations yet.</p>
-                      )}
-                      {agentChats.length > preview.length && (
-                        <button
-                          type="button"
-                          className="quiet"
-                          onClick={() => openAgentHistory(agent.id)}
-                        >
-                          View all {agentChats.length.toLocaleString()} chats
-                        </button>
-                      )}
+                <button
+                  type="button"
+                  className="quiet"
+                  data-ui-action="catalog_refresh"
+                  disabled={refreshingCatalog}
+                  onClick={() => void refreshCatalog()}
+                >
+                  {refreshingCatalog
+                    ? "Refreshing agent sources..."
+                    : "Refresh agent catalog"}
+                </button>
+                {catalogProblem && <InlineFailure problem={catalogProblem} />}
+                {!!inventory?.sources?.length && (
+                  <details>
+                    <summary data-ui-action="inspect_details">
+                      Environment coverage ({inventory.sources.length})
+                    </summary>
+                    <StudioSources sources={inventory.sources} />
+                  </details>
+                )}
+                {studioLinkStatus && <p role="status">{studioLinkStatus}</p>}
+                <div className="fleet-searchbar">
+                  <label>
+                    Find an agent
+                    <input
+                      type="search"
+                      data-ui-action="workspace_filter_fleet"
+                      value={fleetSearch}
+                      onChange={(event) => {
+                        setFleetSearch(event.target.value);
+                        setFleetPage(0);
+                      }}
+                      placeholder="Name, ID or environment"
+                    />
+                  </label>
+                  <p className="hint">
+                    {matchingFleet.length} of {fleet.length} cards
+                  </p>
+                  {matchingFleet.length > FLEET_PAGE_SIZE && (
+                    <nav aria-label="Fleet pages" className="fleet-toolbar">
                       <button
                         type="button"
-                        disabled={
-                          busy || !eventsReady || disabledAgentIds.has(agent.id)
-                        }
-                        onClick={() => void startDraft(agent.id)}
+                        className="quiet"
+                        data-ui-action="fleet_page"
+                        disabled={!page}
+                        onClick={() => setFleetPage(page - 1)}
                       >
-                        New chat
+                        Previous
                       </button>
-                    </li>
-                  );
-                })}
+                      <span>
+                        {pageStart + 1}–
+                        {Math.min(
+                          pageStart + FLEET_PAGE_SIZE,
+                          matchingFleet.length,
+                        )}
+                      </span>
+                      <button
+                        type="button"
+                        className="quiet"
+                        data-ui-action="fleet_page"
+                        disabled={
+                          pageStart + FLEET_PAGE_SIZE >= matchingFleet.length
+                        }
+                        onClick={() => setFleetPage(page + 1)}
+                      >
+                        Next
+                      </button>
+                    </nav>
+                  )}
+                </div>
+              </div>
+              <ul className="copilot-agent-canvas" aria-label="Agent cards">
+                {surface === "canvas" &&
+                  matchingFleet
+                    .slice(pageStart, pageStart + FLEET_PAGE_SIZE)
+                    .map((agent) => {
+                      return (
+                        <FleetTile
+                          key={fleetIdentity(agent)}
+                          agent={agent}
+                          history={historyFor(agent)}
+                          build={() =>
+                            buildFleetCard(
+                              agent,
+                              fleet,
+                              savedWorkspace.ok ? chats : null,
+                              sessionsPage,
+                              historyIndexScope,
+                              !sessionsLoading && !sessionsProblem,
+                              inventory?.sources ?? [],
+                              session
+                                ? {
+                                    agentId: sessionAgentId,
+                                    sessionId: session.sessionId,
+                                    model: modelOption?.currentValue,
+                                  }
+                                : undefined,
+                              historyFor(agent).summary,
+                            )
+                          }
+                          diagnostics={() => (
+                            <ResourceDiagnostics
+                              inventory={inventory}
+                              agent={agent}
+                              status={status}
+                            />
+                          )}
+                          sessionActions={() => (
+                            <>
+                              {dashboard(agent, true)}
+                              {isStudioAgentId(agent.id) && (
+                                <button
+                                  type="button"
+                                  className="quiet"
+                                  data-ui-action="studio_copy_link"
+                                  disabled={!agent.source}
+                                  onClick={() => void copyStudioLink(agent)}
+                                >
+                                  Copy Copilot Studio link
+                                </button>
+                              )}
+                            </>
+                          )}
+                        />
+                      );
+                    })}
               </ul>
             </div>
             <div
               id="copilot-panel-cli"
-              className="copilot-surface-panel"
+              className="copilot-surface-panel copilot-cli-panel"
               role="tabpanel"
               aria-labelledby="copilot-tab-cli"
               hidden={surface !== "cli"}
               // biome-ignore lint/a11y/noNoninteractiveTabindex: ARIA tab panels need a keyboard entry point for their scrollable content.
               tabIndex={0}
             >
-              <div className="copilot-surface-heading">
-                <h2 className="copilot-provider-label">
-                  <span className="copilot-mark" aria-hidden="true" />
-                  GitHub Copilot CLI
-                </h2>
-                <p className="hint">
-                  Live tool activity for this conversation, separate from chat.
-                  This is an activity viewer, not an interactive shell.
-                </p>
-              </div>
-              {activityMessages.length === 0 ? (
-                <p className="copilot-empty">
-                  No tool activity in this conversation yet.
-                </p>
-              ) : (
-                <ol
-                  className="copilot-cli-activity"
-                  aria-label="CLI activity"
-                  aria-live="polite"
-                >
-                  {activityMessages.map((message) => (
-                    <li key={message.id}>
-                      <p>{message.text}</p>
-                      {message.raw != null && (
-                        <details className="detail-of">
-                          <summary>Tool output and details</summary>
-                          <pre>{formatRawPayload(message.raw)}</pre>
-                        </details>
-                      )}
-                    </li>
-                  ))}
-                </ol>
-              )}
-              {location && <CopilotExtensionsPanel cwd={location.cwd} />}
+              <CliFlipCard
+                title="CLI AgentCard"
+                badge="CLI"
+                header={
+                  <>
+                    <h2 className="copilot-provider-label">
+                      <span className="copilot-mark" aria-hidden="true" />
+                      GitHub Copilot CLI
+                    </h2>
+                    <p className="hint">
+                      Live tool activity and background SDK tools. This is not
+                      an interactive shell.
+                    </p>
+                  </>
+                }
+                reverse={
+                  <>
+                    <h3>CLI AgentCard details</h3>
+                    <dl className="cli-flipcard-facts">
+                      <div>
+                        <dt>Conversation activity</dt>
+                        <dd>
+                          {activityMessages.length.toLocaleString()} tool
+                          activity entries
+                        </dd>
+                      </div>
+                      <div>
+                        <dt>Workspace folder</dt>
+                        <dd>
+                          {location?.cwd ?? "No workspace folder selected"}
+                        </dd>
+                      </div>
+                    </dl>
+                    <p className="hint">
+                      Background SDK work runs separately from the active
+                      conversation.
+                    </p>
+                  </>
+                }
+              >
+                <div className="cli-livetile-grid">
+                  <CliFlipCard
+                    title="Live tool activity"
+                    header={<h3>Live tool activity</h3>}
+                    reverse={
+                      <>
+                        <h4>Activity scope</h4>
+                        <p className="hint">
+                          Shows tool updates received for the active
+                          conversation, separate from chat. Tool output is shown
+                          only when supplied by the CLI.
+                        </p>
+                      </>
+                    }
+                  >
+                    {activityMessages.length === 0 ? (
+                      <p className="copilot-empty">
+                        No tool activity in this conversation yet.
+                      </p>
+                    ) : (
+                      <ol
+                        className="copilot-cli-activity"
+                        aria-label="CLI activity"
+                        aria-live="polite"
+                      >
+                        {activityMessages.map((message) => (
+                          <li key={message.id}>
+                            <p>{message.text}</p>
+                            {message.raw != null && (
+                              <details className="detail-of">
+                                <summary data-ui-action="inspect_details">
+                                  Tool output and details
+                                </summary>
+                                <pre>{formatRawPayload(message.raw)}</pre>
+                              </details>
+                            )}
+                          </li>
+                        ))}
+                      </ol>
+                    )}
+                  </CliFlipCard>
+                  {location && (
+                    <CliFlipCard
+                      title="Background SDK"
+                      header={<h3>Background SDK</h3>}
+                      reverse={
+                        <>
+                          <h4>SDK scope</h4>
+                          <dl className="cli-flipcard-facts">
+                            <div>
+                              <dt>Workspace folder</dt>
+                              <dd>{location.cwd}</dd>
+                            </div>
+                            <div>
+                              <dt>Runtime</dt>
+                              <dd>Signed-in Copilot CLI profile</dd>
+                            </div>
+                          </dl>
+                          <p className="hint">
+                            Agent tasks, plugin inventory and remote session
+                            discovery use the separate SDK connection.
+                          </p>
+                        </>
+                      }
+                    >
+                      <CopilotExtensionsPanel cwd={location.cwd} />
+                    </CliFlipCard>
+                  )}
+                </div>
+              </CliFlipCard>
             </div>
-            <div className="copilot-composer">
+            <div className="copilot-composer" hidden={dashboardId !== null}>
               <label htmlFor="copilot-prompt">
                 Message{" "}
                 {currentAgent.name.replace(/^./, (letter) =>
@@ -2157,6 +3312,7 @@ export function CopilotWorkspace({
                 <button
                   type="button"
                   className="quiet copilot-composer-add"
+                  data-ui-action="workspace_open_dialog"
                   aria-label="Add a skill or command"
                   title="Add a skill or command"
                   onClick={() => openDialogFrom("resources")}
@@ -2167,6 +3323,7 @@ export function CopilotWorkspace({
                 <textarea
                   ref={promptRef}
                   id="copilot-prompt"
+                  data-ui-action="workspace_edit_draft"
                   value={prompt}
                   onChange={(event) => updateDraft(event.target.value)}
                   maxLength={MAX_DRAFT_LENGTH}
@@ -2188,6 +3345,7 @@ export function CopilotWorkspace({
                 <button
                   type="button"
                   className="quiet"
+                  data-ui-action="workspace_open_dialog"
                   onClick={() => openDialogFrom("settings")}
                 >
                   Settings
@@ -2197,6 +3355,7 @@ export function CopilotWorkspace({
                 </span>
                 <button
                   type="button"
+                  data-ui-action="workspace_send_prompt"
                   onClick={() => void sendPrompt()}
                   disabled={busy || !eventsReady || !prompt.trim()}
                 >
@@ -2206,6 +3365,7 @@ export function CopilotWorkspace({
                   <button
                     type="button"
                     className="quiet"
+                    data-ui-action="workspace_cancel_prompt"
                     onClick={() => void cancelPrompt()}
                   >
                     Stop
@@ -2213,21 +3373,36 @@ export function CopilotWorkspace({
                 )}
               </div>
             </div>
-            {inventory && inventory.warnings.length > 0 && (
-              <details className="copilot-runtime-warnings">
-                <summary>Copilot resource warnings</summary>
-                <ul>
-                  {[...new Set(inventory.warnings)].map((warning) => (
-                    <li key={warning}>{warning}</li>
-                  ))}
-                </ul>
-              </details>
+            {dashboardId === null &&
+              inventory &&
+              inventory.warnings.length > 0 && (
+                <details className="copilot-runtime-warnings">
+                  <summary data-ui-action="inspect_details">
+                    Copilot resource warnings
+                  </summary>
+                  <ul>
+                    {[...new Set(inventory.warnings)].map((warning) => (
+                      <li key={warning}>{warning}</li>
+                    ))}
+                  </ul>
+                </details>
+              )}
+            {dashboardId === null && failure && (
+              <>
+                <Failure problem={failure} />
+                {activeChat && !session && !busy && (
+                  <p className="hint">
+                    Check that the folder exists and Copilot CLI supports this
+                    agent. Your draft is still saved locally.
+                  </p>
+                )}
+              </>
             )}
-            {failure && <Failure problem={failure} />}
             {failure && activeChat?.sessionId && !session && !busy && (
               <button
                 type="button"
                 className="quiet"
+                data-ui-action="workspace_retry_chat"
                 onClick={() => void loadSession(activeChat)}
               >
                 Retry opening conversation
@@ -2237,9 +3412,9 @@ export function CopilotWorkspace({
           </section>
         </section>
       </div>
-
       <dialog
         ref={importDialogRef}
+        data-ui-action="workspace_close_dialog"
         className="copilot-dialog copilot-dialog-wide"
         aria-labelledby="copilot-import-title"
         onClose={() => handleDialogClosed("import")}
@@ -2248,6 +3423,7 @@ export function CopilotWorkspace({
           {openDialog === "import" && (
             <CopilotAgentImport
               existingIds={importedAgentIds}
+              onCatalogLoaded={applyCatalog}
               onComplete={(ids) => {
                 addImportedAgents(ids);
                 setOpenDialog(null);
@@ -2260,6 +3436,7 @@ export function CopilotWorkspace({
 
       <dialog
         ref={createAgentDialogRef}
+        data-ui-action="workspace_close_dialog"
         className="copilot-dialog"
         aria-labelledby="copilot-create-agent-title"
         onClose={() => handleDialogClosed("create-agent")}
@@ -2272,6 +3449,7 @@ export function CopilotWorkspace({
           <button
             type="button"
             className="quiet"
+            data-ui-action="workspace_close_dialog"
             disabled={creatingAgent}
             onClick={() => setOpenDialog(null)}
           >
@@ -2280,6 +3458,7 @@ export function CopilotWorkspace({
         </div>
         <form
           className="copilot-dialog-body"
+          data-ui-action="workspace_create_agent"
           onSubmit={(event) => {
             event.preventDefault();
             void createAgent();
@@ -2289,6 +3468,7 @@ export function CopilotWorkspace({
             <label htmlFor="copilot-new-agent-name">Agent name</label>
             <input
               id="copilot-new-agent-name"
+              data-ui-action="workspace_edit_agent_name"
               type="text"
               value={agentName}
               onChange={(event) => setAgentName(event.target.value)}
@@ -2307,6 +3487,7 @@ export function CopilotWorkspace({
             <label htmlFor="copilot-new-agent-description">Description</label>
             <input
               id="copilot-new-agent-description"
+              data-ui-action="workspace_edit_agent_description"
               type="text"
               value={agentDescription}
               onChange={(event) => setAgentDescription(event.target.value)}
@@ -2319,6 +3500,7 @@ export function CopilotWorkspace({
             <label htmlFor="copilot-new-agent-instructions">Instructions</label>
             <textarea
               id="copilot-new-agent-instructions"
+              data-ui-action="workspace_edit_agent_instructions"
               value={agentInstructions}
               onChange={(event) => setAgentInstructions(event.target.value)}
               rows={5}
@@ -2336,6 +3518,7 @@ export function CopilotWorkspace({
           {agentProblem && <InlineFailure problem={agentProblem} />}
           <button
             type="submit"
+            data-ui-action="workspace_create_agent"
             disabled={
               creatingAgent ||
               !agentName.trim() ||
@@ -2350,6 +3533,7 @@ export function CopilotWorkspace({
 
       <dialog
         ref={settingsDialogRef}
+        data-ui-action="workspace_close_dialog"
         className="copilot-dialog"
         aria-labelledby="copilot-settings-title"
         onClose={() => handleDialogClosed("settings")}
@@ -2359,6 +3543,7 @@ export function CopilotWorkspace({
           <button
             type="button"
             className="quiet"
+            data-ui-action="workspace_close_dialog"
             onClick={() => setOpenDialog(null)}
           >
             Close
@@ -2371,6 +3556,7 @@ export function CopilotWorkspace({
             <label htmlFor="copilot-theme">Theme</label>
             <select
               id="copilot-theme"
+              data-ui-action="settings_theme"
               value={theme}
               onChange={(event) =>
                 changeTheme(event.target.value as ThemePreference)
@@ -2384,6 +3570,7 @@ export function CopilotWorkspace({
             <label className="copilot-checkbox-row">
               <input
                 type="checkbox"
+                data-ui-action="settings_auto_scroll"
                 checked={autoScrollEnabled}
                 onChange={(event) => changeAutoScroll(event.target.checked)}
               />
@@ -2392,6 +3579,7 @@ export function CopilotWorkspace({
             <label className="copilot-checkbox-row">
               <input
                 type="checkbox"
+                data-ui-action="settings_snap_scroll"
                 checked={snapScrollEnabled}
                 onChange={(event) => {
                   setSnapScrollEnabled(event.target.checked);
@@ -2407,6 +3595,7 @@ export function CopilotWorkspace({
             <div className="row">
               <input
                 id="copilot-folder-input"
+                data-ui-action="settings_folder"
                 type="text"
                 value={locationInput}
                 disabled={busy}
@@ -2414,6 +3603,7 @@ export function CopilotWorkspace({
               />
               <button
                 type="button"
+                data-ui-action="settings_folder"
                 disabled={busy}
                 onClick={() => void applyLocation()}
               >
@@ -2422,6 +3612,7 @@ export function CopilotWorkspace({
               <button
                 type="button"
                 className="quiet"
+                data-ui-action="settings_browse_folder"
                 disabled={busy}
                 onClick={() => void browseLocation()}
               >
@@ -2431,100 +3622,163 @@ export function CopilotWorkspace({
             <p className="copilot-folder-home">Home: {workspace.home}</p>
             {locationProblem && <InlineFailure problem={locationProblem} />}
           </section>
-          {session && (modelOption || reasoningOption || modeOption) && (
-            <section>
-              <h3>Session configuration</h3>
-              {modelOption && (
-                <>
-                  <label htmlFor="copilot-model">
-                    {modelOption.name ?? configOptionLabel(modelOption.id)}
-                  </label>
-                  <select
-                    id="copilot-model"
-                    value={modelOption.currentValue}
-                    disabled={busy}
-                    onChange={(event) =>
-                      void configureSession("model", event.target.value)
-                    }
+          <section>
+            <h3>Agent configuration</h3>
+            <button
+              type="button"
+              className="quiet"
+              data-ui-action="workspace_inspect_agent"
+              onClick={() => openAgentSettings(currentAgent.id)}
+            >
+              {currentAgent.name} settings
+            </button>
+          </section>
+        </div>
+      </dialog>
+
+      <dialog
+        ref={agentDialogRef}
+        data-ui-action="workspace_close_dialog"
+        className="copilot-dialog copilot-agent-dialog"
+        aria-labelledby="copilot-agent-settings-title"
+        onClose={() => handleDialogClosed("agent")}
+      >
+        <div className="copilot-dialog-header">
+          <CopilotAgentIcon agent={inspectedAgent} />
+          <h2 id="copilot-agent-settings-title">{inspectedAgent.name}</h2>
+          <button
+            type="button"
+            className="quiet"
+            data-ui-action="workspace_close_dialog"
+            onClick={() => setOpenDialog(null)}
+          >
+            Close
+          </button>
+        </div>
+        <div className="copilot-dialog-body">
+          <section>
+            <label htmlFor="copilot-inspected-agent">Agent</label>
+            <select
+              id="copilot-inspected-agent"
+              data-ui-action="workspace_inspect_agent"
+              value={inspectedAgent.id}
+              onChange={(event) => setInspectedAgentId(event.target.value)}
+            >
+              {sidebarAgents.map((agent) => (
+                <option key={agent.id} value={agent.id}>
+                  {agent.name}
+                </option>
+              ))}
+            </select>
+            <p>{inspectedAgent.description || "No description provided."}</p>
+            <p className="hint">{agentSourceLabel(inspectedAgent)}</p>
+            {inspectedAgent.source && (
+              <StudioSources
+                sources={(inventory?.sources ?? []).filter(
+                  (source) =>
+                    source.tenantId === inspectedAgent.source?.tenantId &&
+                    source.environmentId ===
+                      inspectedAgent.source?.environmentId,
+                )}
+              />
+            )}
+            <HistorySources
+              history={historyFor(inspectedAgent)}
+              sources={sources}
+            />
+            {inspectedAgent.model && (
+              <p className="hint">{inspectedAgent.model}</p>
+            )}
+            <div className="row">
+              {isStudioAgentId(inspectedAgent.id) ? (
+                <div>
+                  <p>
+                    Catalog reference only. Use Copilot Studio for this agent;
+                    cloud transcripts have not been imported.
+                  </p>
+                  {inspectedAgent.source && (
+                    <p className="hint">{studioAgentUrl(inspectedAgent)}</p>
+                  )}
+                  <button
+                    type="button"
+                    className="quiet"
+                    data-ui-action="studio_copy_link"
+                    disabled={!inspectedAgent.source}
+                    onClick={() => void copyStudioLink(inspectedAgent)}
                   >
-                    {modelOption.options.map((value) => (
-                      <option
-                        key={value.value}
-                        value={value.value}
-                        disabled={isConfigValueDisabled(value)}
-                      >
-                        {value.name}
-                      </option>
-                    ))}
-                  </select>
+                    Copy Copilot Studio link
+                  </button>
+                  <p role="status">{studioLinkStatus}</p>
+                </div>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    data-ui-action="workspace_new_chat"
+                    disabled={
+                      busy ||
+                      !eventsReady ||
+                      disabledAgentIds.has(inspectedAgent.id)
+                    }
+                    onClick={() => {
+                      setOpenDialog(null);
+                      void startDraft(inspectedAgent.id);
+                    }}
+                  >
+                    New chat with {inspectedAgent.name}
+                  </button>
+                  <button
+                    type="button"
+                    className="quiet"
+                    data-ui-action="sidebar_select_agent"
+                    disabled={busy || !eventsReady}
+                    onClick={() => {
+                      setOpenDialog(null);
+                      void selectWorkspaceAgent(inspectedAgent.id);
+                    }}
+                  >
+                    View agent dashboard
+                  </button>
+                  <button
+                    type="button"
+                    className="quiet"
+                    data-ui-action="workspace_view_agent_history"
+                    onClick={() => openAgentHistory(inspectedAgent.id)}
+                  >
+                    History
+                  </button>
+                  <button
+                    type="button"
+                    className="quiet"
+                    data-ui-action="sidebar_toggle_chats"
+                    aria-expanded={inspectedChatsExpanded}
+                    aria-controls={`copilot-agent-chats-${inspectedGroupId}`}
+                    disabled={inspectedChats.length === 0}
+                    onClick={() => {
+                      toggleAgentChats(
+                        inspectedAgent.id,
+                        !inspectedChatsExpanded,
+                      );
+                      setOpenDialog(null);
+                    }}
+                  >
+                    {inspectedChatsExpanded ? "Hide" : "Show"}{" "}
+                    {inspectedAgent.name} chats
+                  </button>
                 </>
               )}
-              {reasoningOption && (
-                <>
-                  <label htmlFor="copilot-reasoning">
-                    {reasoningOption.name ??
-                      configOptionLabel(reasoningOption.id)}
-                  </label>
-                  <select
-                    id="copilot-reasoning"
-                    value={reasoningOption.currentValue}
-                    disabled={busy}
-                    onChange={(event) =>
-                      void configureSession(
-                        "reasoning_effort",
-                        event.target.value,
-                      )
-                    }
-                  >
-                    {reasoningOption.options.map((value) => (
-                      <option
-                        key={value.value}
-                        value={value.value}
-                        disabled={isConfigValueDisabled(value)}
-                      >
-                        {value.name}
-                      </option>
-                    ))}
-                  </select>
-                </>
-              )}
-              {modeOption && (
-                <>
-                  <label htmlFor="copilot-mode">
-                    {modeOption.name ?? configOptionLabel(modeOption.id)}
-                  </label>
-                  <select
-                    id="copilot-mode"
-                    value={modeOption.currentValue}
-                    disabled={busy}
-                    onChange={(event) =>
-                      void configureSession("mode", event.target.value)
-                    }
-                  >
-                    {visibleConfigOptionValues(modeOption).map((value) => (
-                      <option
-                        key={value.value}
-                        value={value.value}
-                        disabled={isConfigValueDisabled(value)}
-                      >
-                        {value.name}
-                      </option>
-                    ))}
-                  </select>
-                </>
-              )}
-            </section>
-          )}
-          {!session && (
-            <p className="hint">
-              Model and reasoning settings appear once a conversation starts.
-            </p>
+            </div>
+          </section>
+          {!isStudioAgentId(inspectedAgent.id) && sessionConfiguration}
+          {openDialog === "agent" && failure && (
+            <InlineFailure problem={failure} />
           )}
         </div>
       </dialog>
 
       <dialog
         ref={profileDialogRef}
+        data-ui-action="workspace_close_dialog"
         className="copilot-dialog"
         aria-labelledby="copilot-profile-title"
         onClose={() => handleDialogClosed("profile")}
@@ -2534,6 +3788,7 @@ export function CopilotWorkspace({
           <button
             type="button"
             className="quiet"
+            data-ui-action="workspace_close_dialog"
             onClick={() => setOpenDialog(null)}
           >
             Close
@@ -2556,7 +3811,8 @@ export function CopilotWorkspace({
             <button
               type="button"
               className="quiet"
-              onClick={() => openDialogFrom("settings")}
+              data-ui-action="workspace_open_dialog"
+              onClick={() => openAgentSettings(currentAgent.id)}
             >
               Conversation model settings
             </button>
@@ -2582,7 +3838,7 @@ export function CopilotWorkspace({
                 </p>
                 {status.warnings.length > 0 && (
                   <details className="copilot-runtime-warnings">
-                    <summary>Warnings</summary>
+                    <summary data-ui-action="inspect_details">Warnings</summary>
                     <ul>
                       {[...new Set(status.warnings)].map((warning) => (
                         <li key={warning}>{warning}</li>
@@ -2612,6 +3868,7 @@ export function CopilotWorkspace({
             <button
               type="button"
               className="quiet"
+              data-ui-action="settings_open_setup"
               disabled={busy}
               onClick={() => void handleBack()}
             >
@@ -2619,7 +3876,9 @@ export function CopilotWorkspace({
             </button>
           </section>
           <details className="detail-of">
-            <summary>GitHub Copilot icon license</summary>
+            <summary data-ui-action="inspect_details">
+              GitHub Copilot icon license
+            </summary>
             <pre>{copilotIconLicense}</pre>
           </details>
         </div>
@@ -2627,6 +3886,7 @@ export function CopilotWorkspace({
 
       <dialog
         ref={resourcesDialogRef}
+        data-ui-action="workspace_close_dialog"
         className="copilot-dialog copilot-dialog-wide"
         aria-labelledby="copilot-resources-title"
         onClose={() => handleDialogClosed("resources")}
@@ -2636,15 +3896,20 @@ export function CopilotWorkspace({
           <button
             type="button"
             className="quiet"
+            data-ui-action="workspace_close_dialog"
             onClick={() => setOpenDialog(null)}
           >
             Close
           </button>
         </div>
         <div className="copilot-dialog-body">
+          {openDialog === "resources" && (
+            <ResourceDiagnostics inventory={inventory} status={status} />
+          )}
           <label htmlFor="copilot-resource-filter">Search skills</label>
           <input
             id="copilot-resource-filter"
+            data-ui-action="workspace_filter_resources"
             type="text"
             value={resourceFilter}
             onChange={(event) => setResourceFilter(event.target.value)}
@@ -2659,7 +3924,13 @@ export function CopilotWorkspace({
                   <button
                     type="button"
                     className="copilot-resource-item"
-                    disabled={!resource.enabled || busy || !eventsReady}
+                    data-ui-action="workspace_insert_resource"
+                    disabled={
+                      dashboardId !== null ||
+                      !resource.enabled ||
+                      busy ||
+                      !eventsReady
+                    }
                     onClick={() => void insertMention(resource.name)}
                     title={resource.description ?? undefined}
                   >
@@ -2679,7 +3950,9 @@ export function CopilotWorkspace({
           </ul>
           {inventory && inventory.plugins.length > 0 && (
             <details>
-              <summary>Plugins ({inventory.plugins.length})</summary>
+              <summary data-ui-action="inspect_details">
+                Plugins ({inventory.plugins.length})
+              </summary>
               <ul className="copilot-resource-list copilot-resource-list-plain">
                 {inventory.plugins.map((plugin) => (
                   <li key={plugin.name}>
@@ -2693,7 +3966,9 @@ export function CopilotWorkspace({
           )}
           {inventory && inventory.mcpServers.length > 0 && (
             <details>
-              <summary>MCP servers ({inventory.mcpServers.length})</summary>
+              <summary data-ui-action="inspect_details">
+                MCP servers ({inventory.mcpServers.length})
+              </summary>
               <ul className="copilot-resource-list copilot-resource-list-plain">
                 {inventory.mcpServers.map((server) => (
                   <li key={server.name}>
@@ -2706,7 +3981,7 @@ export function CopilotWorkspace({
           )}
           {inventory && inventory.warnings.length > 0 && (
             <details className="copilot-runtime-warnings">
-              <summary>Warnings</summary>
+              <summary data-ui-action="inspect_details">Warnings</summary>
               <ul>
                 {[...new Set(inventory.warnings)].map((warning) => (
                   <li key={warning}>{warning}</li>
@@ -2719,6 +3994,7 @@ export function CopilotWorkspace({
 
       <dialog
         ref={conversationsDialogRef}
+        data-ui-action="workspace_close_dialog"
         className="copilot-dialog copilot-dialog-wide"
         aria-labelledby="copilot-history-agents-title copilot-conversations-title"
         onClose={() => handleDialogClosed("conversations")}
@@ -2728,6 +4004,7 @@ export function CopilotWorkspace({
           <button
             type="button"
             className="quiet"
+            data-ui-action="workspace_close_dialog"
             onClick={() => setOpenDialog(null)}
           >
             Close
@@ -2738,6 +4015,7 @@ export function CopilotWorkspace({
             <label htmlFor="copilot-history-agent">Conversation agent</label>
             <select
               id="copilot-history-agent"
+              data-ui-action="history_select_agent"
               value={historyAgent}
               onChange={(event) => {
                 setHistoryAgent(event.target.value);
@@ -2745,11 +4023,11 @@ export function CopilotWorkspace({
               }}
             >
               <option value="__all__">
-                All agents ({historyRows.length.toLocaleString()} conversations)
+                All agents · ACP records and drafts
               </option>
               {historyAgents.map((agent) => (
                 <option key={agent.id} value={agent.id}>
-                  {agent.name} ({agent.count.toLocaleString()})
+                  {agent.name} · {countLabel(historyFor(agent).summary)}
                 </option>
               ))}
             </select>
@@ -2757,22 +4035,30 @@ export function CopilotWorkspace({
               Recorded conversations keep their initial agent. Local drafts stay
               on this device and start Copilot only when you send.
             </p>
+            {filterProjection && (
+              <HistorySources
+                key={historyAgent}
+                history={filterProjection}
+                sources={sources}
+                expanded
+              />
+            )}
           </section>
           <h3 id="copilot-conversations-title">Conversations</h3>
           <label className="copilot-checkbox-row">
             <input
               type="checkbox"
+              data-ui-action="history_scope_folders"
               checked={sessionsAllFolders}
               disabled={sessionsLoading}
-              onChange={(event) =>
-                setAllFoldersAndRefetch(event.target.checked)
-              }
+              onChange={(event) => filterHistoryFolders(event.target.checked)}
             />
             Show conversations from all folders
           </label>
           <label htmlFor="copilot-history-search">Search conversations</label>
           <input
             id="copilot-history-search"
+            data-ui-action="history_search"
             type="text"
             value={historySearch}
             onChange={(event) => {
@@ -2785,12 +4071,15 @@ export function CopilotWorkspace({
           {sessionsProblem && <InlineFailure problem={sessionsProblem} />}
           {sessionsPage && !sessionsLoading && (
             <p className="hint">
-              {filteredHistory.length.toLocaleString()} matching conversations
+              {filteredHistory.length.toLocaleString()} matching ACP records and
+              local drafts
             </p>
           )}
           {sessionsPage?.timings && (
             <details className="detail-of">
-              <summary>History indexing timings</summary>
+              <summary data-ui-action="inspect_details">
+                History indexing timings
+              </summary>
               <p>
                 Connection: {sessionsPage.timings.connectionMs} ms. Listing:{" "}
                 {sessionsPage.timings.listingMs} ms. Agent metadata:{" "}
@@ -2800,9 +4089,33 @@ export function CopilotWorkspace({
               </p>
             </details>
           )}
+          {filterAgent &&
+            filterProjection &&
+            (sessionsAllFolders ? (
+              <ArchiveTiles
+                key={fleetIdentity(filterAgent)}
+                identity={fleetIdentity(filterAgent)}
+                summary={filterProjection.summary}
+                rows={filterProjection.archiveOnly.filter(
+                  (row) =>
+                    !historyQuery ||
+                    [row.id, ...row.sourceIds, filterAgent.name].some((s) =>
+                      s.toLowerCase().includes(historyQuery),
+                    ),
+                )}
+              />
+            ) : (
+              <p className="hint">
+                Archive references have no verified folder and are excluded by
+                this filter.
+              </p>
+            ))}
           <ul className="copilot-resource-list copilot-resource-list-plain">
             {filteredHistory.length === 0 && !sessionsLoading ? (
-              <li>No conversations match this agent, folder and search.</li>
+              <li>
+                No available ACP records or drafts match this agent, folder and
+                search.
+              </li>
             ) : (
               filteredHistory.slice(0, visibleHistoryCount).map((item) => (
                 <li key={item.conversationId} className="copilot-session-row">
@@ -2815,15 +4128,16 @@ export function CopilotWorkspace({
                   </div>
                   <button
                     type="button"
+                    data-ui-action="workspace_open_chat"
                     disabled={
-                      busy ||
-                      (item.sessionId !== null &&
-                        item.sessionId === session?.sessionId)
+                      busy || !eventsReady || !!localBlock(item.agentId)
                     }
                     onClick={() => void loadSession(item)}
                   >
                     {item.sessionId !== null &&
-                    item.sessionId === session?.sessionId
+                    item.sessionId === session?.sessionId &&
+                    item.agentId === sessionAgentId &&
+                    item.cwd === session.cwd
                       ? "Active"
                       : item.sessionId === null
                         ? "Open draft"
@@ -2837,6 +4151,7 @@ export function CopilotWorkspace({
             <button
               type="button"
               className="quiet"
+              data-ui-action="history_load_more"
               disabled={sessionsLoading}
               onClick={() => setVisibleHistoryCount((count) => count + 50)}
             >
@@ -2845,7 +4160,9 @@ export function CopilotWorkspace({
           )}
           {!!sessionsPage?.warnings.length && (
             <details className="copilot-runtime-warnings">
-              <summary>History metadata warnings</summary>
+              <summary data-ui-action="inspect_details">
+                History metadata warnings
+              </summary>
               <ul>
                 {sessionsPage.warnings.map((warning) => (
                   <li key={warning}>{warning}</li>
@@ -2858,6 +4175,7 @@ export function CopilotWorkspace({
 
       <dialog
         ref={permissionDialogRef}
+        data-ui-action="workspace_permission_decide"
         className="copilot-dialog"
         aria-labelledby="copilot-permission-title"
         onCancel={(event) => {
@@ -2878,7 +4196,9 @@ export function CopilotWorkspace({
             <div className="copilot-dialog-body">
               <p>{describePermissionTitle(currentPermission.toolCall)}</p>
               <details className="copilot-permission-detail">
-                <summary>Requested action details</summary>
+                <summary data-ui-action="inspect_details">
+                  Requested action details
+                </summary>
                 <pre>{formatRawPayload(currentPermission.toolCall)}</pre>
               </details>
               <div className="row">
@@ -2886,6 +4206,7 @@ export function CopilotWorkspace({
                   <button
                     type="button"
                     key={option.optionId}
+                    data-ui-action="workspace_permission_decide"
                     disabled={respondingPermission}
                     onClick={() =>
                       void answerPermission(currentPermission, option.optionId)
@@ -2897,6 +4218,7 @@ export function CopilotWorkspace({
                 <button
                   type="button"
                   className="quiet"
+                  data-ui-action="workspace_permission_decide"
                   disabled={respondingPermission}
                   onClick={() => void answerPermission(currentPermission, null)}
                 >

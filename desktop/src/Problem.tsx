@@ -42,7 +42,7 @@ export function Failure({ problem }: { problem: Problem }) {
           reading the sentence above never has to. */}
       {problem.detail && (
         <details className="detail-of">
-          <summary>Technical details</summary>
+          <summary data-ui-action="inspect_details">Technical details</summary>
           <pre>{problem.detail}</pre>
         </details>
       )}
@@ -63,7 +63,7 @@ export function InlineFailure({ problem }: { problem: Problem }) {
       <p className="caution">{problem.said}</p>
       {problem.detail && (
         <details className="detail-of">
-          <summary>Technical details</summary>
+          <summary data-ui-action="inspect_details">Technical details</summary>
           <pre>{problem.detail}</pre>
         </details>
       )}

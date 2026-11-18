@@ -96,6 +96,33 @@ a container deployment just to start Copilot. Appearance defaults to dark, with
 persisted light/system overrides and scrolling preferences. Profile and resource
 views show CLI-owned configuration without exposing authentication tokens.
 
+Choose **Widget** to turn the desktop workspace into a resizable, frameless
+floating live tile. **Chat** / **Tile** flips between live agent status and the
+workspace without remounting the conversation or disconnecting its runtime.
+Drag the widget's Darbot bar to move it, use the lower-right grip to resize,
+and use **Pin** for optional always-on-top behavior. **Expand** restores the
+previous full-window bounds. Permission requests flip back to the workspace
+for review; flipping the card never grants permission or sends a prompt.
+**Wide** uses a compact 640 by 480 logical-pixel, Duo-like layout with the agents
+pane alongside chat; **Portrait** returns to the narrow tile. Both shapes scale
+text and controls to the available width and height, including Windows display
+scaling. Resizing and changing shape preserve the mounted conversation and draft.
+
+The agents pane uses compact rows with Swarm artwork. Widget rows have smaller
+icons and lightly overlapping background layers; hover or keyboard focus raises
+the current layer without covering neighboring controls. Click an agent's icon
+to open its actions, history, chat disclosure, and agent selector. Model,
+reasoning, and mode controls are shown only for that agent's active
+conversation; inspecting another agent never reconfigures the current session.
+General appearance and working-folder settings remain in **Settings**.
+
+The packaged desktop app runs independently of the terminal. Closing the
+widget hides it to the existing tray rather than stopping agents; use
+**Open darbot** to restore it or **Quit** to exit. Launch it manually from
+Windows; widget mode does not add sign-in autostart. Outer window scrolling
+is disabled while messages, agent lists, dialogs, and setup content retain
+their own scrollable regions.
+
 ## Requirements
 
 - Docker, for PostgreSQL and the shipped Bots.

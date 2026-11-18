@@ -10,6 +10,7 @@
 
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { CopilotHistorySession } from "./copilot-types";
+import { isStudioAgentId, requireLocalAgent } from "./copilot-types";
 
 type LegacyWorkspaceChat = CopilotHistorySession & { title: string };
 
@@ -140,10 +141,18 @@ export function writeStoredCwd(value: string): void {
 }
 
 export function readStoredAgentId(): string {
-  return readAll().agentId;
+  const id = readAll().agentId;
+  if (isStudioAgentId(id)) {
+    console.warn(
+      "A Copilot Studio catalog reference cannot be selected as a local CLI agent.",
+    );
+    return "";
+  }
+  return id;
 }
 
 export function writeStoredAgentId(value: string): void {
+  requireLocalAgent(value);
   writeAll({ agentId: value });
 }
 
@@ -176,6 +185,18 @@ export function readImportedAgentIds(): string[] | null {
 }
 
 export function writeImportedAgentIds(value: string[]): void {
+  if (
+    value.some(
+      (id) =>
+        !id ||
+        id.length > 1024 ||
+        [...id].some((char) => char.charCodeAt(0) < 32),
+    )
+  ) {
+    throw new Error(
+      "Imported agent references must be nonempty, bounded identifiers.",
+    );
+  }
   writeAll({ importedAgentIds: [...new Set(value)] });
 }
 

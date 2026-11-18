@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 mod desktop_host_access;
 mod desktop_telemetry;
+mod desktop_window;
 
 #[cfg(test)]
 mod test_support;
@@ -2641,6 +2642,50 @@ where
 }
 
 #[tauri::command]
+async fn history_sources_index(
+    refresh: bool,
+    cache: tauri::State<'_, darbot_desktop_lib::history_sources::IndexCache>,
+) -> Result<darbot_desktop_lib::history_sources::HistoryIndex, &'static str> {
+    cache.index(refresh).await
+}
+
+#[tauri::command]
+async fn harvest_ledger_read<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    agent_key: String,
+) -> Result<Option<String>, Problem> {
+    copilot_task("Harvest ledger read stopped", move || {
+        let root = app.path().app_local_data_dir().map_err(|error| {
+            Problem::with("Darbot local storage is unavailable.", error.to_string())
+        })?;
+        darbot_desktop_lib::history_sources::ledger::read(&root, &agent_key)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn harvest_ledger_mutate<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    agent_key: String,
+    mutation: darbot_desktop_lib::history_sources::ledger::Mutation,
+) -> Result<String, Problem> {
+    // Keep notification with the blocking job even if the invoking webview goes away.
+    copilot_task("Harvest ledger update stopped", move || {
+        let root = app.path().app_local_data_dir().map_err(|error| {
+            Problem::with("Darbot local storage is unavailable.", error.to_string())
+        })?;
+        let outcome =
+            darbot_desktop_lib::history_sources::ledger::mutate(&root, &agent_key, mutation)?;
+        if outcome.committed && app.emit("darbot:harvest-changed", &agent_key).is_err() {
+            // Persistence succeeded. Reporting failure here would make a retried toggle undo it.
+            eprintln!("[harvest] saved ledger notification could not be delivered");
+        }
+        Ok(outcome.json)
+    })
+    .await
+}
+
+#[tauri::command]
 async fn copilot_sessions<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     runtime: tauri::State<'_, Arc<copilot::CopilotRuntimeState>>,
@@ -2665,6 +2710,18 @@ async fn copilot_history<R: tauri::Runtime>(
     let runtime = Arc::clone(&runtime);
     copilot_task("GitHub Copilot history could not be read", move || {
         runtime.history(&app, cwd, request_id)
+    })
+    .await
+}
+
+#[tauri::command]
+async fn copilot_session_evidence(
+    session_id: String,
+    cwd: String,
+    agent_id: String,
+) -> Result<copilot::evidence::Evidence, Problem> {
+    copilot_task("Could not inspect local session evidence", move || {
+        Ok(copilot::evidence::read(&session_id, &cwd, &agent_id))
     })
     .await
 }
@@ -3134,9 +3191,13 @@ fn main() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(Shell::default())
+        .manage(desktop_window::DesktopWindowState::default())
+        .manage(darbot_desktop_lib::history_sources::IndexCache::default())
         .manage(Arc::new(copilot::CopilotRuntimeState::default()))
         .manage(Arc::new(copilot_extensions::ExtensionState::default()))
         .invoke_handler(tauri::generate_handler![
+            desktop_window::desktop_window_state,
+            desktop_window::desktop_window_present,
             record_setup_event,
             detect_engine,
             windows_blocker,
@@ -3160,7 +3221,11 @@ fn main() {
             copilot_agent_create,
             copilot_login,
             copilot_sessions,
+            history_sources_index,
+            harvest_ledger_read,
+            harvest_ledger_mutate,
             copilot_history,
+            copilot_session_evidence,
             copilot_session_new,
             copilot_session_load,
             copilot_session_resume,
