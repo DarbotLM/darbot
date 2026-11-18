@@ -30,7 +30,11 @@ import {
 import { promoteDraft } from "./session-harvest";
 import { ResourceDiagnostics } from "./ResourceDiagnostics";
 import { CopilotAgentImport, StudioSources } from "./CopilotAgentImport";
-import { CopilotExtensionsPanel } from "./CopilotExtensionsPanel";
+import {
+  CopilotExtensionsPanel,
+  ElicitationReview,
+  type CopilotElicitationRequest,
+} from "./CopilotExtensionsPanel";
 import {
   conversationHistoryRows,
   groupWorkspaceChats,
@@ -70,6 +74,10 @@ import {
   type CopilotSessionUpdate,
   type CopilotStatus,
   type CopilotToolActivity,
+  type CopilotTerminalOutput,
+  type CopilotCompaction,
+  mergeCompaction,
+  terminalDisplayText,
   type CopilotWorkspaceChat,
   type CopilotWorkspaceLocation,
   findConfigOption,
@@ -118,6 +126,7 @@ type Message = {
   /** Dedup key for one-shot activity notices (e.g. "thinking") so repeats don't pile up. */
   activityKey?: string;
   raw?: unknown;
+  protocolMessageId?: string;
   toolActivity?: CopilotToolActivity;
 };
 
@@ -737,6 +746,9 @@ export function CopilotWorkspace({
     [],
   );
   const [respondingPermission, setRespondingPermission] = useState(false);
+  const [elicitations, setElicitations] = useState<CopilotElicitationRequest[]>(
+    [],
+  );
 
   const [theme, setThemeState] = useState<ThemePreference>(() =>
     readThemePreference(),
@@ -761,8 +773,13 @@ export function CopilotWorkspace({
     return () => setAvailable(false);
   }, [location, setAvailable]);
   useEffect(() => {
-    if (permissions.length > 0 || openDialog !== null) showWorkspace();
-  }, [permissions.length, openDialog, showWorkspace]);
+    if (
+      permissions.length > 0 ||
+      elicitations.length > 0 ||
+      openDialog !== null
+    )
+      showWorkspace();
+  }, [permissions.length, elicitations.length, openDialog, showWorkspace]);
   const [resourceFilter, setResourceFilter] = useState("");
   const [sessionsPage, setSessionsPage] = useState<CopilotHistory | null>(null);
   const historyIndexScope = "all local folders";
@@ -798,6 +815,10 @@ export function CopilotWorkspace({
   const activeChatRef = useRef<HTMLButtonElement | null>(null);
   const nextMessageId = useRef(1);
   const toolCallMessageIds = useRef(new Map<string, number>());
+  const compactions = useRef(new Map<string, CopilotCompaction>());
+  const terminalSnapshots = useRef(new Map<string, CopilotTerminalOutput>());
+  const toolTerminals = useRef(new Map<string, string[]>());
+  const initialTerminalOutputs = useRef<CopilotTerminalOutput[]>([]);
   const conversationIdRef = useRef(activeConversationId);
   const operationRef = useRef(false);
   const mountedRef = useRef(true);
@@ -979,9 +1000,7 @@ export function CopilotWorkspace({
     if (
       chats.some(
         (chat) =>
-          chat.agentId === agentId &&
-          chat.conversationId === conversationId &&
-          chat.sessionId === null,
+          chat.agentId === agentId && chat.conversationId === conversationId,
       )
     ) {
       const owner = fleet.filter((agent) => agent.id === agentId);
@@ -1124,6 +1143,10 @@ export function CopilotWorkspace({
     setPrompt("");
     sessionIdRef.current = null;
     toolCallMessageIds.current.clear();
+    compactions.current.clear();
+    terminalSnapshots.current.clear();
+    toolTerminals.current.clear();
+    initialTerminalOutputs.current = [];
     return true;
   }
 
@@ -1178,33 +1201,60 @@ export function CopilotWorkspace({
     await resolveLocation(null);
   }
 
-  function appendActivityOnce(key: string, text: string) {
+  function appendActivityOnce(key: string, text: string, raw?: unknown) {
+    const id = nextMessageId.current++;
     setMessages((current) => {
-      if (current.some((message) => message.activityKey === key))
-        return current;
+      if (current.some((message) => message.activityKey === key)) {
+        return raw === undefined
+          ? current
+          : current.map((message) =>
+              message.activityKey === key ? { ...message, text, raw } : message,
+            );
+      }
       return [
         ...current,
         {
-          id: nextMessageId.current++,
+          id,
           role: "activity",
           text,
           activityKey: key,
+          ...(raw === undefined ? {} : { raw }),
         },
       ];
     });
   }
 
-  function appendOrMergeAssistantChunk(text: string) {
+  function appendOrMergeAssistantChunk(text: string, messageId?: string) {
+    const newId = nextMessageId.current++;
     setMessages((current) => {
+      if (messageId) {
+        const found = current.find(
+          (message) =>
+            message.role === "assistant" &&
+            message.protocolMessageId === messageId,
+        );
+        if (found)
+          return current.map((message) =>
+            message === found
+              ? { ...message, text: message.text + text }
+              : message,
+          );
+      }
       const last = current.at(-1);
-      if (last && last.role === "assistant" && !last.raw) {
+      if (
+        !messageId &&
+        last &&
+        !last.protocolMessageId &&
+        last.role === "assistant" &&
+        !last.raw
+      ) {
         const next = [...current];
         next[next.length - 1] = { ...last, text: `${last.text}${text}` };
         return next;
       }
       return [
         ...current,
-        { id: nextMessageId.current++, role: "assistant", text },
+        { id: newId, role: "assistant", text, protocolMessageId: messageId },
       ];
     });
   }
@@ -1212,15 +1262,37 @@ export function CopilotWorkspace({
   /** Mirrors appendOrMergeAssistantChunk for a replayed session's historical user turns: deltas
    * for the same turn coalesce into one bubble, and a new one starts once anything else (the
    * assistant's reply to that turn) lands in between. */
-  function appendOrMergeUserChunk(text: string) {
+  function appendOrMergeUserChunk(text: string, messageId?: string) {
+    const newId = nextMessageId.current++;
     setMessages((current) => {
+      if (messageId) {
+        const found = current.find(
+          (message) =>
+            message.role === "user" && message.protocolMessageId === messageId,
+        );
+        if (found)
+          return current.map((message) =>
+            message === found
+              ? { ...message, text: message.text + text }
+              : message,
+          );
+      }
       const last = current.at(-1);
-      if (last && last.role === "user" && !last.raw) {
+      if (
+        !messageId &&
+        last &&
+        !last.protocolMessageId &&
+        last.role === "user" &&
+        !last.raw
+      ) {
         const next = [...current];
         next[next.length - 1] = { ...last, text: `${last.text}${text}` };
         return next;
       }
-      return [...current, { id: nextMessageId.current++, role: "user", text }];
+      return [
+        ...current,
+        { id: newId, role: "user", text, protocolMessageId: messageId },
+      ];
     });
   }
 
@@ -1231,9 +1303,23 @@ export function CopilotWorkspace({
     const id =
       toolCallMessageIds.current.get(toolCallId) ?? nextMessageId.current++;
     toolCallMessageIds.current.set(toolCallId, id);
+    const terminalIds = toolTerminals.current.get(toolCallId) ?? [];
+    const terminals = terminalIds.flatMap((terminalId) => {
+      const snapshot = terminalSnapshots.current.get(terminalId);
+      return snapshot ? [snapshot] : [];
+    });
     setMessages((current) => {
+      current = current.filter(
+        (message) =>
+          !terminalIds.some(
+            (terminalId) => message.activityKey === `terminal:${terminalId}`,
+          ),
+      );
       const previous = current.find((message) => message.id === id);
-      const activity = mergeToolActivity(previous?.toolActivity, update);
+      const activity = mergeToolActivity(previous?.toolActivity, {
+        ...update,
+        ...(terminals.length ? { terminals } : {}),
+      });
       const text = activity.status
         ? `${activity.title}: ${activity.status}`
         : activity.title;
@@ -1251,11 +1337,51 @@ export function CopilotWorkspace({
     });
   }
 
+  function handleTerminalOutput(event: CopilotTerminalOutput) {
+    if (
+      !event ||
+      typeof event.terminalId !== "string" ||
+      typeof event.output !== "string" ||
+      typeof event.truncated !== "boolean"
+    ) {
+      setFailure({
+        said: "The native terminal returned an invalid output event.",
+      });
+      return;
+    }
+    const snapshot = { ...event, output: terminalDisplayText(event.output) };
+    terminalSnapshots.current.set(event.terminalId, snapshot);
+    let linked = false;
+    for (const [toolCallId, ids] of toolTerminals.current) {
+      if (ids.includes(event.terminalId)) {
+        linked = true;
+        appendToolCallMessage(toolCallId, {});
+      }
+    }
+    if (!linked) {
+      appendActivityOnce(
+        `terminal:${event.terminalId}`,
+        snapshot.exitStatus ? "Terminal exited" : "Terminal output",
+        snapshot,
+      );
+    }
+  }
+
   function handleSessionUpdate(update: Record<string, unknown>) {
     switch (updateKind(update)) {
       case "agent_message_chunk": {
         const text = updateText(update);
-        if (text) appendOrMergeAssistantChunk(text);
+        if (text)
+          appendOrMergeAssistantChunk(
+            text,
+            typeof update.messageId === "string" ? update.messageId : undefined,
+          );
+        else if (update.content)
+          appendActivityOnce(
+            `content:${nextMessageId.current}`,
+            "Agent content",
+            update.content,
+          );
         break;
       }
       case "user_message_chunk": {
@@ -1264,22 +1390,74 @@ export function CopilotWorkspace({
         // no local echo yet.
         if (replayingSessionIdRef.current === sessionIdRef.current) {
           const text = updateText(update);
-          if (text) appendOrMergeUserChunk(text);
+          if (text)
+            appendOrMergeUserChunk(
+              text,
+              typeof update.messageId === "string"
+                ? update.messageId
+                : undefined,
+            );
+          else if (update.content)
+            appendActivityOnce(
+              `user-content:${nextMessageId.current}`,
+              "User content",
+              update.content,
+            );
         }
         break;
       }
-      case "agent_thought_chunk":
-        appendActivityOnce("thinking", "Thinking...");
+      case "agent_thought_chunk": {
+        const text = updateText(update);
+        const id = nextMessageId.current++;
+        if (text) {
+          setMessages((current) => {
+            const last = current.at(-1);
+            return last?.activityKey === "thinking" &&
+              typeof last.raw === "string"
+              ? [...current.slice(0, -1), { ...last, raw: last.raw + text }]
+              : [
+                  ...current,
+                  {
+                    id,
+                    role: "activity",
+                    text: "Agent activity",
+                    activityKey: "thinking",
+                    raw: text,
+                  },
+                ];
+          });
+        }
         break;
+      }
       case "tool_call":
       case "tool_call_update": {
         const toolCallId = String(update.toolCallId ?? "");
-        if (!toolCallId) break;
+        if (!toolCallId) {
+          setFailure({
+            said: "An ACP tool update did not identify its tool call.",
+          });
+          break;
+        }
+        if (Array.isArray(update.content)) {
+          const ids = update.content.flatMap((item: unknown) =>
+            item &&
+            typeof item === "object" &&
+            "type" in item &&
+            item.type === "terminal" &&
+            "terminalId" in item &&
+            typeof item.terminalId === "string"
+              ? [item.terminalId]
+              : [],
+          );
+          if (ids.length) toolTerminals.current.set(toolCallId, ids);
+        }
         appendToolCallMessage(toolCallId, {
           title: typeof update.title === "string" ? update.title : undefined,
           status: typeof update.status === "string" ? update.status : undefined,
           input: update.rawInput,
           output: update.content ?? update.rawOutput,
+          kind: typeof update.kind === "string" ? update.kind : undefined,
+          locations: update.locations,
         });
         break;
       }
@@ -1310,14 +1488,66 @@ export function CopilotWorkspace({
         break;
       }
       case "plan":
-        appendActivityOnce("plan", "Updated plan.");
+        appendActivityOnce("plan", "Plan", update);
         break;
+      case "current_mode_update":
+        if (typeof update.currentModeId === "string") {
+          const mode = update.currentModeId;
+          setConfigOptions((options) =>
+            options.map((option) =>
+              option.id === "mode" &&
+              visibleConfigOptionValues(option).some(
+                (value) => value.value === mode,
+              )
+                ? { ...option, currentValue: mode }
+                : option,
+            ),
+          );
+        }
+        appendActivityOnce("current_mode_update", "Session mode", update);
+        break;
+      case "usage_update":
+        appendActivityOnce("usage_update", "Context usage", update);
+        break;
+      case "notice":
+        if (
+          replayingSessionIdRef.current !== sessionIdRef.current &&
+          typeof update.title === "string" &&
+          typeof update.severity === "string"
+        ) {
+          appendActivityOnce(
+            `notice:${nextMessageId.current}`,
+            update.title,
+            update,
+          );
+        }
+        break;
+      case "compaction_update":
+      case "compaction_summary_chunk": {
+        try {
+          const previous =
+            typeof update.compactionId === "string"
+              ? compactions.current.get(update.compactionId)
+              : undefined;
+          const next = mergeCompaction(previous, update);
+          compactions.current.set(next.compactionId, next);
+          appendActivityOnce(
+            `compaction:${next.compactionId}`,
+            `Context compaction: ${next.status}`,
+            next,
+          );
+        } catch (error) {
+          setFailure(asProblem(error));
+        }
+        break;
+      }
       default:
         break;
     }
   }
 
   const onSessionUpdate = useEffectEvent(handleSessionUpdate);
+  const onTerminalOutput = useEffectEvent(handleTerminalOutput);
 
   // Registered once on mount. Session-scoped events are filtered by sessionIdRef, which callers
   // update before invoking session-new/session-load so replayed history is never missed.
@@ -1332,6 +1562,25 @@ export function CopilotWorkspace({
           return;
         }
         onSessionUpdate(event.payload.update);
+      },
+    );
+    const terminalOutputs = listen<CopilotTerminalOutput>(
+      "copilot:terminal-output",
+      (event) => {
+        if (event.payload.sessionId !== sessionIdRef.current) {
+          if (creatingSessionRef.current) {
+            initialTerminalOutputs.current = [
+              ...initialTerminalOutputs.current.filter(
+                (output) =>
+                  output.terminalId !== event.payload.terminalId ||
+                  output.sessionId !== event.payload.sessionId,
+              ),
+              event.payload,
+            ];
+          }
+          return;
+        }
+        onTerminalOutput(event.payload);
       },
     );
     const permissionRequests = listen<CopilotPermissionRequest>(
@@ -1362,10 +1611,42 @@ export function CopilotWorkspace({
         );
       },
     );
+    const elicitationRequests = listen<CopilotElicitationRequest>(
+      "copilot:elicitation-request",
+      (event) => {
+        if (!listening) return;
+        if (
+          event.payload.sessionId &&
+          event.payload.sessionId !== sessionIdRef.current &&
+          !creatingSessionRef.current
+        )
+          return;
+        setElicitations((current) =>
+          current.some((item) => item.requestId === event.payload.requestId)
+            ? current
+            : [...current, event.payload],
+        );
+      },
+    );
+    const elicitationClosed = listen<{ requestId: string }>(
+      "copilot:elicitation-closed",
+      (event) => {
+        if (listening)
+          setElicitations((current) =>
+            current.filter(
+              (item) => item.requestId !== event.payload.requestId,
+            ),
+          );
+      },
+    );
     const runtimeErrors = listen<Problem>("copilot:runtime-error", (event) => {
+      setElicitations([]);
       if (!sessionIdRef.current && !creatingSessionRef.current) return;
       setFailure(event.payload);
       sessionIdRef.current = null;
+      terminalSnapshots.current.clear();
+      toolTerminals.current.clear();
+      initialTerminalOutputs.current = [];
       setSession(null);
       setPermissions([]);
       setConfigOptions([]);
@@ -1402,8 +1683,11 @@ export function CopilotWorkspace({
     );
     Promise.all([
       sessionUpdates,
+      terminalOutputs,
       permissionRequests,
       permissionClosed,
+      elicitationRequests,
+      elicitationClosed,
       runtimeErrors,
       historyUpdates,
     ])
@@ -1418,8 +1702,11 @@ export function CopilotWorkspace({
       listening = false;
       for (const registration of [
         sessionUpdates,
+        terminalOutputs,
         permissionRequests,
         permissionClosed,
+        elicitationRequests,
+        elicitationClosed,
         runtimeErrors,
         historyUpdates,
       ]) {
@@ -1527,6 +1814,7 @@ export function CopilotWorkspace({
       setStatusText("Opening conversation");
       creatingSessionRef.current = true;
       initialUpdatesRef.current = [];
+      initialTerminalOutputs.current = [];
       const next = await invoke<CopilotSession>("copilot_session_new", {
         cwd: chat.cwd,
         agent: chat.agentId || null,
@@ -1541,6 +1829,9 @@ export function CopilotWorkspace({
         if (event.sessionId === next.sessionId)
           handleSessionUpdate(event.update);
       }
+      for (const event of initialTerminalOutputs.current) {
+        if (event.sessionId === next.sessionId) handleTerminalOutput(event);
+      }
       setStatusText("Ready");
       return next;
     } catch (error) {
@@ -1552,6 +1843,7 @@ export function CopilotWorkspace({
     } finally {
       creatingSessionRef.current = false;
       initialUpdatesRef.current = [];
+      initialTerminalOutputs.current = [];
       if (mountedRef.current) {
         setOpeningSession(false);
         setBusy(false);
@@ -1655,6 +1947,10 @@ export function CopilotWorkspace({
         );
         setAvailableCommands([]);
         toolCallMessageIds.current.clear();
+        compactions.current.clear();
+        terminalSnapshots.current.clear();
+        toolTerminals.current.clear();
+        initialTerminalOutputs.current = [];
         setStatusText("Conversation not opened");
         setFailure(asProblem(error));
         if (dashboardId !== null) setDashboardProblem(asProblem(error));
@@ -2088,9 +2384,11 @@ export function CopilotWorkspace({
   useEffect(() => {
     const element = permissionDialogRef.current;
     if (!element) return;
-    if (permissions.length > 0 && !element.open) element.showModal();
-    if (permissions.length === 0 && element.open) element.close();
-  }, [permissions.length]);
+    if ((permissions.length > 0 || elicitations.length > 0) && !element.open)
+      element.showModal();
+    if (permissions.length === 0 && elicitations.length === 0 && element.open)
+      element.close();
+  }, [permissions.length, elicitations.length]);
 
   // Follows new messages only while the reader is already at the bottom, so nobody scrolled up
   // to re-read something earlier gets yanked back down mid-read.
@@ -2370,6 +2668,23 @@ export function CopilotWorkspace({
     );
 
   const currentPermission = permissions[0] ?? null;
+  const currentElicitation = elicitations[0] ?? null;
+  async function answerElicitation(
+    action: "accept" | "decline" | "cancel",
+    content?: Record<string, unknown>,
+  ) {
+    if (!currentElicitation)
+      throw new Error("The agent request has already closed.");
+    const requestId = currentElicitation.requestId;
+    await invoke("copilot_elicitation_respond", {
+      requestId,
+      action,
+      content: content ?? null,
+    });
+    setElicitations((current) =>
+      current.filter((item) => item.requestId !== requestId),
+    );
+  }
   const historyQuery = historySearch.trim().toLowerCase();
   function historyFor(agent: CopilotAgentSummary) {
     return project(agent, (runtimeCounts.get(agent.id) ?? 0) > 1);
@@ -4181,6 +4496,10 @@ export function CopilotWorkspace({
         onCancel={(event) => {
           event.preventDefault();
           if (currentPermission) void answerPermission(currentPermission, null);
+          else if (currentElicitation)
+            void answerElicitation("cancel").catch((error) =>
+              setFailure(asProblem(error)),
+            );
         }}
       >
         {currentPermission && (
@@ -4228,6 +4547,13 @@ export function CopilotWorkspace({
               {failure && <InlineFailure problem={failure} />}
             </div>
           </>
+        )}
+        {!currentPermission && currentElicitation && (
+          <ElicitationReview
+            key={currentElicitation.requestId}
+            request={currentElicitation}
+            onRespond={answerElicitation}
+          />
         )}
       </dialog>
     </main>

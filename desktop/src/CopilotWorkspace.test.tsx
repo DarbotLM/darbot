@@ -92,6 +92,9 @@ mock.module("@tauri-apps/api/window", () => ({
 
 const { CopilotWorkspace } = await import("./CopilotWorkspace");
 const { DesktopWindow } = await import("./DesktopWindow");
+const { CopilotExtensionsPanel, ElicitationReview } = await import(
+  "./CopilotExtensionsPanel"
+);
 const { createHarvestStore, draftKey, sessionKey } = await import(
   "./session-harvest"
 );
@@ -1305,7 +1308,7 @@ test("an archive flashcard travels only via explicit preview, copy, validation a
   expect(saved().chats).toHaveLength(0);
   cleanup();
   const remounted = await workspace();
-  fireEvent.click(remounted.getByRole("button", { name: "Architect" }));
+  fireEvent.click(await remounted.findByRole("button", { name: "Architect" }));
   const again = within(
     remounted.getByRole("region", { name: "Architect dashboard" }),
   );
@@ -1348,6 +1351,360 @@ test("invalid stored workspace is visible and not overwritten during mount", asy
     false,
   );
   expect(view.queryByRole("button", { name: "Send" })).toBeNull();
+});
+
+test("ACP terminal snapshots bind to their tool calls and preserve final output without persisting it", async () => {
+  const view = await workspace();
+  await userEvent.type(draftInput(view), "Start activity");
+  fireEvent.click(view.getByRole("button", { name: "Send" }));
+  await view.findByText("Unit-test reply");
+  const sessionId = argument(
+    calls.find((call) => call.command === "copilot_session_prompt")?.args,
+    "sessionId",
+  );
+  expect(sessionId).toBeTruthy();
+  const snapshot = {
+    sessionId,
+    terminalId: "terminal-a",
+    output: "first\n",
+    truncated: false,
+  };
+  await act(async () => emit("copilot:terminal-output", snapshot));
+  await act(async () =>
+    emit("copilot:session-update", {
+      sessionId,
+      update: {
+        sessionUpdate: "tool_call",
+        toolCallId: "build",
+        title: "Compile project",
+        kind: "execute",
+        status: "in_progress",
+        content: [{ type: "terminal", terminalId: "terminal-a" }],
+      },
+    }),
+  );
+  await act(async () =>
+    emit("copilot:terminal-output", {
+      ...snapshot,
+      output: "Private terminal output ✓\n",
+      exitStatus: { exitCode: 0, signal: null },
+    }),
+  );
+  await act(async () =>
+    emit("copilot:session-update", {
+      sessionId,
+      update: {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "build",
+        status: "completed",
+      },
+    }),
+  );
+  await act(async () =>
+    emit("copilot:terminal-output", {
+      ...snapshot,
+      sessionId: "other-session",
+      output: "foreign output",
+    }),
+  );
+  fireEvent.click(view.getByRole("tab", { name: "Your CLI" }));
+  const activity = within(view.getByRole("list", { name: "CLI activity" }));
+  expect(activity.getAllByRole("listitem")).toHaveLength(1);
+  expect(activity.getByText("Compile project: completed")).toBeTruthy();
+  const details = activity.getByText("Tool output and details");
+  fireEvent.click(details);
+  expect(
+    activity.getByText(/Private terminal output ✓/, { selector: "pre" }),
+  ).toBeTruthy();
+  expect(activity.queryByText(/foreign output/)).toBeNull();
+  expect(localStorage.getItem(WORKSPACE_STORAGE_KEY)).not.toContain(
+    "Private terminal output",
+  );
+});
+
+test("ACP plan changes replace the plan details rather than leaving a one-shot placeholder", async () => {
+  const view = await workspace();
+  await userEvent.type(draftInput(view), "Run plan");
+  fireEvent.click(view.getByRole("button", { name: "Send" }));
+  await view.findByText("Unit-test reply");
+  const sessionId = argument(
+    calls.find((call) => call.command === "copilot_session_prompt")?.args,
+    "sessionId",
+  );
+  for (const status of ["pending", "completed"]) {
+    await act(async () =>
+      emit("copilot:session-update", {
+        sessionId,
+        update: {
+          sessionUpdate: "plan",
+          entries: [{ content: "Compile target", priority: "high", status }],
+        },
+      }),
+    );
+  }
+  fireEvent.click(view.getByRole("tab", { name: "Your CLI" }));
+  const activity = within(view.getByRole("list", { name: "CLI activity" }));
+  expect(activity.getAllByRole("listitem")).toHaveLength(1);
+  fireEvent.click(activity.getByText("Tool output and details"));
+  const plan = activity.getByText(/Compile target/, {
+    selector: "pre",
+  }).textContent;
+  expect(plan).toContain('"completed"');
+  expect(plan).not.toContain('"pending"');
+});
+
+test("ACP message IDs remain distinct and compaction patches keep their first timeline position", async () => {
+  const view = await workspace();
+  await userEvent.type(draftInput(view), "Start context");
+  fireEvent.click(view.getByRole("button", { name: "Send" }));
+  await view.findByText("Unit-test reply");
+  const sessionId = argument(
+    calls.find((call) => call.command === "copilot_session_prompt")?.args,
+    "sessionId",
+  );
+  await act(async () => {
+    for (const update of [
+      {
+        sessionUpdate: "agent_message_chunk",
+        messageId: "first",
+        content: { type: "text", text: "First distinct message" },
+      },
+      {
+        sessionUpdate: "agent_message_chunk",
+        messageId: "second",
+        content: { type: "text", text: "Second distinct message" },
+      },
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "compact",
+        status: "in_progress",
+      },
+      {
+        sessionUpdate: "plan",
+        entries: [
+          {
+            content: "Plan after compaction",
+            status: "pending",
+            priority: "low",
+          },
+        ],
+      },
+      {
+        sessionUpdate: "compaction_summary_chunk",
+        compactionId: "compact",
+        content: { type: "text", text: "Partial context" },
+      },
+      {
+        sessionUpdate: "compaction_update",
+        compactionId: "compact",
+        status: "completed",
+        summary: [{ type: "text", text: "Final retained context" }],
+      },
+    ])
+      emit("copilot:session-update", { sessionId, update });
+  });
+  expect(view.getByText("First distinct message")).toBeTruthy();
+  expect(view.getByText("Second distinct message")).toBeTruthy();
+  fireEvent.click(view.getByRole("tab", { name: "Your CLI" }));
+  const list = within(view.getByRole("list", { name: "CLI activity" }));
+  const rows = list.getAllByRole("listitem");
+  expect(rows).toHaveLength(2);
+  expect(rows[0].textContent).toContain("Context compaction: completed");
+  expect(rows[1].textContent).toContain("Plan");
+  fireEvent.click(within(rows[0]).getByText("Tool output and details"));
+  expect(rows[0].textContent).toContain("Final retained context");
+  expect(rows[0].textContent).not.toContain("Partial context");
+});
+
+test("SDK task rejection retains the submitted draft and success clears it only after confirmation", async () => {
+  const snapshot = {
+    schemaVersion: 1,
+    sdkVersion: "test",
+    runtimeVersion: "test",
+    protocolVersion: 3,
+    connectionId: "workspace",
+    sessionId: "sdk",
+    cwd: "C:\\workspace",
+    memoryEnabled: false,
+    agents: {
+      state: "available",
+      data: [{ id: "architect", name: "Architect" }],
+    },
+    tasks: { state: "available", data: [] },
+    plugins: { state: "available", data: [] },
+  };
+  let approved = false;
+  invokeHandler = async (command) => {
+    if (command === "copilot_extensions_status") return snapshot;
+    if (command === "copilot_extensions_action") {
+      if (!approved) throw { said: "The SDK action was not approved." };
+      return snapshot;
+    }
+    throw new Error(`Unexpected operation ${command}`);
+  };
+  const view = render(<CopilotExtensionsPanel cwd={"C:\\workspace"} />);
+  await view.findByPlaceholderText("Task name");
+  const taskName = view.getByPlaceholderText("Task name");
+  const taskPrompt = view.getByPlaceholderText("Task prompt");
+  if (
+    !(taskName instanceof HTMLInputElement) ||
+    !(taskPrompt instanceof HTMLTextAreaElement)
+  )
+    throw new Error("SDK task fields must be editable native controls.");
+  const user = userEvent.setup({ document });
+  await user.selectOptions(view.getByRole("combobox"), "architect");
+  await user.type(taskName, "Review");
+  await user.type(taskPrompt, "Keep these instructions");
+  expect(
+    view
+      .getByRole("button", { name: "Start background task" })
+      .hasAttribute("disabled"),
+  ).toBe(false);
+  fireEvent.click(view.getByRole("button", { name: "Start background task" }));
+  await view.findByText("The SDK action was not approved.");
+  expect(taskName.value).toBe("Review");
+  expect(taskPrompt.value).toBe("Keep these instructions");
+  approved = true;
+  fireEvent.click(view.getByRole("button", { name: "Start background task" }));
+  await waitFor(() => expect(taskName.value).toBe(""));
+  expect(taskPrompt.value).toBe("");
+});
+test("ACP form elicitation lets the user review defaults and submits typed values only on acceptance", async () => {
+  const responses: { action: string; content?: Record<string, unknown> }[] = [];
+  const view = render(
+    <ElicitationReview
+      request={{
+        requestId: "form-1",
+        sessionId: "session-1",
+        mode: "form",
+        message: "Choose the review settings.",
+        requestedSchema: {
+          type: "object",
+          required: ["strategy", "attempts", "enabled"],
+          properties: {
+            strategy: {
+              type: "string",
+              title: "Strategy",
+              enum: ["safe", "fast"],
+              default: "safe",
+            },
+            attempts: {
+              type: "integer",
+              title: "Attempts",
+              minimum: 1,
+              default: 2,
+            },
+            enabled: { type: "boolean", title: "Enabled", default: false },
+          },
+        },
+      }}
+      onRespond={async (action, content) => {
+        responses.push({ action, content });
+      }}
+    />,
+  );
+  expect(responses).toEqual([]);
+  await userEvent
+    .setup({ document })
+    .selectOptions(
+      view.getByRole("combobox", { name: /Strategy/ }),
+      JSON.stringify("fast"),
+    );
+  const form = view
+    .getByRole("spinbutton", { name: /Attempts/ })
+    .closest("form");
+  if (!form) throw new Error("Elicitation input has no review form.");
+  fireEvent.submit(form);
+  await waitFor(() =>
+    expect(responses).toEqual([
+      {
+        action: "accept",
+        content: { strategy: "fast", attempts: 2, enabled: false },
+      },
+    ]),
+  );
+});
+
+test("ACP URL elicitation displays the destination but never opens it on mount or decline", async () => {
+  const responses: { action: string; content?: Record<string, unknown> }[] = [];
+  const request = {
+    requestId: "url-1",
+    mode: "url" as const,
+    message: "Authorize in your browser.",
+    url: "https://example.com/connect",
+    elicitationId: "external-1",
+  };
+  const view = render(
+    <ElicitationReview
+      request={request}
+      onRespond={async (action, content) => {
+        responses.push({ action, content });
+      }}
+    />,
+  );
+  expect(view.getByText("example.com")).toBeTruthy();
+  expect(view.getByText(request.url)).toBeTruthy();
+  expect(calls).toEqual([]);
+  fireEvent.click(view.getByRole("button", { name: "Decline" }));
+  await waitFor(() =>
+    expect(responses).toEqual([{ action: "decline", content: undefined }]),
+  );
+});
+
+test("ACP elicitation uses the existing consent dialog and drops closed request state", async () => {
+  const view = await workspace();
+  await userEvent.type(draftInput(view), "Start form");
+  fireEvent.click(view.getByRole("button", { name: "Send" }));
+  await view.findByText("Unit-test reply");
+  const sessionId = argument(
+    calls.find((call) => call.command === "copilot_session_prompt")?.args,
+    "sessionId",
+  );
+  const previous = invokeHandler;
+  invokeHandler = (command, args) =>
+    command === "copilot_elicitation_respond"
+      ? Promise.resolve(null)
+      : previous(command, args);
+  await act(async () =>
+    emit("copilot:elicitation-request", {
+      requestId: "native-form",
+      sessionId,
+      mode: "form",
+      message: "Review the values.",
+      requestedSchema: {
+        type: "object",
+        properties: {
+          note: { type: "string", title: "Note", default: "review only" },
+        },
+      },
+    }),
+  );
+  const dialog = within(
+    view.getByRole("dialog", { name: "Agent information request" }),
+  );
+  expect(dialog.getByRole("textbox", { name: "Note" })).toBeTruthy();
+  fireEvent.click(dialog.getByRole("button", { name: "Cancel request" }));
+  await waitFor(() =>
+    expect(
+      calls.some((call) => call.command === "copilot_elicitation_respond"),
+    ).toBe(true),
+  );
+  expect(
+    calls.find((call) => call.command === "copilot_elicitation_respond")?.args,
+  ).toEqual({
+    requestId: "native-form",
+    action: "cancel",
+    content: null,
+  });
+  expect(localStorage.getItem(WORKSPACE_STORAGE_KEY)).not.toContain(
+    "review only",
+  );
+  await act(async () =>
+    emit("copilot:elicitation-closed", { requestId: "native-form" }),
+  );
+  expect(
+    view.queryByRole("dialog", { name: "Agent information request" }),
+  ).toBeNull();
 });
 
 test("Harvest migrates the v1 ledger once, keeps its original backup and survives loss of WebView storage", async () => {
@@ -1650,8 +2007,10 @@ test("failed promotion is visible after sending and never discards draft decisio
     chats: [chat],
     activeConversationId: chat.conversationId,
   });
+  let memoryReadOnly = true;
   invokeHandler = async (command, args) => {
-    if (command === "harvest_ledger_mutate") throw { said: "Read-only memory" };
+    if (command === "harvest_ledger_mutate" && memoryReadOnly)
+      throw { said: "Read-only memory" };
     return standardInvoke(command, args);
   };
   const view = await workspace();
@@ -1665,6 +2024,25 @@ test("failed promotion is visible after sending and never discards draft decisio
         ?.sessionId,
     ).toBeTruthy(),
   );
+  memoryReadOnly = false;
+  await userEvent.type(
+    draftInput(view),
+    "Retry the same recorded conversation",
+  );
+  fireEvent.click(view.getByRole("button", { name: "Send" }));
+  await waitFor(() => {
+    const raw = nativeLedgers.get(owner);
+    if (!raw) throw new Error("Missing native feedback ledger.");
+    const ledger: TestLedger = JSON.parse(raw);
+    expect(
+      ledger.decisions.some(([key]) => key === draftKey(chat.conversationId)),
+    ).toBe(false);
+    expect(
+      ledger.decisions.some(
+        ([key, feedback]) => key.startsWith('["session",') && feedback.pinned,
+      ),
+    ).toBe(true);
+  });
 });
 
 test("reference saves wait for native persistence and a failed removal retains the reference", async () => {

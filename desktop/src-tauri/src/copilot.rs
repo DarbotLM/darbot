@@ -17,10 +17,12 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter, Runtime};
+use tauri::{AppHandle, Emitter, Manager, Runtime};
 
-use crate::copilot_client::{ClientConsent, ConsentDecision};
+use crate::copilot_client::{terminals, ClientConsent, ConsentDecision};
+use crate::copilot_extensions::elicitation;
 use crate::copilot_files::{self, ReadTextFile, WriteTextFile};
+use crate::history_sources::ledger::{record_protocol_audit, AuditOutcome, ProtocolOperation};
 use crate::problem::Problem;
 use crate::quiet;
 
@@ -483,12 +485,16 @@ struct SkillRecord {
 #[derive(Default)]
 pub struct CopilotRuntimeState {
     runtime: Mutex<Option<Arc<CopilotRuntime>>>,
+    connecting: Mutex<()>,
+    connection_generation: AtomicU64,
     history_agents: Mutex<HashMap<PathBuf, CachedHistoryAgent>>,
     pub consent: Arc<ClientConsent>,
 }
 
 impl CopilotRuntimeState {
     fn connected<R: Runtime>(&self, app: &AppHandle<R>) -> Result<Arc<CopilotRuntime>, Problem> {
+        let _connecting = self.connecting.lock().unwrap();
+        let generation = self.connection_generation.load(Ordering::SeqCst);
         let mut runtime = self.runtime.lock().unwrap();
         if runtime
             .as_ref()
@@ -497,10 +503,20 @@ impl CopilotRuntimeState {
             return Ok(Arc::clone(runtime.as_ref().unwrap()));
         }
 
-        if let Some(previous) = runtime.take() {
+        let previous = runtime.take();
+        drop(runtime);
+        if let Some(previous) = previous {
             previous.stop();
         }
         let connection = Arc::new(CopilotRuntime::start(app, Arc::clone(&self.consent))?);
+        let mut runtime = self.runtime.lock().unwrap();
+        if self.connection_generation.load(Ordering::SeqCst) != generation {
+            drop(runtime);
+            connection.stop();
+            return Err(Problem::plain(
+                "The connection was stopped while it was opening.",
+            ));
+        }
         *runtime = Some(Arc::clone(&connection));
         Ok(connection)
     }
@@ -520,7 +536,12 @@ impl CopilotRuntimeState {
     }
 
     pub fn shutdown(&self) {
-        if let Some(runtime) = self.runtime.lock().unwrap().take() {
+        let runtime = {
+            let mut runtime = self.runtime.lock().unwrap();
+            self.connection_generation.fetch_add(1, Ordering::SeqCst);
+            runtime.take()
+        };
+        if let Some(runtime) = runtime {
             runtime.stop();
         }
     }
@@ -819,6 +840,43 @@ impl CopilotRuntimeState {
     ) -> Result<CopilotSessionConfig, Problem> {
         require_local_agent(Some(&value))?;
         self.current()?.configure(session_id, config_id, value)
+    }
+
+    pub fn delete_session(&self, session_id: String) -> Result<(), Problem> {
+        self.current()?.delete_session(session_id)
+    }
+
+    pub fn set_mode(&self, session_id: String, mode_id: String) -> Result<Value, Problem> {
+        self.current()?.set_mode(session_id, mode_id)
+    }
+
+    pub fn respond_elicitation(
+        &self,
+        request_id: String,
+        response: elicitation::Response,
+    ) -> Result<(), Problem> {
+        let runtime = self.current()?;
+        let controller =
+            runtime.core.elicitation.as_ref().ok_or_else(|| {
+                Problem::plain("The runtime has no active elicitation controller.")
+            })?;
+        let params = controller
+            .scope_for_response(&request_id, &runtime.core.identity)
+            .map_err(|error| Problem::plain(error.message))?;
+        let scope = runtime.core.elicitation_scope(&params)?;
+        let outcome = match response.action {
+            elicitation::Action::Accept => AuditOutcome::Approved,
+            elicitation::Action::Decline => AuditOutcome::Rejected,
+            elicitation::Action::Cancel => AuditOutcome::Cancelled,
+        };
+        runtime.core.audit(
+            scope.current_session_id.as_deref(),
+            ProtocolOperation::Elicitation,
+            outcome,
+        )?;
+        controller
+            .respond(&request_id, response, &scope)
+            .map_err(|error| Problem::plain(error.message))
     }
 }
 
@@ -1839,17 +1897,27 @@ struct PendingPermission {
     rpc_id: Value,
     session_id: String,
     options: Vec<CopilotPermissionOption>,
+    expires: Instant,
 }
 
 struct SessionState {
     cwd: String,
     config_options: Value,
+    modes: Value,
 }
 
 struct RuntimeCore {
     identity: String,
+    audit_root: Option<PathBuf>,
+    elicitation: Option<Arc<elicitation::Controller>>,
+    tool_calls: Mutex<HashMap<String, HashSet<String>>>,
+    elicitation_rpc: Mutex<HashMap<String, String>>,
+    client_home: PathBuf,
     consent: Arc<ClientConsent>,
-    stdin: Mutex<ChildStdin>,
+    terminals: Arc<terminals::Manager>,
+    client_requests: Mutex<HashMap<String, bool>>,
+    report_cleanup: Arc<dyn Fn(&Problem) + Send + Sync>,
+    outgoing: mpsc::SyncSender<Value>,
     pending: Mutex<HashMap<String, Sender<Result<Value, Problem>>>>,
     permissions: Mutex<HashMap<String, PendingPermission>>,
     sessions: Mutex<HashMap<String, SessionState>>,
@@ -1868,6 +1936,18 @@ struct CopilotRuntime {
 
 impl CopilotRuntime {
     fn start<R: Runtime>(app: &AppHandle<R>, consent: Arc<ClientConsent>) -> Result<Self, Problem> {
+        let client_home = copilot_home()?;
+        let audit_root = app.path().app_local_data_dir().map_err(|error| {
+            Problem::with("Native audit storage is unavailable.", error.to_string())
+        })?;
+        let identity = format!("acp-{:032x}", rand::random::<u128>());
+        record_protocol_audit(
+            &audit_root,
+            &identity,
+            None,
+            ProtocolOperation::Lifecycle,
+            AuditOutcome::Requested,
+        )?;
         let mut child = spawn_acp_child()?;
         let stdin = take_child_stdin(&mut child)?;
         let stdout = child.stdout.take().ok_or_else(|| {
@@ -1878,10 +1958,29 @@ impl CopilotRuntime {
             let _ = child.kill();
             Problem::plain("GitHub Copilot CLI did not open its diagnostic output.")
         })?;
+        let (outgoing, messages) = mpsc::sync_channel(64);
         let core = Arc::new(RuntimeCore {
-            identity: format!("acp-{:032x}", rand::random::<u128>()),
+            identity,
+            audit_root: Some(audit_root),
+            elicitation: Some(elicitation::Controller::new(
+                app.clone(),
+                Some(elicitation::native_patterns()),
+            )),
+            tool_calls: Mutex::default(),
+            elicitation_rpc: Mutex::default(),
+            client_home,
             consent,
-            stdin: Mutex::new(stdin),
+            terminals: Arc::default(),
+            client_requests: Mutex::default(),
+            report_cleanup: {
+                let app = app.clone();
+                Arc::new(move |problem| {
+                    if app.emit("copilot:runtime-error", problem).is_err() {
+                        eprintln!("Darbot could not show an owned terminal cleanup failure.");
+                    }
+                })
+            },
+            outgoing,
             pending: Mutex::new(HashMap::new()),
             permissions: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
@@ -1891,8 +1990,10 @@ impl CopilotRuntime {
             stderr: Mutex::new(String::new()),
         });
 
+        start_runtime_writer(stdin, messages, Arc::downgrade(&core));
         start_runtime_stderr(stderr, Arc::downgrade(&core));
         start_runtime_stdout(stdout, Arc::downgrade(&core), app.clone());
+        start_permission_expiry(Arc::downgrade(&core), app.clone());
 
         let capabilities = match core
             .request("initialize", initialize_params(true), ACP_TIMEOUT)
@@ -1931,13 +2032,13 @@ impl CopilotRuntime {
         self.core.stopping.store(true, Ordering::SeqCst);
         self.core.closed.store(true, Ordering::SeqCst);
         self.core.consent.cancel(&self.core.identity, None);
-        let mut child = self.child.lock().unwrap();
-        let _ = child.kill();
-        let _ = child.wait();
         fail_pending(
             &self.core,
             Problem::plain("GitHub Copilot was stopped before it answered."),
         );
+        let mut child = self.child.lock().unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
         self.core.sessions.lock().unwrap().clear();
         self.core.permissions.lock().unwrap().clear();
     }
@@ -2032,6 +2133,9 @@ impl CopilotRuntime {
     ) -> Result<CopilotSession, Problem> {
         let _opening = self.opening.lock().unwrap();
         let session_id = required_text(session_id, "session ID")?;
+        if self.core.sessions.lock().unwrap().contains_key(&session_id) {
+            return Err(Problem::plain("The selected session is already active. Close it before loading or resuming it again."));
+        }
         let cwd = session_root(&cwd)?;
         finish_session_open(
             self.open_session(
@@ -2049,11 +2153,13 @@ impl CopilotRuntime {
         mut session: CopilotSession,
         agent: Option<String>,
     ) -> Result<CopilotSession, Problem> {
+        self.core.terminals.activate(&session.session_id)?;
         self.core.sessions.lock().unwrap().insert(
             session.session_id.clone(),
             SessionState {
                 cwd: session.cwd.clone(),
                 config_options: session.config_options.clone().unwrap_or_else(|| json!([])),
+                modes: session.modes.clone().unwrap_or(Value::Null),
             },
         );
         // A resumed autopilot session must not silently bypass the native permission UI.
@@ -2072,7 +2178,7 @@ impl CopilotRuntime {
                 .and_then(|option| option["currentValue"].as_str())
                 .is_some_and(|current| {
                     (id == "allow_all" && current != "off")
-                        || (id == "mode" && current.ends_with("#autopilot"))
+                        || (id == "mode" && unattended_mode(current))
                 });
             if should_reset {
                 session.config_options = Some(
@@ -2080,6 +2186,28 @@ impl CopilotRuntime {
                         .config_options,
                 );
             }
+        }
+        if session
+            .modes
+            .as_ref()
+            .and_then(|modes| modes["currentModeId"].as_str())
+            .is_some_and(unattended_mode)
+        {
+            let safe_mode = session
+                .modes
+                .as_ref()
+                .and_then(|modes| modes["availableModes"].as_array())
+                .and_then(|modes| {
+                    modes
+                        .iter()
+                        .filter_map(|mode| mode["id"].as_str())
+                        .find(|id| *id == "agent" || id.ends_with("#agent"))
+                })
+                .ok_or_else(|| {
+                    Problem::plain("The resumed session has no approval-preserving Agent mode.")
+                })?
+                .to_string();
+            session.modes = Some(self.set_mode(session.session_id.clone(), safe_mode)?);
         }
         if let Some(agent) = agent {
             session.config_options = Some(
@@ -2113,7 +2241,7 @@ impl CopilotRuntime {
                 ));
             }
             if (config_id == "allow_all" && value != "off")
-                || (config_id == "mode" && value.ends_with("#autopilot"))
+                || (config_id == "mode" && unattended_mode(&value))
             {
                 return Err(Problem::plain(
                     "Darbot keeps tool approval enabled. Use Agent or Plan mode.",
@@ -2136,6 +2264,50 @@ impl CopilotRuntime {
             session.config_options = config_options.clone();
         }
         Ok(CopilotSessionConfig { config_options })
+    }
+
+    fn set_mode(&self, session_id: String, mode_id: String) -> Result<Value, Problem> {
+        let session_id = self.known_session(session_id)?;
+        let mode_id = required_text(mode_id, "mode ID")?;
+        {
+            let sessions = self.core.sessions.lock().unwrap();
+            let modes = &sessions
+                .get(&session_id)
+                .ok_or_else(|| Problem::plain("The session closed."))?
+                .modes;
+            validate_mode(modes, &mode_id)?;
+        }
+        self.core.request(
+            "session/set_mode",
+            json!({"sessionId":session_id,"modeId":mode_id}),
+            ACP_SESSION_TIMEOUT,
+        )?;
+        let mut sessions = self.core.sessions.lock().unwrap();
+        let session = sessions
+            .get_mut(&session_id)
+            .ok_or_else(|| Problem::plain("The session closed while its mode was changing."))?;
+        session.modes["currentModeId"] = json!(mode_id);
+        Ok(session.modes.clone())
+    }
+
+    fn delete_session(&self, session_id: String) -> Result<(), Problem> {
+        let session_id = required_text(session_id, "session ID")?;
+        if !self.capabilities.delete_session {
+            return Err(Problem::plain(
+                "This GitHub Copilot version does not support deleting sessions.",
+            ));
+        }
+        self.core.sessions.lock().unwrap().remove(&session_id);
+        let terminals = self.core.terminals.cancel(Some(&session_id), true);
+        let permissions = self.core.cancel_permissions(&session_id);
+        terminals?;
+        permissions?;
+        self.core.request(
+            "session/delete",
+            json!({"sessionId": session_id}),
+            ACP_TIMEOUT,
+        )?;
+        Ok(())
     }
 
     fn prompt(&self, session_id: String, prompt: String) -> Result<CopilotPromptResult, Problem> {
@@ -2168,22 +2340,37 @@ impl CopilotRuntime {
 
     fn cancel(&self, session_id: String) -> Result<(), Problem> {
         let session_id = self.known_session(session_id)?;
-        self.core.cancel_permissions(&session_id)?;
-        self.core
-            .notify("session/cancel", json!({"sessionId": session_id}))
+        let terminals = self.core.terminals.cancel(Some(&session_id), false);
+        let permissions = self.core.cancel_permissions(&session_id);
+        let notified = self
+            .core
+            .notify("session/cancel", json!({"sessionId": session_id}));
+        terminals?;
+        permissions?;
+        notified
     }
 
     fn close_session(&self, session_id: String) -> Result<(), Problem> {
         let session_id = required_text(session_id, "session ID")?;
-        if !self.core.sessions.lock().unwrap().contains_key(&session_id) {
+        if self
+            .core
+            .sessions
+            .lock()
+            .unwrap()
+            .remove(&session_id)
+            .is_none()
+        {
             return Ok(());
         }
+        let terminals = self.core.terminals.cancel(Some(&session_id), true);
+        let permissions = self.core.cancel_permissions(&session_id);
+        terminals?;
+        permissions?;
         if !self.capabilities.close_session {
             return Err(Problem::plain(
                 "This GitHub Copilot version does not support closing active sessions.",
             ));
         }
-        self.core.cancel_permissions(&session_id)?;
         self.core.request(
             "session/close",
             json!({"sessionId": session_id}),
@@ -2215,9 +2402,15 @@ impl CopilotRuntime {
 
 impl Drop for CopilotRuntime {
     fn drop(&mut self) {
+        if let Some(controller) = &self.core.elicitation {
+            controller.cancel_all();
+        }
         self.core.stopping.store(true, Ordering::SeqCst);
         self.core.closed.store(true, Ordering::SeqCst);
         self.core.consent.cancel(&self.core.identity, None);
+        if let Err(problem) = self.core.terminals.cancel(None, true) {
+            (self.core.report_cleanup)(&problem);
+        }
         let child = self.child.get_mut().unwrap();
         let _ = child.kill();
         let _ = child.wait();
@@ -2225,6 +2418,56 @@ impl Drop for CopilotRuntime {
 }
 
 impl RuntimeCore {
+    fn audit(
+        &self,
+        session: Option<&str>,
+        operation: ProtocolOperation,
+        outcome: AuditOutcome,
+    ) -> Result<(), Problem> {
+        if let Some(root) = &self.audit_root {
+            record_protocol_audit(root, &self.identity, session, operation, outcome)?;
+        }
+        Ok(())
+    }
+
+    fn elicitation_scope(&self, params: &Value) -> Result<elicitation::ScopeContext, Problem> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(Problem::plain("The requesting runtime has closed."));
+        }
+        let session = params.get("sessionId").and_then(Value::as_str);
+        if session.is_some_and(|id| !self.sessions.lock().unwrap().contains_key(id)) {
+            return Err(Problem::plain(
+                "The elicitation session is not owned by this runtime.",
+            ));
+        }
+        if let Some(request_id) = params.get("requestId") {
+            if !json_id_key(request_id)
+                .is_some_and(|key| self.pending.lock().unwrap().contains_key(&key))
+            {
+                return Err(Problem::plain(
+                    "The elicitation parent request has already ended.",
+                ));
+            }
+        }
+        Ok(elicitation::ScopeContext {
+            connection_id: self.identity.clone(),
+            current_session_id: session.map(str::to_owned),
+            session_generation: session.and_then(|id| self.terminals.generation(id)),
+            in_flight_request_ids: self
+                .pending
+                .lock()
+                .unwrap()
+                .keys()
+                .filter_map(|key| serde_json::from_str(key).ok())
+                .collect(),
+            tool_call_ids: session
+                .and_then(|id| self.tool_calls.lock().unwrap().get(id).cloned())
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+        })
+    }
+
     fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, Problem> {
         self.request_with_timeout(method, params, timeout, || {
             Problem::with(
@@ -2244,6 +2487,16 @@ impl RuntimeCore {
         if self.closed.load(Ordering::SeqCst) {
             return Err(self.closed_problem());
         }
+        let audit_session = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let operation = match method {
+            "session/prompt" => ProtocolOperation::Prompt,
+            "session/close" | "session/delete" => ProtocolOperation::SessionClose,
+            _ => ProtocolOperation::Lifecycle,
+        };
+        self.audit(audit_session.as_deref(), operation, AuditOutcome::Requested)?;
         let id = self.next_request_id.fetch_add(1, Ordering::SeqCst);
         let key = id.to_string();
         let (sender, receiver) = mpsc::channel();
@@ -2255,12 +2508,27 @@ impl RuntimeCore {
             "params": params,
         })) {
             self.pending.lock().unwrap().remove(&key);
+            fail_pending(self, problem.clone());
             return Err(problem);
         }
         let result =
             wait_for_runtime_response(receiver, timeout, on_timeout, || self.closed_problem());
+        if let Some(controller) = &self.elicitation {
+            controller.cancel_request(&self.identity, &json!(id));
+        }
         if result.is_err() {
             self.pending.lock().unwrap().remove(&key);
+        }
+        if let Err(problem) = self.audit(
+            audit_session.as_deref(),
+            operation,
+            if result.is_ok() {
+                AuditOutcome::Succeeded
+            } else {
+                AuditOutcome::Failed
+            },
+        ) {
+            (self.report_cleanup)(&problem);
         }
         result
     }
@@ -2274,23 +2542,13 @@ impl RuntimeCore {
     }
 
     fn write(&self, message: &Value) -> Result<(), Problem> {
-        let mut stdin = self.stdin.lock().unwrap();
-        serde_json::to_writer(&mut *stdin, message).map_err(|error| {
-            Problem::with(
-                "Darbot could not send a request to GitHub Copilot.",
-                error.to_string(),
-            )
-        })?;
-        stdin.write_all(b"\n").map_err(|error| {
-            Problem::with(
-                "Darbot could not finish sending a request to GitHub Copilot.",
-                error.to_string(),
-            )
-        })?;
-        stdin.flush().map_err(|error| {
-            Problem::with(
-                "Darbot could not flush a request to GitHub Copilot.",
-                error.to_string(),
+        if self.closed.load(Ordering::SeqCst) {
+            return Err(self.closed_problem());
+        }
+        // Never block the RPC reader on a full OS pipe while the agent is writing to us.
+        self.outgoing.try_send(message.clone()).map_err(|_| {
+            Problem::plain(
+                "The Copilot protocol writer disconnected or exceeded its bounded queue.",
             )
         })
     }
@@ -2306,6 +2564,20 @@ impl RuntimeCore {
             Problem::plain("That GitHub Copilot permission request is no longer pending.")
         })?;
         let result = permission_result(&pending.options, option_id)?;
+        let outcome = match result
+            .pointer("/outcome/optionId")
+            .and_then(Value::as_str)
+            .and_then(|id| pending.options.iter().find(|option| option.option_id == id))
+        {
+            Some(option) if option.kind.starts_with("allow") => AuditOutcome::Approved,
+            Some(_) => AuditOutcome::Rejected,
+            None => AuditOutcome::Cancelled,
+        };
+        self.audit(
+            Some(&pending.session_id),
+            ProtocolOperation::Permission,
+            outcome,
+        )?;
         let rpc_id = pending.rpc_id.clone();
         permissions.remove(&request_id);
         drop(permissions);
@@ -2313,6 +2585,10 @@ impl RuntimeCore {
     }
 
     fn cancel_permissions(&self, session_id: &str) -> Result<(), Problem> {
+        if let Some(controller) = &self.elicitation {
+            controller.cancel_session(&self.identity, session_id);
+        }
+        self.tool_calls.lock().unwrap().remove(session_id);
         self.consent.cancel(&self.identity, Some(session_id));
         let cancelled = {
             let mut permissions = self.permissions.lock().unwrap();
@@ -2373,8 +2649,35 @@ fn finish_session_open<T>(result: Result<T, Problem>, retire: impl FnOnce()) -> 
     })
 }
 
+fn unattended_mode(id: &str) -> bool {
+    id.eq_ignore_ascii_case("autopilot") || id.to_ascii_lowercase().ends_with("#autopilot")
+}
+
+fn validate_mode(modes: &Value, id: &str) -> Result<(), Problem> {
+    if unattended_mode(id) {
+        return Err(Problem::plain(
+            "Darbot keeps tool approval enabled. Use Agent or Plan mode.",
+        ));
+    }
+    if !modes["availableModes"]
+        .as_array()
+        .is_some_and(|modes| modes.iter().any(|mode| mode["id"] == id))
+    {
+        return Err(Problem::plain(
+            "This Copilot session does not offer that mode.",
+        ));
+    }
+    Ok(())
+}
+
+fn copilot_command() -> Result<std::process::Command, Problem> {
+    let mut command = quiet::command("copilot");
+    command.args(crate::copilot_extensions::agent_plugin_launch_args()?);
+    Ok(command)
+}
+
 fn spawn_acp_child() -> Result<Child, Problem> {
-    quiet::command("copilot")
+    copilot_command()?
         .args(["--acp", "--stdio", "--no-auto-update"])
         .current_dir(user_home()?)
         .stdin(Stdio::piped())
@@ -2394,6 +2697,44 @@ fn take_child_stdin(child: &mut Child) -> Result<ChildStdin, Problem> {
         let _ = child.kill();
         Problem::plain("GitHub Copilot CLI did not open its protocol input.")
     })
+}
+
+fn start_runtime_writer(mut stdin: ChildStdin, messages: Receiver<Value>, core: Weak<RuntimeCore>) {
+    std::thread::spawn(move || loop {
+        let message = match messages.recv_timeout(Duration::from_millis(100)) {
+            Ok(message) => message,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if core
+                    .upgrade()
+                    .is_none_or(|core| core.closed.load(Ordering::SeqCst))
+                {
+                    break;
+                }
+                continue;
+            }
+        };
+        let Some(core) = core
+            .upgrade()
+            .filter(|core| !core.closed.load(Ordering::SeqCst))
+        else {
+            break;
+        };
+        let written = serde_json::to_writer(&mut stdin, &message)
+            .map_err(std::io::Error::other)
+            .and_then(|()| stdin.write_all(b"\n"))
+            .and_then(|()| stdin.flush());
+        if let Err(error) = written {
+            fail_pending(
+                &core,
+                Problem::with(
+                    "Darbot could not write to the Copilot protocol connection.",
+                    error.to_string(),
+                ),
+            );
+            break;
+        }
+    });
 }
 
 fn start_runtime_stderr(stderr: std::process::ChildStderr, core: Weak<RuntimeCore>) {
@@ -2472,6 +2813,30 @@ fn route_runtime_message<R: Runtime>(core: &Arc<RuntimeCore>, app: &AppHandle<R>
     if core.closed.load(Ordering::SeqCst) {
         return;
     }
+    if !message.is_object()
+        || message["jsonrpc"] != "2.0"
+        || message
+            .get("id")
+            .is_some_and(|id| json_id_key(id).is_none())
+        || message
+            .get("method")
+            .is_some_and(|method| !method.is_string())
+        || (message.get("method").is_some()
+            && (message.get("result").is_some() || message.get("error").is_some()))
+        || (message.get("result").is_some() && message.get("error").is_some())
+    {
+        write_client_error(
+            core,
+            message
+                .get("id")
+                .filter(|id| json_id_key(id).is_some())
+                .cloned()
+                .unwrap_or(Value::Null),
+            -32600,
+            "Invalid JSON-RPC envelope.",
+        );
+        return;
+    }
     if message.get("result").is_some() || message.get("error").is_some() {
         if let Some(id) = message.get("id").and_then(json_id_key) {
             if let Some(sender) = core.pending.lock().unwrap().remove(&id) {
@@ -2493,10 +2858,47 @@ fn route_runtime_message<R: Runtime>(core: &Arc<RuntimeCore>, app: &AppHandle<R>
         }
         return;
     }
+    if let Some(key) = message.get("id").and_then(json_id_key) {
+        let client_pending = core.client_requests.lock().unwrap().contains_key(&key);
+        let permission_pending = core
+            .permissions
+            .lock()
+            .unwrap()
+            .contains_key(&format!("{}:{key}", core.identity));
+        if client_pending || permission_pending {
+            write_client_error(
+                core,
+                message["id"].clone(),
+                -32600,
+                "Duplicate pending client request ID.",
+            );
+            return;
+        }
+    }
 
     match message.get("method").and_then(Value::as_str) {
         Some("session/update") => {
             if let Some(params) = message.get("params") {
+                if matches!(
+                    params
+                        .pointer("/update/sessionUpdate")
+                        .and_then(Value::as_str),
+                    Some("tool_call" | "tool_call_update")
+                ) {
+                    if let (Some(session), Some(tool)) = (
+                        params["sessionId"].as_str(),
+                        params.pointer("/update/toolCallId").and_then(Value::as_str),
+                    ) {
+                        if core.sessions.lock().unwrap().contains_key(session) {
+                            core.tool_calls
+                                .lock()
+                                .unwrap()
+                                .entry(session.into())
+                                .or_default()
+                                .insert(tool.into());
+                        }
+                    }
+                }
                 if params
                     .pointer("/update/sessionUpdate")
                     .and_then(Value::as_str)
@@ -2513,7 +2915,56 @@ fn route_runtime_message<R: Runtime>(core: &Arc<RuntimeCore>, app: &AppHandle<R>
                         }
                     }
                 }
+                if params
+                    .pointer("/update/sessionUpdate")
+                    .and_then(Value::as_str)
+                    == Some("current_mode_update")
+                {
+                    if let (Some(session_id), Some(mode)) = (
+                        params["sessionId"].as_str(),
+                        params
+                            .pointer("/update/currentModeId")
+                            .and_then(Value::as_str),
+                    ) {
+                        if let Some(session) = core.sessions.lock().unwrap().get_mut(session_id) {
+                            if session.modes.is_object() {
+                                session.modes["currentModeId"] = json!(mode);
+                            }
+                        }
+                    }
+                }
                 let _ = app.emit("copilot:session-update", params);
+            }
+        }
+        Some("elicitation/create") => route_elicitation_request(core, &message),
+        Some("elicitation/complete") => {
+            if let (Some(controller), Some(id)) = (
+                &core.elicitation,
+                message
+                    .pointer("/params/elicitationId")
+                    .and_then(Value::as_str),
+            ) {
+                controller.complete(&core.identity, id);
+            }
+        }
+        Some("$/cancel_request") => {
+            if let (Some(controller), Some(id)) =
+                (&core.elicitation, message.pointer("/params/requestId"))
+            {
+                if let Some(local) = json_id_key(id).and_then(|key| {
+                    let mut pending = core.elicitation_rpc.lock().unwrap();
+                    pending.get_mut(&key).map(|local| {
+                        let id = local.clone();
+                        if local.is_empty() {
+                            *local = "cancelled-before-display".into();
+                        }
+                        id
+                    })
+                }) {
+                    if !local.is_empty() {
+                        controller.cancel_local(&local);
+                    }
+                }
             }
         }
         Some("session/request_permission") => {
@@ -2522,18 +2973,161 @@ fn route_runtime_message<R: Runtime>(core: &Arc<RuntimeCore>, app: &AppHandle<R>
         Some("fs/read_text_file" | "fs/write_text_file") => {
             route_file_request(core, app, &message);
         }
-        Some(method) if message.get("id").is_some() => {
-            let _ = core.write(&json!({
-                "jsonrpc": "2.0",
-                "id": message.get("id").cloned().unwrap_or(Value::Null),
-                "error": {
-                    "code": -32601,
-                    "message": format!("Darbot does not support ACP client method {method}."),
-                },
-            }));
+        Some(
+            "terminal/create"
+            | "terminal/output"
+            | "terminal/wait_for_exit"
+            | "terminal/kill"
+            | "terminal/release",
+        ) => {
+            route_terminal_request(core, app, &message);
+        }
+        Some(_) if message.get("id").is_some() => {
+            write_client_error(
+                core,
+                message["id"].clone(),
+                -32601,
+                "Darbot does not support this ACP client method.",
+            );
+        }
+        _ if message.get("id").is_some() => {
+            write_client_error(
+                core,
+                message["id"].clone(),
+                -32600,
+                "Missing JSON-RPC method or result.",
+            );
         }
         _ => {}
     }
+}
+
+fn route_elicitation_request(core: &Arc<RuntimeCore>, message: &Value) {
+    let Some(id) = message
+        .get("id")
+        .filter(|id| json_id_key(id).is_some())
+        .cloned()
+    else {
+        return;
+    };
+    let key = json_id_key(&id).unwrap();
+    let params = message.get("params").cloned().unwrap_or(Value::Null);
+    let Some(controller) = core.elicitation.clone() else {
+        write_client_error(
+            core,
+            id,
+            -32601,
+            "No native elicitation controller is attached.",
+        );
+        return;
+    };
+    {
+        let mut pending = core.client_requests.lock().unwrap();
+        if pending.contains_key(&key) || pending.len() >= 64 {
+            drop(pending);
+            write_client_error(
+                core,
+                id,
+                -32600,
+                "Duplicate or excessive pending client requests.",
+            );
+            return;
+        }
+        pending.insert(key.clone(), true);
+    }
+    core.elicitation_rpc
+        .lock()
+        .unwrap()
+        .insert(key.clone(), String::new());
+    let intended_generation = params
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .and_then(|session| core.terminals.generation(session));
+    let core = Arc::clone(core);
+    std::thread::spawn(move || {
+        let _guard = ClientRequestGuard {
+            core: Arc::clone(&core),
+            key: key.clone(),
+        };
+        let scope = match core.elicitation_scope(&params) {
+            Ok(scope) => scope,
+            Err(problem) => {
+                core.elicitation_rpc.lock().unwrap().remove(&key);
+                write_client_error(&core, id, -32602, &problem.said);
+                return;
+            }
+        };
+        if scope.session_generation != intended_generation {
+            core.elicitation_rpc.lock().unwrap().remove(&key);
+            write_client_error(&core, id, -32800, "Elicitation session was cancelled.");
+            return;
+        }
+        let generation = intended_generation;
+        if let Err(problem) = core.audit(
+            scope.current_session_id.as_deref(),
+            ProtocolOperation::Elicitation,
+            AuditOutcome::Requested,
+        ) {
+            core.elicitation_rpc.lock().unwrap().remove(&key);
+            write_client_error(&core, id, -32603, &problem.said);
+            return;
+        }
+        let ticket = match controller.begin(params.clone(), &scope) {
+            Ok(ticket) => ticket,
+            Err(error) => {
+                core.elicitation_rpc.lock().unwrap().remove(&key);
+                write_client_error(&core, id, error.code, &error.message);
+                return;
+            }
+        };
+        let local_id = ticket.request.request_id.clone();
+        let cancelled = {
+            let mut pending = core.elicitation_rpc.lock().unwrap();
+            let cancelled = pending.get(&key).is_none_or(|value| !value.is_empty());
+            pending.insert(key.clone(), local_id.clone());
+            cancelled
+        };
+        if cancelled
+            || core.elicitation_scope(&params).is_err()
+            || scope
+                .current_session_id
+                .as_deref()
+                .is_some_and(|session| core.terminals.generation(session) != generation)
+        {
+            controller.cancel_local(&local_id);
+        }
+        let response = match ticket.response.recv_timeout(Duration::from_secs(300)) {
+            Ok(response) => response,
+            Err(_) => {
+                controller.cancel_local(&local_id);
+                Err(elicitation::Error {
+                    code: -32800,
+                    message: "Elicitation expired or disconnected".into(),
+                })
+            }
+        };
+        core.elicitation_rpc.lock().unwrap().remove(&key);
+        let outcome = if response.is_ok() {
+            AuditOutcome::Succeeded
+        } else {
+            AuditOutcome::Cancelled
+        };
+        if let Err(problem) = core.audit(
+            scope.current_session_id.as_deref(),
+            ProtocolOperation::Elicitation,
+            outcome,
+        ) {
+            (core.report_cleanup)(&problem);
+        }
+        match response {
+            Ok(value) => write_client_result(
+                &core,
+                id,
+                serde_json::to_value(value).map_err(|error| Problem::plain(error.to_string())),
+            ),
+            Err(error) => write_client_error(&core, id, error.code, &error.message),
+        }
+    });
 }
 
 fn route_permission_request<R: Runtime>(
@@ -2545,47 +3139,399 @@ fn route_permission_request<R: Runtime>(
         return;
     };
     let request_id = format!("{}:{rpc_key}", core.identity);
-    let Some(params) = message.get("params") else {
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Permission {
+        session_id: String,
+        tool_call: Value,
+        options: Vec<PermissionOption>,
+        #[serde(rename = "_meta")]
+        _meta: Option<Value>,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct PermissionOption {
+        option_id: String,
+        name: String,
+        kind: String,
+        #[serde(rename = "_meta")]
+        _meta: Option<Value>,
+    }
+    let id = message["id"].clone();
+    let Ok(params) =
+        serde_json::from_value::<Permission>(message.get("params").cloned().unwrap_or(Value::Null))
+    else {
+        write_client_error(core, id, -32602, "Invalid ACP permission parameters.");
         return;
     };
-    let Some(session_id) = params.get("sessionId").and_then(Value::as_str) else {
-        return;
-    };
-    let options: Vec<CopilotPermissionOption> = params
-        .get("options")
-        .cloned()
-        .and_then(|options| serde_json::from_value(options).ok())
-        .unwrap_or_default();
-    if options.is_empty() {
-        let _ = core.write(&json!({
-            "jsonrpc": "2.0",
-            "id": message.get("id").cloned().unwrap_or(Value::Null),
-            "result": {"outcome": {"outcome": "cancelled"}},
-        }));
+    let mut ids = HashSet::new();
+    if message["params"].to_string().len() > 32 * 1024
+        || params.options.is_empty()
+        || params.options.len() > 32
+        || params._meta.as_ref().is_some_and(|meta| !meta.is_object())
+        || !params.tool_call.is_object()
+        || params
+            .tool_call
+            .get("toolCallId")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        || params.options.iter().any(|option| {
+            option.option_id.is_empty()
+                || option.name.is_empty()
+                || option._meta.as_ref().is_some_and(|meta| !meta.is_object())
+                || !ids.insert(&option.option_id)
+                || !matches!(
+                    option.kind.as_str(),
+                    "allow_once" | "allow_always" | "reject_once" | "reject_always"
+                )
+        })
+    {
+        write_client_error(
+            core,
+            id,
+            -32602,
+            "Invalid or oversized ACP permission request.",
+        );
         return;
     }
-    core.permissions.lock().unwrap().insert(
-        request_id.clone(),
-        PendingPermission {
-            rpc_id: message["id"].clone(),
-            session_id: session_id.to_string(),
-            options: options.clone(),
-        },
-    );
-    let _ = app.emit(
-        "copilot:permission-request",
-        CopilotPermissionRequest {
-            request_id,
-            session_id: session_id.to_string(),
-            origin: CopilotPermissionOrigin::Conversation,
-            tool_call: params.get("toolCall").cloned().unwrap_or(Value::Null),
-            options,
-        },
-    );
+    let options: Vec<_> = params
+        .options
+        .into_iter()
+        .map(|option| CopilotPermissionOption {
+            option_id: option.option_id,
+            name: option.name,
+            kind: option.kind,
+        })
+        .collect();
+    {
+        let sessions = core.sessions.lock().unwrap();
+        if !sessions.contains_key(&params.session_id) {
+            drop(sessions);
+            write_client_error(
+                core,
+                id,
+                -32602,
+                "Permission requires this runtime's active session.",
+            );
+            return;
+        }
+        let mut pending = core.permissions.lock().unwrap();
+        if pending.contains_key(&request_id) || pending.len() >= 32 {
+            drop(pending);
+            drop(sessions);
+            write_client_error(
+                core,
+                id,
+                -32600,
+                "Duplicate or excessive pending permission request.",
+            );
+            return;
+        }
+        pending.insert(
+            request_id.clone(),
+            PendingPermission {
+                rpc_id: id.clone(),
+                session_id: params.session_id.clone(),
+                options: options.clone(),
+                expires: Instant::now() + Duration::from_secs(300),
+            },
+        );
+    }
+    if app
+        .emit(
+            "copilot:permission-request",
+            CopilotPermissionRequest {
+                request_id: request_id.clone(),
+                session_id: params.session_id,
+                origin: CopilotPermissionOrigin::Conversation,
+                tool_call: params.tool_call,
+                options,
+            },
+        )
+        .is_err()
+        && core
+            .permissions
+            .lock()
+            .unwrap()
+            .remove(&request_id)
+            .is_some()
+    {
+        write_client_error(
+            core,
+            id,
+            -32603,
+            "Darbot could not show the permission request.",
+        );
+    }
 }
 
-fn fail_pending(core: &RuntimeCore, problem: Problem) {
+fn start_permission_expiry<R: Runtime>(core: Weak<RuntimeCore>, app: AppHandle<R>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_secs(1));
+        let Some(core) = core
+            .upgrade()
+            .filter(|core| !core.closed.load(Ordering::SeqCst))
+        else {
+            break;
+        };
+        let expired: Vec<_> = {
+            let mut permissions = core.permissions.lock().unwrap();
+            let ids: Vec<_> = permissions
+                .iter()
+                .filter(|(_, pending)| Instant::now() >= pending.expires)
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.into_iter()
+                .filter_map(|id| permissions.remove(&id).map(|p| (id, p)))
+                .collect()
+        };
+        for (request_id, pending) in expired {
+            if let Err(problem) = core.write(&json!({
+                "jsonrpc": "2.0", "id": pending.rpc_id,
+                "result": {"outcome": {"outcome": "cancelled"}}
+            })) {
+                fail_pending(&core, problem);
+                break;
+            }
+            if app
+                .emit(
+                    "copilot:permission-closed",
+                    json!({"requestId": request_id, "sessionId": pending.session_id}),
+                )
+                .is_err()
+            {
+                eprintln!("Darbot could not close an expired permission notification.");
+            }
+        }
+    });
+}
+
+fn write_client_error(core: &RuntimeCore, id: Value, code: i64, message: &str) {
+    if core.closed.load(Ordering::SeqCst) {
+        return;
+    }
+    if let Err(problem) = core.write(&json!({
+        "jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message},
+    })) {
+        fail_pending(core, problem);
+    }
+}
+
+struct ClientRequestGuard {
+    core: Arc<RuntimeCore>,
+    key: String,
+}
+
+impl Drop for ClientRequestGuard {
+    fn drop(&mut self) {
+        self.core.client_requests.lock().unwrap().remove(&self.key);
+    }
+}
+
+fn route_terminal_request<R: Runtime>(
+    core: &Arc<RuntimeCore>,
+    app: &AppHandle<R>,
+    message: &Value,
+) {
+    let Some((id, key)) = message
+        .get("id")
+        .and_then(|id| json_id_key(id).map(|key| (id.clone(), key)))
+    else {
+        return;
+    };
+    let method = message["method"].as_str().unwrap().to_string();
+    let params = message.get("params").cloned().unwrap_or(Value::Null);
+    let audit_session = params["sessionId"].as_str().map(str::to_owned);
+    let audit_operation = match method.as_str() {
+        "terminal/create" => ProtocolOperation::TerminalCreate,
+        "terminal/output" => ProtocolOperation::TerminalOutput,
+        "terminal/wait_for_exit" => ProtocolOperation::TerminalWait,
+        "terminal/kill" => ProtocolOperation::TerminalKill,
+        "terminal/release" => ProtocolOperation::TerminalRelease,
+        _ => return,
+    };
+    if let Err(problem) = core.audit(
+        audit_session.as_deref(),
+        audit_operation,
+        AuditOutcome::Requested,
+    ) {
+        write_client_error(core, id, -32603, &problem.said);
+        return;
+    }
+    enum Request {
+        Create(terminals::Create, terminals::Reservation, String),
+        Handle(terminals::Handle),
+    }
+    let parsed = (|| {
+        if params.to_string().len() > 24 * 1024 {
+            return Err(Problem::plain("Terminal requests are limited to 24 KiB."));
+        }
+        if method == "terminal/create" {
+            let request: terminals::Create = serde_json::from_value(params)
+                .map_err(|_| Problem::plain("Invalid ACP terminal/create parameters."))?;
+            request.validate()?;
+            let cwd = core
+                .sessions
+                .lock()
+                .unwrap()
+                .get(&request.session_id)
+                .map(|session| session.cwd.clone())
+                .ok_or_else(|| {
+                    Problem::plain("Terminal creation requires this runtime's active session.")
+                })?;
+            let reservation = core.terminals.reserve(&request.session_id)?;
+            Ok(Request::Create(request, reservation, cwd))
+        } else {
+            let handle = serde_json::from_value::<terminals::Handle>(params)
+                .map_err(|_| Problem::plain("Invalid ACP terminal handle parameters."))?;
+            handle.validate()?;
+            Ok(Request::Handle(handle))
+        }
+    })();
+    let request = match parsed {
+        Ok(request) => request,
+        Err(problem) => {
+            write_client_error(core, id, -32602, &problem.said);
+            return;
+        }
+    };
+    if let Request::Handle(handle) = &request {
+        if method == "terminal/output" {
+            let result = core.terminals.output(handle);
+            if let Err(problem) = core.audit(
+                audit_session.as_deref(),
+                audit_operation,
+                if result.is_ok() {
+                    AuditOutcome::Succeeded
+                } else {
+                    AuditOutcome::Failed
+                },
+            ) {
+                write_client_error(core, id, -32603, &problem.said);
+                return;
+            }
+            write_client_result(core, id, result);
+            return;
+        }
+    }
+    {
+        let mut pending = core.client_requests.lock().unwrap();
+        let slow = matches!(
+            method.as_str(),
+            "terminal/create" | "terminal/wait_for_exit"
+        );
+        if pending.contains_key(&key)
+            || pending.values().filter(|value| **value == slow).count() >= 32
+        {
+            drop(pending);
+            write_client_error(
+                core,
+                id,
+                -32600,
+                "Duplicate or excessive pending terminal requests.",
+            );
+            return;
+        }
+        pending.insert(key.clone(), slow);
+    }
+    let guard = ClientRequestGuard {
+        core: Arc::clone(core),
+        key,
+    };
+    let core = Arc::clone(core);
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let _guard = guard;
+        let result = (|| match request {
+            Request::Create(request, reservation, cwd) => {
+                let home = &core.client_home;
+                let directory = request.directory(&cwd, home)?;
+                if core.consent.ask_if(
+                    &app,
+                    &core.identity,
+                    &request.session_id,
+                    CopilotPermissionOrigin::Conversation,
+                    request.details(&directory),
+                    || reservation.is_current() && !core.closed.load(Ordering::SeqCst),
+                )? != ConsentDecision::Allow
+                {
+                    core.audit(
+                        Some(&request.session_id),
+                        audit_operation,
+                        AuditOutcome::Rejected,
+                    )?;
+                    return Err(Problem::plain("The native command was not approved."));
+                }
+                core.audit(
+                    Some(&request.session_id),
+                    audit_operation,
+                    AuditOutcome::Approved,
+                )?;
+                if core.closed.load(Ordering::SeqCst) || request.directory(&cwd, home)? != directory
+                {
+                    return Err(Problem::plain(
+                        "The command session or directory changed during approval.",
+                    ));
+                }
+                let publish: terminals::Publish = Arc::new(move |session, id, snapshot| {
+                    let mut event = serde_json::to_value(snapshot).unwrap();
+                    event["sessionId"] = json!(session);
+                    event["terminalId"] = json!(id);
+                    app.emit("copilot:terminal-output", event)
+                        .map_err(|_| "Darbot could not publish terminal output.".to_string())
+                });
+                core.terminals
+                    .create(reservation, &request, &directory, publish)
+                    .map(|id| json!({"terminalId": id}))
+            }
+            Request::Handle(handle) => match method.as_str() {
+                "terminal/output" => core.terminals.output(&handle),
+                "terminal/wait_for_exit" => core.terminals.wait(&handle),
+                "terminal/kill" => core.terminals.kill(&handle).map(|()| json!({})),
+                "terminal/release" => core.terminals.release(&handle).map(|()| json!({})),
+                _ => unreachable!(),
+            },
+        })();
+        if let Err(problem) = core.audit(
+            audit_session.as_deref(),
+            audit_operation,
+            if result.is_ok() {
+                AuditOutcome::Succeeded
+            } else {
+                AuditOutcome::Failed
+            },
+        ) {
+            (core.report_cleanup)(&problem);
+        }
+        match result {
+            Ok(value) => write_client_result(&core, id, Ok(value)),
+            Err(problem) => write_client_error(
+                &core,
+                id,
+                -32000,
+                &format!(
+                    "{} {}",
+                    problem.said,
+                    problem.detail.as_deref().unwrap_or("")
+                ),
+            ),
+        }
+    });
+}
+
+fn fail_pending(core: &RuntimeCore, mut problem: Problem) {
+    core.closed.store(true, Ordering::SeqCst);
+    if let Some(controller) = &core.elicitation {
+        controller.cancel_all();
+    }
     core.consent.cancel(&core.identity, None);
+    if let Err(cleanup) = core.terminals.cancel(None, true) {
+        (core.report_cleanup)(&cleanup);
+        problem
+            .said
+            .push_str(" An owned terminal could not be completely cleaned up.");
+        problem.detail = cleanup.detail;
+    }
     let pending = std::mem::take(&mut *core.pending.lock().unwrap());
     for (_, sender) in pending {
         let _ = sender.send(Err(problem.clone()));
@@ -2657,9 +3603,42 @@ fn route_file_request<R: Runtime>(core: &Arc<RuntimeCore>, app: &AppHandle<R>, m
         );
         return;
     };
+    let Some(generation) = core.terminals.generation(request.session_id()) else {
+        write_client_error(core, id, -32602, "The file request's session has closed.");
+        return;
+    };
+    let key = json_id_key(&id).unwrap();
+    {
+        let mut pending = core.client_requests.lock().unwrap();
+        if pending.contains_key(&key) || pending.values().filter(|slow| **slow).count() >= 32 {
+            drop(pending);
+            write_client_error(core, id, -32600, "Duplicate or excessive client requests.");
+            return;
+        }
+        pending.insert(key.clone(), true);
+    }
+    let guard = ClientRequestGuard {
+        core: Arc::clone(core),
+        key,
+    };
+    let audit_session = request.session_id().to_owned();
+    let audit_operation = if matches!(request, ClientFileRequest::Write(_)) {
+        ProtocolOperation::FileWrite
+    } else {
+        ProtocolOperation::FileRead
+    };
+    if let Err(problem) = core.audit(
+        Some(&audit_session),
+        audit_operation,
+        AuditOutcome::Requested,
+    ) {
+        write_client_error(core, id, -32603, &problem.said);
+        return;
+    }
     let core = Arc::clone(core);
     let app = app.clone();
     std::thread::spawn(move || {
+        let _guard = guard;
         let result = (|| {
             let writing = matches!(request, ClientFileRequest::Write(_));
             if let ClientFileRequest::Write(request) = &request {
@@ -2669,8 +3648,8 @@ fn route_file_request<R: Runtime>(core: &Arc<RuntimeCore>, app: &AppHandle<R>, m
                     ));
                 }
             }
-            let home = copilot_home()?;
-            let path = copilot_files::resolve(&cwd, request.path(), writing, &home)?;
+            let home = &core.client_home;
+            let path = copilot_files::resolve(&cwd, request.path(), writing, home)?;
             let mut details = json!({
                 "title": if writing { "Replace a project text file" } else { "Read a project text file" },
                 "path": display_path(&path),
@@ -2690,26 +3669,36 @@ fn route_file_request<R: Runtime>(core: &Arc<RuntimeCore>, app: &AppHandle<R>, m
                     details["bytes"] = json!(request.content.len());
                 }
             }
-            if core.consent.ask(
+            if core.consent.ask_if(
                 &app,
                 &core.identity,
                 request.session_id(),
                 CopilotPermissionOrigin::Conversation,
                 details,
+                || {
+                    core.terminals.generation(request.session_id()) == Some(generation)
+                        && !core.closed.load(Ordering::SeqCst)
+                },
             )? != ConsentDecision::Allow
             {
+                core.audit(
+                    Some(&audit_session),
+                    audit_operation,
+                    AuditOutcome::Rejected,
+                )?;
                 return Err(Problem::plain("The project file request was not approved."));
             }
+            core.audit(
+                Some(&audit_session),
+                audit_operation,
+                AuditOutcome::Approved,
+            )?;
             if core.closed.load(Ordering::SeqCst)
-                || !core
-                    .sessions
-                    .lock()
-                    .unwrap()
-                    .contains_key(request.session_id())
+                || core.terminals.generation(request.session_id()) != Some(generation)
             {
                 return Err(Problem::plain("The file request's session has closed."));
             }
-            let current = copilot_files::resolve(&cwd, request.path(), writing, &home)?;
+            let current = copilot_files::resolve(&cwd, request.path(), writing, home)?;
             if current != path {
                 return Err(Problem::plain(
                     "The requested file changed location during approval.",
@@ -2725,6 +3714,17 @@ fn route_file_request<R: Runtime>(core: &Arc<RuntimeCore>, app: &AppHandle<R>, m
                 }
             }
         })();
+        if let Err(problem) = core.audit(
+            Some(&audit_session),
+            audit_operation,
+            if result.is_ok() {
+                AuditOutcome::Succeeded
+            } else {
+                AuditOutcome::Failed
+            },
+        ) {
+            (core.report_cleanup)(&problem);
+        }
         write_client_result(&core, id, result);
     });
 }
@@ -2742,26 +3742,24 @@ fn write_client_result(core: &RuntimeCore, id: Value, result: Result<Value, Prob
         }),
     };
     if let Err(problem) = core.write(&message) {
-        eprintln!(
-            "Darbot could not answer a client operation: {}",
-            problem.said
-        );
+        fail_pending(core, problem);
     }
 }
 
-fn initialize_params(client_files: bool) -> Value {
+fn initialize_params(client_operations: bool) -> Value {
     let mut params = json!({
         "protocolVersion": 1,
-        "clientCapabilities": {
-            "auth": {"terminal": true},
-        },
+        "clientCapabilities": {},
         "clientInfo": {
             "name": "darbot",
             "title": "Darbot",
             "version": env!("CARGO_PKG_VERSION"),
         },
     });
-    if client_files {
+    if client_operations {
+        params["clientCapabilities"]["elicitation"] = json!({"form":{}, "url":{}});
+        params["clientCapabilities"]["session"] = json!({"notices":{}, "compaction":{}});
+        params["clientCapabilities"]["terminal"] = json!(true);
         params["clientCapabilities"]["fs"] = json!({
             "readTextFile": true,
             "writeTextFile": true,
@@ -2983,10 +3981,11 @@ impl AcpConnection {
             )
         })?;
 
+        let deadline = Instant::now() + ACP_TIMEOUT;
         loop {
             let line = self
                 .stdout
-                .recv_timeout(ACP_TIMEOUT)
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                 .map_err(|error| match error {
                     mpsc::RecvTimeoutError::Timeout => Problem::plain(
                         "GitHub Copilot did not answer in time. Close and reopen Darbot to retry.",
@@ -3004,6 +4003,26 @@ impl AcpConnection {
                     format!("{error}: {line}"),
                 )
             })?;
+            if message.get("method").is_some() {
+                if let Some(callback_id) = message.get("id") {
+                    let reply = json!({
+                        "jsonrpc": "2.0", "id": callback_id,
+                        "error": {"code": -32601, "message":
+                            "Client callbacks are unavailable on this read-only status connection."}
+                    });
+                    serde_json::to_writer(&mut self.stdin, &reply)
+                        .map_err(std::io::Error::other)
+                        .and_then(|()| self.stdin.write_all(b"\n"))
+                        .and_then(|()| self.stdin.flush())
+                        .map_err(|error| {
+                            Problem::with(
+                                "Darbot could not reject a callback on its status connection.",
+                                error.to_string(),
+                            )
+                        })?;
+                }
+                continue;
+            }
             if message.get("id").and_then(Value::as_u64) != Some(id) {
                 continue;
             }
@@ -3545,7 +4564,7 @@ fn public_symbol(value: &str) -> bool {
 }
 
 pub fn login() -> Result<CopilotStatus, Problem> {
-    let output = quiet::command("copilot")
+    let output = copilot_command()?
         .args(["login", "--web-flow"])
         .output()
         .map_err(|error| {
@@ -3571,7 +4590,7 @@ fn read_inventory<T>(
     parse: impl FnOnce(Value) -> Result<Vec<T>, Problem>,
 ) -> Result<(Vec<T>, Option<String>), Problem> {
     diagnostics::reading(Some(cwd), operation, || {
-        let output = quiet::command("copilot")
+        let output = copilot_command()?
             .args([resource, "list", "--json"])
             .current_dir(cwd)
             .output()
@@ -3638,15 +4657,29 @@ fn parse_status(initialized: &Value) -> Result<CopilotStatus, Problem> {
             list_sessions: capability_present(sessions, "list"),
             close_session: capability_present(sessions, "close"),
             delete_session: capability_present(sessions, "delete"),
-            prompt_image: capability_enabled(prompt, "image"),
-            prompt_embedded_context: capability_enabled(prompt, "embeddedContext"),
+            // These are usable desktop capabilities, not merely the agent's declarations.
+            prompt_image: false,
+            prompt_embedded_context: false,
             mcp_http: capability_enabled(mcp, "http"),
             mcp_sse: capability_enabled(mcp, "sse"),
         },
         auth_methods,
         session_count: 0,
         has_more_sessions: false,
-        warnings: Vec::new(),
+        warnings: {
+            let mut warnings = Vec::new();
+            if capability_enabled(prompt, "image") || capability_enabled(prompt, "embeddedContext")
+            {
+                warnings.push("The agent supports additional prompt content, but this desktop sends text prompts only.".into());
+            }
+            if initialized["authMethods"]
+                .as_array()
+                .is_some_and(|methods| !methods.is_empty())
+            {
+                warnings.push("Generic ACP authentication methods are not implemented here; GitHub Copilot login is the supported sign-in flow.".into());
+            }
+            warnings
+        },
         observations: Observations::new(),
     })
 }
@@ -3741,7 +4774,7 @@ fn parse_mcp_servers(value: Value) -> Result<Vec<CopilotMcpServer>, Problem> {
 fn capability_present(capabilities: Option<&Value>, name: &str) -> bool {
     capabilities
         .and_then(|value| value.get(name))
-        .is_some_and(|value| !value.is_null())
+        .is_some_and(Value::is_object)
 }
 
 fn capability_enabled(capabilities: Option<&Value>, name: &str) -> bool {
@@ -5368,8 +6401,8 @@ mod tests {
         assert!(status.capabilities.list_sessions);
         assert!(status.capabilities.close_session);
         assert!(!status.capabilities.delete_session);
-        assert!(status.capabilities.prompt_image);
-        assert!(status.capabilities.prompt_embedded_context);
+        assert!(!status.capabilities.prompt_image);
+        assert!(!status.capabilities.prompt_embedded_context);
         assert!(status.capabilities.mcp_http);
         assert!(!status.capabilities.mcp_sse);
         assert_eq!(status.auth_methods[0].kind, "terminal");
@@ -5467,7 +6500,7 @@ mod tests {
             .get("clientCapabilities")
             .cloned()
             .unwrap();
-        assert_eq!(capabilities, json!({"auth": {"terminal": true}}));
+        assert_eq!(capabilities, json!({}));
         assert!(capabilities.get("fs").is_none());
         assert!(capabilities.get("terminal").is_none());
         assert!(capabilities.get("elicitation").is_none());
@@ -5476,7 +6509,775 @@ mod tests {
             connected["clientCapabilities"]["fs"],
             json!({"readTextFile": true, "writeTextFile": true})
         );
-        assert!(connected["clientCapabilities"].get("terminal").is_none());
+        assert_eq!(connected["clientCapabilities"]["terminal"], true);
+    }
+
+    fn terminal_wire_core(
+        fixture: &terminals::test_fixture::Fixture,
+    ) -> (
+        Arc<RuntimeCore>,
+        terminals::test_fixture::OwnedChild,
+        std::process::ChildStdout,
+    ) {
+        let mut child = terminals::test_fixture::OwnedChild::new(
+            quiet::command(&fixture.executable)
+                .arg("wire")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let (outgoing, messages) = mpsc::sync_channel(64);
+        let stdin = child.stdin.take().unwrap();
+        let core = Arc::new(RuntimeCore {
+            identity: format!("wire-{:032x}", rand::random::<u128>()),
+            audit_root: Some(fixture.root.join("audit-app")),
+            elicitation: Some(elicitation::Controller::with_hooks(
+                Arc::new(|_, _| Ok(())),
+                Arc::new(|_| Err("Test browser opening is forbidden".into())),
+                Some(Arc::new(|pattern, input| {
+                    let regex = regress::Regex::new(pattern).map_err(|error| error.to_string())?;
+                    Ok(input.is_none_or(|value| regex.find(value).is_some()))
+                })),
+            )),
+            tool_calls: Mutex::default(),
+            elicitation_rpc: Mutex::default(),
+            client_home: fixture.root.with_extension("unused-private-home"),
+            consent: Arc::default(),
+            terminals: Arc::default(),
+            client_requests: Mutex::default(),
+            report_cleanup: Arc::new(|_| {}),
+            outgoing,
+            pending: Mutex::default(),
+            permissions: Mutex::default(),
+            sessions: Mutex::new(HashMap::from([(
+                "one".into(),
+                SessionState {
+                    cwd: fixture.root.to_string_lossy().into(),
+                    config_options: json!([]),
+                    modes: Value::Null,
+                },
+            )])),
+            next_request_id: AtomicU64::new(0),
+            closed: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
+            stderr: Mutex::default(),
+        });
+        start_runtime_writer(stdin, messages, Arc::downgrade(&core));
+        core.terminals.activate("one").unwrap();
+        let stdout = child.stdout.take().unwrap();
+        (core, child, stdout)
+    }
+
+    fn terminal_wire(
+        fixture: &terminals::test_fixture::Fixture,
+    ) -> (
+        Arc<RuntimeCore>,
+        terminals::test_fixture::OwnedChild,
+        Receiver<Value>,
+    ) {
+        let (core, child, stdout) = terminal_wire_core(fixture);
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else {
+                    break;
+                };
+                let value = serde_json::from_str(&line).unwrap();
+                if sender.send(value).is_err() {
+                    break;
+                }
+            }
+        });
+        (core, child, receiver)
+    }
+
+    #[test]
+    fn elicitation_wire_response_and_cancel_are_bound_to_live_native_scope() {
+        let fixture = terminals::test_fixture::Fixture::new();
+        let (core, mut child, replies) = terminal_wire(&fixture);
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let params = json!({"sessionId":"one","mode":"form","message":"Choose the review strategy.",
+            "requestedSchema":{"type":"object","properties":{"choice":{"type":"string","enum":["safe","fast"]}},"required":["choice"]}});
+        route_runtime_message(
+            &core,
+            app.handle(),
+            json!({"jsonrpc":"2.0","id":"form","method":"elicitation/create","params":params}),
+        );
+        let controller = core.elicitation.as_ref().unwrap();
+        let started = Instant::now();
+        let local = loop {
+            if let Some(local) = core
+                .elicitation_rpc
+                .lock()
+                .unwrap()
+                .get("\"form\"")
+                .filter(|local| local.starts_with("el-"))
+                .cloned()
+            {
+                break local;
+            }
+            assert!(started.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let scope = core.elicitation_scope(&params).unwrap();
+        assert!(controller
+            .respond(
+                &local,
+                elicitation::Response {
+                    action: elicitation::Action::Accept,
+                    content: Some(json!({"choice":"invalid"}))
+                },
+                &scope
+            )
+            .is_err());
+        controller
+            .respond(
+                &local,
+                elicitation::Response {
+                    action: elicitation::Action::Accept,
+                    content: Some(json!({"choice":"safe"})),
+                },
+                &scope,
+            )
+            .unwrap();
+        let response = replies.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(
+            response["result"],
+            json!({"action":"accept","content":{"choice":"safe"}})
+        );
+        route_runtime_message(
+            &core,
+            app.handle(),
+            json!({"jsonrpc":"2.0","id":9,"method":"elicitation/create","params":params}),
+        );
+        route_runtime_message(
+            &core,
+            app.handle(),
+            json!({"jsonrpc":"2.0","method":"$/cancel_request","params":{"requestId":9}}),
+        );
+        let cancelled = replies.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(cancelled["id"], 9);
+        assert_eq!(cancelled["error"]["code"], -32800);
+        route_runtime_message(
+            &core,
+            app.handle(),
+            json!({"jsonrpc":"2.0","id":10,"method":"elicitation/create","params":{"sessionId":"foreign","mode":"url","url":"https://example.com","elicitationId":"other","message":"Open"}}),
+        );
+        assert_eq!(
+            replies.recv_timeout(Duration::from_secs(10)).unwrap()["error"]["code"],
+            -32602
+        );
+        fail_pending(&core, Problem::plain("Finished test"));
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn terminal_stdout_eof_and_malformed_protocol_dispose_owned_commands() {
+        for malformed in [false, true] {
+            let fixture = terminals::test_fixture::Fixture::new();
+            let (core, mut child, stdout) = terminal_wire_core(&fixture);
+            let app = tauri::test::mock_builder()
+                .build(tauri::test::mock_context(tauri::test::noop_assets()))
+                .unwrap();
+            let request = fixture.request("sleep", 1024);
+            let id = core
+                .terminals
+                .create(
+                    core.terminals.reserve("one").unwrap(),
+                    &request,
+                    &fixture.root,
+                    Arc::new(|_, _, _| Ok(())),
+                )
+                .unwrap();
+            start_runtime_stdout(stdout, Arc::downgrade(&core), app.handle().clone());
+            if malformed {
+                core.write(&json!("not-json")).unwrap();
+            } else {
+                child.kill().unwrap();
+                child.wait().unwrap();
+            }
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let handle: terminals::Handle = serde_json::from_value(json!({
+                "sessionId":"one","terminalId":id
+            }))
+            .unwrap();
+            while !core.closed.load(Ordering::SeqCst) || core.terminals.output(&handle).is_ok() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(core.terminals.reserve("one").is_err());
+            core.terminals.cancel(None, true).unwrap();
+            if malformed {
+                child.kill().unwrap();
+                child.wait().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_wire_dispatch_runs_all_five_methods_without_blocking_reader_and_publishes_final_output(
+    ) {
+        use tauri::Listener;
+        let fixture = terminals::test_fixture::Fixture::new();
+        let (core, mut child, replies) = terminal_wire(&fixture);
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let (opened, requests) = mpsc::channel();
+        app.listen("copilot:permission-request", move |event| {
+            opened
+                .send(serde_json::from_str::<Value>(event.payload()).unwrap())
+                .unwrap();
+        });
+        let events = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let output_events = Arc::clone(&events);
+        app.listen("copilot:terminal-output", move |event| {
+            output_events
+                .lock()
+                .unwrap()
+                .push(serde_json::from_str(event.payload()).unwrap());
+        });
+        let send = |id: Value, method: &str, params: Value| {
+            route_runtime_message(
+                &core,
+                app.handle(),
+                json!({
+                    "jsonrpc":"2.0", "id":id, "method":method, "params":params
+                }),
+            );
+        };
+        send(
+            json!("create"),
+            "terminal/create",
+            json!({
+                "sessionId":"one","command":fixture.executable,"args":["sleep"],"_meta":{}
+            }),
+        );
+        let request = requests.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(request["toolCall"]["command"], json!(fixture.executable));
+        assert_eq!(request["toolCall"]["args"], json!(["sleep"]));
+        assert_eq!(request["toolCall"]["env"], json!([]));
+        assert!(request["toolCall"]["warning"]
+            .as_str()
+            .unwrap()
+            .contains("not a filesystem sandbox"));
+        core.consent
+            .respond(request["requestId"].as_str().unwrap(), Some("allow-once"))
+            .unwrap();
+        let created = replies.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(created["id"], "create");
+        let handle = json!({"sessionId":"one","terminalId":created["result"]["terminalId"]});
+        assert!(handle["terminalId"].is_string(), "{created}");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if events.lock().unwrap().iter().any(|event| {
+                event["output"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("ready"))
+                    && event.get("exitStatus").is_none()
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "output was not published before command exit"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        send(json!("wait"), "terminal/wait_for_exit", handle.clone());
+        send(json!(12), "terminal/output", handle.clone());
+        let output = replies.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(output["id"], 12);
+        assert!(output["result"]["output"].is_string());
+        send(json!("kill"), "terminal/kill", handle.clone());
+        let first = replies.recv_timeout(Duration::from_secs(10)).unwrap();
+        let second = replies.recv_timeout(Duration::from_secs(10)).unwrap();
+        let responses = HashMap::from([
+            (first["id"].as_str().unwrap().to_string(), first),
+            (second["id"].as_str().unwrap().to_string(), second),
+        ]);
+        assert_eq!(responses["kill"]["result"], json!({}));
+        #[cfg(windows)]
+        assert_eq!(responses["wait"]["result"]["exitCode"], 1);
+        #[cfg(unix)]
+        assert_eq!(responses["wait"]["result"]["signal"], "SIGKILL");
+        send(json!("release"), "terminal/release", handle.clone());
+        assert_eq!(
+            replies.recv_timeout(Duration::from_secs(10)).unwrap()["result"],
+            json!({})
+        );
+        send(json!("after-release"), "terminal/output", handle.clone());
+        assert!(replies
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .get("error")
+            .is_some());
+        send(json!("release-again"), "terminal/release", handle);
+        assert!(replies
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .get("error")
+            .is_some());
+        let events = events.lock().unwrap();
+        assert!(events.len() >= 2);
+        assert_eq!(events[0]["output"], "");
+        assert_eq!(events[0]["sessionId"], "one");
+        assert_eq!(
+            events.last().unwrap()["terminalId"],
+            created["result"]["terminalId"]
+        );
+        assert!(events.last().unwrap().get("exitStatus").is_some());
+        drop(events);
+        core.terminals.cancel(None, true).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn terminal_wire_validation_rejection_and_cancelled_approval_never_start_commands() {
+        use tauri::Listener;
+        let fixture = terminals::test_fixture::Fixture::new();
+        let (core, mut child, replies) = terminal_wire(&fixture);
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let (opened, requests) = mpsc::channel();
+        app.listen("copilot:permission-request", move |event| {
+            opened
+                .send(serde_json::from_str::<Value>(event.payload()).unwrap())
+                .unwrap();
+        });
+        let send = |id: i64, method: &str, params: Value| {
+            route_runtime_message(
+                &core,
+                app.handle(),
+                json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
+            );
+        };
+        for (index, params) in [
+            json!(null),
+            json!({"sessionId":"unknown","command":"unused"}),
+            json!({"sessionId":"one","command":"unused","outputByteLimit":-1}),
+            json!({"sessionId":"one","command":"unused","extra":true}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            send(index as i64, "terminal/create", params);
+            assert_eq!(
+                replies.recv_timeout(Duration::from_secs(2)).unwrap()["error"]["code"],
+                -32602
+            );
+        }
+        for (id, cancel) in [(10, false), (11, true)] {
+            send(
+                id,
+                "terminal/create",
+                json!({
+                    "sessionId":"one","command":fixture.executable,"args":["sleep"]
+                }),
+            );
+            let request = requests.recv_timeout(Duration::from_secs(10)).unwrap();
+            if cancel {
+                core.terminals.cancel(Some("one"), false).unwrap();
+                core.cancel_permissions("one").unwrap();
+            } else {
+                core.consent
+                    .respond(request["requestId"].as_str().unwrap(), Some("reject-once"))
+                    .unwrap();
+            }
+            let response = replies.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(response["id"], id);
+            assert!(response.get("result").is_none());
+            assert_eq!(response["error"]["code"], -32000);
+        }
+        assert!(requests.try_recv().is_err());
+        core.terminals.cancel(None, true).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn permission_wire_replies_to_malformed_unknown_and_duplicate_requests_without_overwriting() {
+        use tauri::Listener;
+        let fixture = terminals::test_fixture::Fixture::new();
+        let (core, mut child, replies) = terminal_wire(&fixture);
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let (opened, requests) = mpsc::channel();
+        app.listen("copilot:permission-request", move |event| {
+            opened
+                .send(serde_json::from_str::<Value>(event.payload()).unwrap())
+                .unwrap();
+        });
+        let send = |id: &str, params: Value| {
+            route_runtime_message(
+                &core,
+                app.handle(),
+                json!({
+                    "jsonrpc":"2.0","id":id,"method":"session/request_permission","params":params
+                }),
+            );
+        };
+        send("missing", json!(null));
+        assert_eq!(
+            replies.recv_timeout(Duration::from_secs(2)).unwrap()["error"]["code"],
+            -32602
+        );
+        let mut params = json!({
+            "sessionId":"unknown","toolCall":{"toolCallId":"test"},
+            "options":[{"optionId":"allow","name":"Allow","kind":"allow_once"}]
+        });
+        send("unknown", params.clone());
+        assert_eq!(
+            replies.recv_timeout(Duration::from_secs(2)).unwrap()["error"]["code"],
+            -32602
+        );
+        params["sessionId"] = json!("one");
+        send("valid", params.clone());
+        let request = requests.recv_timeout(Duration::from_secs(2)).unwrap();
+        send("valid", params);
+        assert_eq!(
+            replies.recv_timeout(Duration::from_secs(2)).unwrap()["error"]["code"],
+            -32600
+        );
+        assert_eq!(core.permissions.lock().unwrap().len(), 1);
+        core.respond_permission(
+            request["requestId"].as_str().unwrap().into(),
+            Some("allow".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            replies.recv_timeout(Duration::from_secs(2)).unwrap()["result"]["outcome"]["optionId"],
+            "allow"
+        );
+        assert!(requests.try_recv().is_err());
+        core.terminals.cancel(None, true).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn file_wire_read_write_and_cancel_return_actual_rpc_responses() {
+        use tauri::Listener;
+        let fixture = terminals::test_fixture::Fixture::new();
+        let (core, mut child, replies) = terminal_wire(&fixture);
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let (opened, requests) = mpsc::channel();
+        app.listen("copilot:permission-request", move |event| {
+            opened
+                .send(serde_json::from_str::<Value>(event.payload()).unwrap())
+                .unwrap();
+        });
+        let path = fixture.root.join("approved.txt");
+        let send = |id: i64, method: &str, params: Value| {
+            route_runtime_message(
+                &core,
+                app.handle(),
+                json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
+            );
+        };
+        send(
+            1,
+            "fs/write_text_file",
+            json!({"sessionId":"one","path":path,"content":"first\n😀\n"}),
+        );
+        let request = requests.recv_timeout(Duration::from_secs(10)).unwrap();
+        core.consent
+            .respond(request["requestId"].as_str().unwrap(), Some("allow-once"))
+            .unwrap();
+        assert_eq!(
+            replies.recv_timeout(Duration::from_secs(10)).unwrap()["result"],
+            json!({})
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "first\n😀\n");
+        send(
+            2,
+            "fs/read_text_file",
+            json!({"sessionId":"one","path":path}),
+        );
+        let request = requests.recv_timeout(Duration::from_secs(10)).unwrap();
+        core.consent
+            .respond(request["requestId"].as_str().unwrap(), Some("allow-once"))
+            .unwrap();
+        assert_eq!(
+            replies.recv_timeout(Duration::from_secs(10)).unwrap()["result"]["content"],
+            "first\n😀\n"
+        );
+        send(
+            3,
+            "fs/write_text_file",
+            json!({"sessionId":"one","path":path,"content":"cancelled"}),
+        );
+        let request = requests.recv_timeout(Duration::from_secs(10)).unwrap();
+        core.terminals.cancel(Some("one"), false).unwrap();
+        core.cancel_permissions("one").unwrap();
+        assert!(core
+            .consent
+            .respond(request["requestId"].as_str().unwrap(), Some("allow-once"))
+            .is_err());
+        assert!(replies
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .get("error")
+            .is_some());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "first\n😀\n");
+        for (id, method, params) in [
+            (
+                4,
+                "fs/read_text_file",
+                json!({"sessionId":"unknown","path":path}),
+            ),
+            (
+                5,
+                "fs/write_text_file",
+                json!({"sessionId":"one","path":path}),
+            ),
+        ] {
+            send(id, method, params);
+            assert!(replies
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .get("error")
+                .is_some());
+        }
+        assert!(requests.try_recv().is_err());
+        core.terminals.cancel(None, true).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn rpc_envelopes_capabilities_and_legacy_modes_are_validated() {
+        let fixture = terminals::test_fixture::Fixture::new();
+        let (core, mut child, replies) = terminal_wire(&fixture);
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        for message in [
+            json!({"jsonrpc":"1.0","id":1,"method":"terminal/create"}),
+            json!({"jsonrpc":"2.0","id":true,"method":"terminal/create"}),
+            json!({"jsonrpc":"2.0","id":2,"method":1}),
+            json!({"jsonrpc":"2.0","id":3,"method":"terminal/create","result":{}}),
+            json!({"jsonrpc":"2.0","id":4}),
+        ] {
+            route_runtime_message(&core, app.handle(), message);
+            assert_eq!(
+                replies.recv_timeout(Duration::from_secs(2)).unwrap()["error"]["code"],
+                -32600
+            );
+        }
+        assert!(!capability_present(
+            Some(&json!({"delete":false})),
+            "delete"
+        ));
+        assert!(!capability_present(Some(&json!({"delete":true})), "delete"));
+        assert!(capability_present(Some(&json!({"delete":{}})), "delete"));
+        let modes = json!({"currentModeId":"agent","availableModes":[
+            {"id":"agent"},{"id":"plan"},{"id":"autopilot"},
+            {"id":"https://agentclientprotocol.com/protocol/session-modes#autopilot"}
+        ]});
+        assert!(validate_mode(&modes, "plan").is_ok());
+        assert!(validate_mode(&modes, "unknown").is_err());
+        assert!(validate_mode(&modes, "autopilot").is_err());
+        assert!(validate_mode(
+            &modes,
+            "https://agentclientprotocol.com/protocol/session-modes#autopilot"
+        )
+        .is_err());
+        core.sessions.lock().unwrap().get_mut("one").unwrap().modes = modes;
+        route_runtime_message(
+            &core,
+            app.handle(),
+            json!({
+                "jsonrpc":"2.0","method":"session/update","params":{
+                    "sessionId":"one","update":{"sessionUpdate":"current_mode_update","currentModeId":"plan"}
+                }
+            }),
+        );
+        assert_eq!(
+            core.sessions.lock().unwrap()["one"].modes["currentModeId"],
+            "plan"
+        );
+        core.terminals.cancel(None, true).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn blocked_protocol_pipe_does_not_block_response_dispatch() {
+        let fixture = terminals::test_fixture::Fixture::new();
+        let (core, mut child, _unread_stdout) = terminal_wire_core(&fixture);
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        for _ in 0..3 {
+            core.write(&json!({"payload": "x".repeat(1024 * 1024)}))
+                .unwrap();
+        }
+        let (sender, received) = mpsc::channel();
+        core.pending.lock().unwrap().insert("99".into(), sender);
+        route_runtime_message(
+            &core,
+            app.handle(),
+            json!({"jsonrpc":"2.0","id":99,"result":{"alive":true}}),
+        );
+        assert_eq!(
+            received
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .unwrap()["alive"],
+            true
+        );
+        fail_pending(&core, Problem::plain("Fixture stopped."));
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn status_probe_explicitly_answers_callbacks_without_granting_authority() {
+        let fixture = terminals::test_fixture::Fixture::new();
+        let mut child = terminals::test_fixture::OwnedChild::new(
+            quiet::command(&fixture.executable)
+                .arg("probe")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (sender, received) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if sender
+                    .send(line.map_err(|error| error.to_string()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let (_, stderr) = mpsc::channel();
+        let mut probe = AcpConnection {
+            child: child.into_inner(),
+            stdin,
+            stdout: received,
+            stderr,
+        };
+        assert_eq!(
+            probe
+                .request(42, "initialize", initialize_params(false))
+                .unwrap(),
+            json!({"answered":true})
+        );
+        drop(probe);
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn shared_cli_builder_preserves_exact_portable_plugin_arguments() {
+        if crate::test_support::isolated_process(
+            "copilot::tests::shared_cli_builder_preserves_exact_portable_plugin_arguments",
+        ) {
+            return;
+        }
+        let fixture = terminals::test_fixture::Fixture::new();
+        let first = fixture.root.join("first plugin");
+        let second = fixture.root.join("second-plugin");
+        for root in [&first, &second] {
+            fs::create_dir(root).unwrap();
+            fs::write(root.join("plugin.json"), r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"fixture","version":"1.0.0"}"#).unwrap();
+        }
+        std::env::set_var(
+            "DARBOT_AGENT_PLUGIN_DIRS",
+            std::env::join_paths([&first, &second]).unwrap(),
+        );
+        let mut command = copilot_command().unwrap();
+        command.args(["--acp", "--stdio", "--no-auto-update"]);
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "--plugin-dir".to_string(),
+                first.canonicalize().unwrap().to_string_lossy().into_owned(),
+                "--plugin-dir".to_string(),
+                second
+                    .canonicalize()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                "--acp".into(),
+                "--stdio".into(),
+                "--no-auto-update".into(),
+            ]
+        );
+        std::env::set_var("DARBOT_AGENT_PLUGIN_DIRS", fixture.root.join("missing"));
+        assert!(copilot_command().is_err());
+    }
+
+    #[test]
+    fn native_delete_and_set_mode_send_exact_methods_and_retire_local_authority() {
+        let fixture = terminals::test_fixture::Fixture::new();
+        let (core, child, replies) = terminal_wire(&fixture);
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        core.sessions.lock().unwrap().get_mut("one").unwrap().modes =
+            json!({"currentModeId":"agent","availableModes":[{"id":"agent"},{"id":"plan"}]});
+        let capabilities = parse_status(&json!({
+            "protocolVersion":1,"agentCapabilities":{"sessionCapabilities":{"delete":{}}}
+        }))
+        .unwrap()
+        .capabilities;
+        let runtime = Arc::new(CopilotRuntime {
+            child: Mutex::new(child.into_inner()),
+            opening: Mutex::new(()),
+            core: Arc::clone(&core),
+            capabilities,
+        });
+        let state = Arc::new(CopilotRuntimeState::default());
+        *state.runtime.lock().unwrap() = Some(Arc::clone(&runtime));
+        let changing = Arc::clone(&state);
+        let change = std::thread::spawn(move || changing.set_mode("one".into(), "plan".into()));
+        let request = replies.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(request["method"], "session/set_mode");
+        assert_eq!(
+            request["params"],
+            json!({"sessionId":"one","modeId":"plan"})
+        );
+        route_runtime_message(
+            &core,
+            app.handle(),
+            json!({"jsonrpc":"2.0","id":request["id"],"result":{}}),
+        );
+        assert_eq!(change.join().unwrap().unwrap()["currentModeId"], "plan");
+        let deleting = Arc::clone(&state);
+        let delete = std::thread::spawn(move || deleting.delete_session("one".into()));
+        let request = replies.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(request["method"], "session/delete");
+        assert_eq!(request["params"], json!({"sessionId":"one"}));
+        assert!(core.terminals.generation("one").is_none());
+        assert!(!core.sessions.lock().unwrap().contains_key("one"));
+        route_runtime_message(
+            &core,
+            app.handle(),
+            json!({"jsonrpc":"2.0","id":request["id"],"result":{}}),
+        );
+        delete.join().unwrap().unwrap();
+        state.shutdown();
     }
 
     #[test]

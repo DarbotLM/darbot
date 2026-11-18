@@ -1685,6 +1685,9 @@ impl RecordedHostProcess {
 fn windows_processes_with(powershell: &Path) -> Result<Vec<WindowsProcess>, Problem> {
     let operation = format!("{} Get-CimInstance Win32_Process", powershell.display());
     let output = command(powershell)
+        // Let Windows PowerShell use its own module paths, not an incompatible launching shell's
+        // (for example PowerShell 7). Inherited paths can stall CIM module discovery during Stop.
+        .env_remove("PSModulePath")
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -4154,6 +4157,10 @@ fn main() {
             std::process::exit(17);
         }
         ("powershell", "inventory-empty") => print!("[]"),
+        ("powershell", "inventory-module-path") => {
+            assert!(std::env::var_os("PSModulePath").is_none(), "inventory inherited the launching shell's module search path");
+            print!("[]");
+        }
         ("powershell", "inventory-malformed") => print!("[{{"),
         ("powershell", "inventory-blank") => {},
         ("netstat", "inventory-empty")
@@ -5591,6 +5598,26 @@ fn main() {
             "{log}"
         );
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn windows_inventory_does_not_inherit_powershell_module_path() {
+        if crate::test_support::isolated_process(
+            "stack::tests::windows_inventory_does_not_inherit_powershell_module_path",
+        ) {
+            return;
+        }
+        let root = temp_root("inventory-module-path");
+        let fixture = CleanupCommandFixture::new(&root);
+        fixture.scenario("inventory-module-path");
+        let inherited = root.join("launching-shell-modules");
+        std::env::set_var("PSModulePath", &inherited);
+        let processes = windows_processes_with(&fixture.command("powershell")).unwrap();
+        assert!(processes.is_empty());
+        assert_eq!(std::env::var_os("PSModulePath"), Some(inherited.into()));
+        assert!(fixture
+            .log()
+            .contains("powershell\t-NoProfile -NonInteractive -Command"));
     }
 
     #[test]

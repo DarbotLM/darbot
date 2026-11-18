@@ -805,21 +805,128 @@ export type CopilotPromptResult = {
   stopReason: string;
 };
 
+export type CopilotTerminalOutput = {
+  sessionId: string;
+  terminalId: string;
+  output: string;
+  truncated: boolean;
+  exitStatus?: { exitCode: number | null; signal: string | null };
+};
+
+export type CopilotCompaction = {
+  compactionId: string;
+  status: string;
+  summary?: unknown[];
+  error?: string;
+  _meta?: Record<string, unknown>;
+};
+
+export function mergeCompaction(
+  previous: CopilotCompaction | undefined,
+  update: Record<string, unknown>,
+): CopilotCompaction {
+  if (
+    typeof update.compactionId !== "string" ||
+    !update.compactionId ||
+    (previous && previous.compactionId !== update.compactionId)
+  )
+    throw new Error("An ACP compaction update has invalid ownership.");
+  const next: CopilotCompaction = {
+    ...previous,
+    compactionId: update.compactionId,
+    status: previous?.status ?? "in_progress",
+  };
+  if (update.sessionUpdate === "compaction_summary_chunk") {
+    if (!update.content || typeof update.content !== "object")
+      throw new Error("An ACP compaction summary chunk requires content.");
+    next.summary = [...(next.summary ?? []), update.content];
+    return next;
+  }
+  if (typeof update.status !== "string" || !update.status)
+    throw new Error("An ACP compaction update requires a status.");
+  next.status = update.status;
+  if (Object.hasOwn(update, "summary")) {
+    if (update.summary !== null && !Array.isArray(update.summary))
+      throw new Error("An ACP compaction summary must be an array or null.");
+    if (update.summary === null) delete next.summary;
+    else next.summary = update.summary;
+  }
+  if (Object.hasOwn(update, "error")) {
+    if (update.error !== null && typeof update.error !== "string")
+      throw new Error("An ACP compaction error must be text or null.");
+    if (update.error === null) delete next.error;
+    else next.error = update.error;
+  }
+  if (Object.hasOwn(update, "_meta")) {
+    if (
+      update._meta !== null &&
+      (typeof update._meta !== "object" || Array.isArray(update._meta))
+    )
+      throw new Error("ACP compaction metadata must be an object or null.");
+    if (update._meta === null) delete next._meta;
+    else next._meta = update._meta as Record<string, unknown>;
+  }
+  return next;
+}
+
+export function terminalDisplayText(text: string): string {
+  let state: "text" | "escape" | "csi" | "osc" | "osc-escape" = "text";
+  let result = "";
+  for (const character of text) {
+    const code = character.codePointAt(0);
+    if (state === "osc") {
+      if (code === 7 || code === 156) state = "text";
+      else if (code === 27) state = "osc-escape";
+    } else if (state === "osc-escape") {
+      state = character === "\\" ? "text" : "osc";
+    } else if (state === "csi") {
+      if (code !== undefined && code >= 64 && code <= 126) state = "text";
+    } else if (state === "escape") {
+      state = character === "[" ? "csi" : character === "]" ? "osc" : "text";
+    } else if (code === 27) {
+      state = "escape";
+    } else if (code === 155) {
+      state = "csi";
+    } else if (code === 157) {
+      state = "osc";
+    } else if (
+      code !== undefined &&
+      ((code >= 32 && (code < 127 || code > 159)) ||
+        character === "\n" ||
+        character === "\r" ||
+        character === "\t")
+    ) {
+      result += character;
+    }
+  }
+  return result;
+}
+
 export type CopilotToolActivity = {
   title: string;
   status?: string;
   input?: unknown;
   output?: unknown;
+  kind?: string;
+  locations?: unknown;
+  terminals?: CopilotTerminalOutput[];
 };
 
 export function mergeToolActivity(
   previous: CopilotToolActivity | undefined,
   update: Partial<CopilotToolActivity>,
 ): CopilotToolActivity {
-  return {
+  const result: CopilotToolActivity = {
     title: update.title?.trim() || previous?.title || "Tool call",
     status: update.status ?? previous?.status,
     input: update.input ?? previous?.input,
     output: update.output ?? previous?.output,
   };
+  if (update.kind !== undefined || previous?.kind !== undefined)
+    result.kind = update.kind ?? previous?.kind;
+  if (update.locations !== undefined || previous?.locations !== undefined)
+    result.locations = update.locations ?? previous?.locations;
+  if (update.terminals !== undefined || previous?.terminals !== undefined)
+    result.terminals = update.terminals ?? previous?.terminals;
+  return result;
 }

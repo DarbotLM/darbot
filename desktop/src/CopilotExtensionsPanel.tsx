@@ -3,6 +3,324 @@ import { useEffect, useState } from "react";
 import type { CopilotAgentSummary } from "./copilot-types";
 import { asProblem, InlineFailure, type Problem } from "./Problem";
 
+type ElicitationField = {
+  type: "string" | "number" | "integer" | "boolean" | "array";
+  title?: string;
+  description?: string;
+  default?: string | number | boolean | string[];
+  enum?: string[];
+  enumNames?: string[];
+  oneOf?: { const: string; title?: string }[];
+  items?: { enum?: string[]; anyOf?: { const: string; title?: string }[] };
+  minLength?: number;
+  maxLength?: number;
+  minimum?: number;
+  maximum?: number;
+  minItems?: number;
+  maxItems?: number;
+  format?: string;
+};
+
+export type CopilotElicitationRequest = {
+  requestId: string;
+  sessionId?: string;
+  mode: "form" | "url";
+  message: string;
+  url?: string;
+  elicitationId?: string;
+  requestedSchema?: {
+    type: "object";
+    properties: Record<string, ElicitationField>;
+    required?: string[];
+  };
+};
+
+export function ElicitationReview({
+  request,
+  onRespond,
+}: {
+  request: CopilotElicitationRequest;
+  onRespond: (
+    action: "accept" | "decline" | "cancel",
+    content?: Record<string, unknown>,
+  ) => Promise<void>;
+}) {
+  const [values, setValues] = useState<Record<string, unknown>>(() =>
+    Object.fromEntries(
+      Object.entries(request.requestedSchema?.properties ?? {})
+        .filter(([, field]) => field.default !== undefined)
+        .map(([name, field]) => [name, field.default]),
+    ),
+  );
+  const [busy, setBusy] = useState(false);
+  const [problem, setProblem] = useState<Problem | null>(null);
+  async function respond(action: "accept" | "decline" | "cancel") {
+    if (busy) return;
+    setBusy(true);
+    setProblem(null);
+    try {
+      await onRespond(
+        action,
+        action === "accept" && request.mode === "form" ? values : undefined,
+      );
+    } catch (error) {
+      setProblem(asProblem(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+  const set = (name: string, value: unknown) =>
+    setValues((current) => {
+      const entries = Object.entries(current).filter(([key]) => key !== name);
+      return Object.fromEntries(
+        value === undefined ? entries : [...entries, [name, value]],
+      );
+    });
+  let host = "";
+  if (request.mode === "url" && request.url) {
+    try {
+      host = new URL(request.url).hostname;
+    } catch {
+      host = "Invalid URL";
+    }
+  }
+  return (
+    <>
+      <div className="copilot-dialog-header">
+        <h2 id="copilot-permission-title">Agent information request</h2>
+      </div>
+      <div className="copilot-dialog-body">
+        <p>
+          Connected ACP agent
+          {request.sessionId ? ` · session ${request.sessionId}` : ""}
+        </p>
+        <p>{request.message}</p>
+        {request.mode === "url" ? (
+          <>
+            <p>
+              External site: <strong>{host}</strong>
+            </p>
+            <pre>{request.url}</pre>
+            <p>
+              Open only if you trust this site. It opens in your browser, not in
+              the agent. Opening does not confirm that sign-in or the external
+              action completed.
+            </p>
+            {host.includes("xn--") && (
+              <p className="caution">
+                This hostname contains Punycode. Check the full destination
+                carefully.
+              </p>
+            )}
+          </>
+        ) : (
+          <form
+            data-ui-action="workspace_permission_decide"
+            id={`elicitation-${request.requestId}`}
+            onSubmit={(event) => {
+              event.preventDefault();
+              void respond("accept");
+            }}
+          >
+            {Object.entries(request.requestedSchema?.properties ?? {}).map(
+              ([name, field]) => {
+                const value = values[name];
+                const required =
+                  request.requestedSchema?.required?.includes(name) ?? false;
+                const options =
+                  field.oneOf ??
+                  field.enum?.map((item, index) => ({
+                    const: item,
+                    title: field.enumNames?.[index],
+                  }));
+                const arrayOptions =
+                  field.items?.anyOf ??
+                  field.items?.enum?.map((item) => ({
+                    const: item,
+                    title: item,
+                  }));
+                const fieldId = `elicitation-${request.requestId}-${encodeURIComponent(name)}`;
+                return (
+                  <label key={name} htmlFor={fieldId}>
+                    {field.title ?? name}
+                    {required ? " (required)" : ""}
+                    {field.description && <small>{field.description}</small>}
+                    {field.type === "boolean" ? (
+                      <select
+                        id={fieldId}
+                        data-ui-action="inspect_details"
+                        disabled={busy}
+                        required={required}
+                        value={value === undefined ? "" : String(value)}
+                        onChange={(event) =>
+                          set(
+                            name,
+                            event.target.value === ""
+                              ? undefined
+                              : event.target.value === "true",
+                          )
+                        }
+                      >
+                        <option value="">Choose</option>
+                        <option value="true">Yes</option>
+                        <option value="false">No</option>
+                      </select>
+                    ) : field.type === "array" ? (
+                      <select
+                        id={fieldId}
+                        multiple
+                        data-ui-action="inspect_details"
+                        disabled={busy}
+                        required={required && (field.minItems ?? 0) > 0}
+                        value={
+                          Array.isArray(value)
+                            ? value.filter(
+                                (item): item is string =>
+                                  typeof item === "string",
+                              )
+                            : []
+                        }
+                        onChange={(event) =>
+                          set(
+                            name,
+                            Array.from(
+                              event.target.selectedOptions,
+                              (option) => option.value,
+                            ),
+                          )
+                        }
+                      >
+                        {arrayOptions?.map((option) => (
+                          <option key={option.const} value={option.const}>
+                            {option.title ?? option.const}
+                          </option>
+                        ))}
+                      </select>
+                    ) : options ? (
+                      <select
+                        id={fieldId}
+                        data-ui-action="inspect_details"
+                        disabled={busy}
+                        required={required}
+                        value={
+                          typeof value === "string" ? JSON.stringify(value) : ""
+                        }
+                        onChange={(event) =>
+                          set(
+                            name,
+                            event.target.value === ""
+                              ? undefined
+                              : JSON.parse(event.target.value),
+                          )
+                        }
+                      >
+                        <option value="">Choose</option>
+                        {options.map((option) => (
+                          <option
+                            key={option.const}
+                            value={JSON.stringify(option.const)}
+                          >
+                            {option.title ?? option.const}
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      <input
+                        id={fieldId}
+                        data-ui-action="inspect_details"
+                        disabled={busy}
+                        required={
+                          required &&
+                          (field.type !== "string" ||
+                            (field.minLength ?? 0) > 0)
+                        }
+                        type={
+                          field.type === "number" || field.type === "integer"
+                            ? "number"
+                            : field.format === "email"
+                              ? "email"
+                              : field.format === "date"
+                                ? "date"
+                                : "text"
+                        }
+                        step={field.type === "integer" ? 1 : "any"}
+                        min={field.minimum}
+                        max={field.maximum}
+                        minLength={field.minLength}
+                        maxLength={field.maxLength}
+                        value={
+                          typeof value === "string" || typeof value === "number"
+                            ? value
+                            : ""
+                        }
+                        onChange={(event) => {
+                          const text = event.target.value;
+                          set(
+                            name,
+                            field.type === "number" || field.type === "integer"
+                              ? text === ""
+                                ? undefined
+                                : Number(text)
+                              : text,
+                          );
+                        }}
+                      />
+                    )}
+                  </label>
+                );
+              },
+            )}
+          </form>
+        )}
+        <div className="row">
+          <button
+            data-ui-action="workspace_permission_decide"
+            disabled={busy}
+            type={request.mode === "form" ? "submit" : "button"}
+            form={
+              request.mode === "form"
+                ? `elicitation-${request.requestId}`
+                : undefined
+            }
+            onClick={
+              request.mode === "url"
+                ? () => {
+                    void respond("accept");
+                  }
+                : undefined
+            }
+          >
+            {request.mode === "url" ? "Open in browser" : "Submit response"}
+          </button>
+          <button
+            type="button"
+            className="quiet"
+            data-ui-action="workspace_permission_decide"
+            disabled={busy}
+            onClick={() => {
+              void respond("decline");
+            }}
+          >
+            Decline
+          </button>
+          <button
+            type="button"
+            className="quiet"
+            data-ui-action="workspace_permission_decide"
+            disabled={busy}
+            onClick={() => {
+              void respond("cancel");
+            }}
+          >
+            Cancel request
+          </button>
+        </div>
+        {problem && <InlineFailure problem={problem} />}
+      </div>
+    </>
+  );
+}
+
 type Feature<T> =
   | { state: "available"; data: T }
   | { state: "unavailable"; problem: Problem };
@@ -60,6 +378,7 @@ export function CopilotExtensionsPanel({ cwd }: { cwd: string }) {
   const [taskPrompt, setTaskPrompt] = useState("");
   const [problem, setProblem] = useState<Problem | null>(null);
   const [busy, setBusy] = useState(false);
+  const mismatchedFolder = snapshot !== null && snapshot.cwd !== cwd;
 
   useEffect(() => {
     let active = true;
@@ -79,7 +398,18 @@ export function CopilotExtensionsPanel({ cwd }: { cwd: string }) {
   }, []);
 
   async function run(action: ExtensionAction, keepOpen = true) {
-    if (busy) return;
+    if (busy) return false;
+    if (
+      mismatchedFolder &&
+      ["start-task", "start-fleet", "set-plugin-enabled"].includes(
+        String(action.kind),
+      )
+    ) {
+      setProblem({
+        said: "The background workspace belongs to a different folder. Disconnect it and connect the selected folder before starting new work.",
+      });
+      return false;
+    }
     setBusy(true);
     setProblem(null);
     try {
@@ -89,18 +419,19 @@ export function CopilotExtensionsPanel({ cwd }: { cwd: string }) {
       );
       if (!keepOpen) {
         setSnapshot(null);
-        return;
+        return true;
       }
       if (!value) {
         setSnapshot(null);
         setProblem({ said: "The SDK workspace is no longer connected." });
-        return;
+        return false;
       }
       setSnapshot(value);
       setMemoryEnabled(value.memoryEnabled);
       const agents =
         value.agents.state === "available" ? value.agents.data : [];
       if (!taskAgent && agents[0]) setTaskAgent(agents[0].id);
+      return true;
     } catch (error) {
       setProblem(asProblem(error));
       // Some failed operations retire the owned SDK client. Don't leave a
@@ -110,10 +441,15 @@ export function CopilotExtensionsPanel({ cwd }: { cwd: string }) {
           setSnapshot(
             await invoke<ExtensionSnapshot | null>("copilot_extensions_status"),
           );
-        } catch {
+        } catch (statusError) {
           setSnapshot(null);
+          setProblem({
+            said: asProblem(error).said,
+            detail: `The workspace status could not be refreshed: ${asProblem(statusError).said}`,
+          });
         }
       }
+      return false;
     } finally {
       setBusy(false);
     }
@@ -237,7 +573,7 @@ export function CopilotExtensionsPanel({ cwd }: { cwd: string }) {
                       data-ui-action="sdk_select_task_agent"
                       value={taskAgent}
                       onChange={(event) => setTaskAgent(event.target.value)}
-                      disabled={busy || agents.length === 0}
+                      disabled={busy || mismatchedFolder || agents.length === 0}
                       aria-label="Background agent"
                     >
                       <option value="">Choose an agent</option>
@@ -250,6 +586,7 @@ export function CopilotExtensionsPanel({ cwd }: { cwd: string }) {
                     <input
                       data-ui-action="sdk_set_task_name"
                       value={taskName}
+                      disabled={busy}
                       onChange={(event) => setTaskName(event.target.value)}
                       placeholder="Task name"
                       maxLength={128}
@@ -257,6 +594,7 @@ export function CopilotExtensionsPanel({ cwd }: { cwd: string }) {
                     <textarea
                       data-ui-action="sdk_set_task_prompt"
                       value={taskPrompt}
+                      disabled={busy}
                       onChange={(event) => setTaskPrompt(event.target.value)}
                       placeholder="Task prompt"
                       maxLength={16000}
@@ -265,19 +603,22 @@ export function CopilotExtensionsPanel({ cwd }: { cwd: string }) {
                     <button
                       type="button"
                       data-ui-action="sdk_start_task"
-                      onClick={() => {
-                        void run({
+                      onClick={async () => {
+                        const started = await run({
                           kind: "start-task",
                           connectionId: snapshot.connectionId,
                           agentId: taskAgent,
                           name: taskName,
                           prompt: taskPrompt,
                         });
-                        setTaskName("");
-                        setTaskPrompt("");
+                        if (started) {
+                          setTaskName("");
+                          setTaskPrompt("");
+                        }
                       }}
                       disabled={
                         busy ||
+                        mismatchedFolder ||
                         !taskAgent ||
                         !taskName.trim() ||
                         !taskPrompt.trim()
@@ -363,7 +704,7 @@ export function CopilotExtensionsPanel({ cwd }: { cwd: string }) {
                             enabled: !plugin.enabled,
                           })
                         }
-                        disabled={busy || !plugin.canToggle}
+                        disabled={busy || mismatchedFolder || !plugin.canToggle}
                       >
                         {plugin.enabled ? "Disable" : "Enable"}
                       </button>
@@ -389,7 +730,15 @@ export function CopilotExtensionsPanel({ cwd }: { cwd: string }) {
           )}
         </>
       )}
-      {problem && <InlineFailure problem={problem} />}
+      {(problem || mismatchedFolder) && (
+        <InlineFailure
+          problem={
+            problem ?? {
+              said: "The background workspace belongs to a different folder. Disconnect it and connect the selected folder before starting new work.",
+            }
+          }
+        />
+      )}
     </section>
   );
 }

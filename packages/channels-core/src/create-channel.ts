@@ -1086,8 +1086,13 @@ export function createChannel<
             dispatchedValue = await registry!.dispatch(evt.id, ctx);
           }
         } catch (err) {
-          // v1: swallow expired-action dispatches; surface anything else.
-          if (!(err instanceof ActionExpiredError)) throw err;
+          if (
+            !(err instanceof ActionExpiredError) ||
+            evt.requireAcknowledgement
+          )
+            throw err;
+          // An expired action must never resolve another live choice waiter.
+          return;
         }
         // Resolve any HITL waiter awaiting a choice in this conversation. Prefer
         // the value carried in the event (Slack), falling back to the value the

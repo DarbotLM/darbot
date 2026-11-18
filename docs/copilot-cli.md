@@ -10,11 +10,47 @@ The integration targets:
 
 - GitHub Copilot CLI `1.0.86-0` or newer;
 - Agent Client Protocol (ACP) v1 as the stable interactive contract;
-- GitHub Copilot SDK protocol v3 as an optional extended capability surface;
+- GitHub Copilot SDK protocol v4 as the vendor-specific extended capability surface;
 - the user's existing Copilot home, normally `~/.copilot`;
 - the authentication state already managed by Copilot CLI.
 
 ACP v2 is currently a draft and is not a release baseline.
+
+### Protocol implementation requirements
+
+ACP is the desktop conversation protocol, not an optional substitute for an SDK.
+The specification permits a client to omit terminal, filesystem and elicitation
+capabilities. That wire-level permission does not complete Darbot's product work.
+Returning an unsupported-method error proves only the error path.
+
+The implementation targets ACP wire version 1 and its
+[published 1.33.0 schema](https://github.com/agentclientprotocol/agent-client-protocol/tree/50672b4ce6563a90dd0e4a82a2d3a398dc1181ee/schema/v1),
+[Agent Plugins 1.0.0](https://github.com/agentplugins/agent-plugins-spec/blob/6395e8906b30e2f333b792bfaa981d790993d56f/spec/1.0.0.md),
+and the separately versioned
+[Microsoft Activity Protocol](https://github.com/microsoft/Agents/blob/e0f38ee2ffc609695001600149de7d2cc743310d/specs/activity/protocol-activity.md).
+These are not interchangeable with AG-UI or Copilot SDK protocol v4.
+
+Completion requires the actual success, approval, rejection, cancellation and
+cleanup paths for each implemented operation. In particular:
+
+- The ACP terminal capability covers all five methods: create, output,
+  wait-for-exit, kill and release. A released handle is invalid, while killing a
+  process retains its output and exit status until release.
+- Elicitation form and URL modes are stable ACP features, not future protocol
+  proposals. Form review and secure external URL consent need their own working
+  handlers and request ownership.
+- Agent Plugins requires a validated root manifest and usable portable skills
+  or MCP servers. An installed-plugin inventory is not a plugin loader.
+- A custom message-to-turn route or connector catalog is not a Microsoft
+  Activity host. Channel authentication, reply routing and type-specific
+  dispatch must work through the actual activity adapter.
+- Protocol activity is live runtime state. The Harvest ledger stores explicit
+  review decisions and inert references; it does not automatically collect
+  terminal output, prompts or activity payloads.
+
+No whole-protocol completion is claimed by this document. Installed-runtime
+acceptance, beyond deterministic fixtures and compilation, must identify the
+specific runtime, operation and result.
 
 ### Durable local drafts and opening recovery
 
@@ -276,9 +312,9 @@ create or connect sessions; plugin management does not install or uninstall
 plugins. Mutating SDK actions require native confirmation and do not alter the
 active ACP conversation.
 
-Terminal callbacks and elicitation/form callbacks remain future work. Copilot's
-own tools, skills and configured MCP servers run inside the CLI, subject to its
-permissions; Darbot does not claim unsupported client capabilities.
+The native ACP connection implements filesystem and terminal callbacks and
+form/URL elicitation. Copilot's own tools, skills and configured MCP servers
+continue to run inside the CLI, subject to its permissions.
 
 ## Product model
 
@@ -310,9 +346,8 @@ Authentication is owned by Copilot CLI:
 - Copilot uses the system credential store when available;
 - `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` and `GITHUB_TOKEN` remain supported by
   Copilot itself;
-- ACP advertises terminal authentication metadata;
-- Darbot launches the advertised `copilot login` flow and reconnects after it
-  exits successfully.
+- Darbot launches the explicit Copilot CLI web login and reconnects after it
+  exits successfully; this vendor login is not generic ACP terminal authentication.
 
 Darbot may inspect resource metadata returned by supported CLI or protocol
 methods. It must not parse private authentication files under `~/.copilot`.
@@ -355,7 +390,10 @@ Darbot initializes with its supported capabilities and implementation metadata:
   "params": {
     "protocolVersion": 1,
     "clientCapabilities": {
-      "auth": { "terminal": true }
+      "fs": { "readTextFile": true, "writeTextFile": true },
+      "terminal": true,
+      "elicitation": { "form": {}, "url": {} },
+      "session": { "notices": {}, "compaction": {} }
     },
     "clientInfo": {
       "name": "darbot",
@@ -369,15 +407,10 @@ Darbot initializes with its supported capabilities and implementation metadata:
 The implementation must negotiate capabilities from the response. It must not
 call optional methods unless the corresponding capability is advertised.
 
-The installed Copilot CLI currently advertises:
-
-- session creation and prompts;
-- `loadSession`;
-- `sessionCapabilities.list`;
-- `sessionCapabilities.close`;
-- HTTP and SSE MCP transports;
-- image and embedded-context prompts;
-- terminal authentication using `copilot login`.
+The peer's initialize response is authoritative for loading, resuming, listing,
+closing and deleting sessions, and for model/mode configuration. A status-only
+probe advertises no acting client callbacks. The execution connection advertises
+the implemented callbacks shown above.
 
 Session creation additionally returns select-style `configOptions` for `agent`,
 `model`, `reasoning_effort`, `mode`, and `allow_all` in the verified CLI. Selectors
@@ -394,7 +427,7 @@ Darbot keeps `allow_all` off, offers Agent/Plan modes, and refuses an Autopilot
 change that would silently enable allow-all. Resumed sessions are brought back
 to the explicit-approval policy before accepting another prompt.
 
-### Copilot SDK protocol v3 extensions
+### Copilot SDK protocol v4 extensions
 
 ACP is the portable baseline. Some Copilot-specific features are available only
 through the Copilot SDK JSON-RPC namespace, including typed access to:
@@ -409,17 +442,17 @@ through the Copilot SDK JSON-RPC namespace, including typed access to:
 - remote sessions and Copilot-specific session metadata;
 - experimental fusion APIs.
 
-Darbot should negotiate and isolate this layer behind a `CopilotExtendedClient`
-interface. The UI must continue to work when only ACP is available.
+Darbot isolates its implemented vendor RPC operations in the native SDK extension
+module. SDK version negotiation occurs before opening a background workspace;
+the separate ACP connection does not depend on SDK workspace creation.
 
-The Rust Copilot SDK currently requires Rust 1.94 and edition 2024, while the
-Darbot desktop crate declares Rust 1.77. Directly adding that crate would be an
-unrelated toolchain migration. Until Darbot intentionally raises its Rust
-minimum, the extended client should use one of these approaches:
-
-1. a small versioned bridge built from the Node SDK and packaged as a sidecar;
-2. a generated protocol-v3 client maintained from the upstream schema;
-3. a future Rust SDK release compatible with Darbot's supported toolchain.
+The desktop crate declares Rust 1.94 and directly depends on
+`copilot-sdk = 2.0.1` (imported as `github_copilot_sdk`). Its owned stdio runtime
+uses the explicitly selected installed CLI, with no bundled runtime or copied
+credentials. The SDK background connection uses the crate's typed RPC client
+and protocol-4 handshake. It is not a Node bridge or a replacement for ACP.
+SDK task, fleet, memory and plugin operations remain distinct from standard ACP
+methods.
 
 Raw, hand-maintained method strings spread through Tauri commands are not an
 acceptable implementation.
@@ -439,6 +472,16 @@ Use supported commands for resources that already have stable JSON output:
 Capture stdout and stderr separately. Copilot can emit skill validation warnings
 while producing valid JSON. Stderr becomes a non-blocking warning list; it must
 not corrupt stdout parsing.
+
+`DARBOT_AGENT_PLUGIN_DIRS` is a host launch setting listing explicitly trusted
+local plugin roots using the operating system's path-list separator. Each root
+must have a valid, contained Agent Plugins 1.0.0 `plugin.json`. Darbot does not
+fetch schemas or download plugins while loading it. The recognized directories
+are passed as separate `--plugin-dir` arguments to the real Copilot CLI loader.
+That loader owns portable skill discovery and MCP server execution; listing
+plugin metadata does not establish a successful MCP handshake or tool call.
+Do not configure an untrusted plugin: containment of its package files is not a
+sandbox for its subprocesses.
 
 Use ACP or the extended client for:
 
@@ -485,14 +528,16 @@ Required commands:
 | `copilot_pick_directory` | Native folder selection; cancellation leaves the current workspace unchanged |
 | `copilot_sessions` | Return cursor-paginated ACP session metadata |
 | `copilot_history` | Read every history page and associate sessions with bounded, read-only initial-agent metadata |
-| `copilot_login` | Run the ACP-advertised terminal authentication command, then reconnect |
+| `copilot_login` | Run the explicit Copilot CLI web login, then reconnect |
 | `copilot_session_new` | Create a session for an absolute working directory |
 | `copilot_session_load` | Load a selected session and replay updates |
 | `copilot_session_configure` | Set an advertised session option and return the complete configuration |
 | `copilot_session_prompt` | Send text (image/embedded context controls are not yet exposed) |
 | `copilot_session_cancel` | Cancel the active turn and pending permission requests |
 | `copilot_session_close` | Close active resources without deleting history |
-| `copilot_session_delete` (future) | Delete history only when advertised and explicitly confirmed |
+| `copilot_session_delete` | Delete history only when advertised and explicitly confirmed |
+| `copilot_session_set_mode` | Apply an offered Agent/Plan mode without implicitly authorizing tools |
+| `copilot_elicitation_respond` | Validate a reviewed form or URL consent against the native pending request |
 | `copilot_permission_respond` | Return the user's selected ACP permission outcome |
 
 Long-running reads belong on background threads or the async runtime. Closing
@@ -502,27 +547,38 @@ Darbot must terminate the ACP child after active requests are cancelled.
 
 Darbot advertises only capabilities it fully implements.
 
-The filesystem, terminal and elicitation designs below are not enabled in
-0.0.14. Unknown callbacks receive a method-not-found response rather than being
-silently approved.
+The execution connection owns the filesystem, terminal and elicitation handlers
+below. Unknown methods receive a protocol error; that error is not counted as
+an implemented capability.
 
 ### Filesystem
 
-`fs/read_text_file` and `fs/write_text_file` are restricted to the session's
-effective roots: the primary working directory plus negotiated additional
-directories. Paths are canonicalized before access. Writes use the existing
-Darbot confirmation and audit model.
+`fs/read_text_file` and `fs/write_text_file` are restricted to the active
+session's canonical working directory. Paths are revalidated after consent.
+Each native read/write requires one-shot approval and produces metadata-only
+audit records. No extra filesystem root is granted implicitly.
 
 ### Terminal
 
 ACP terminal processes use the existing no-console process wrapper and are
 tracked by terminal ID. Darbot enforces:
 
-- absolute or session-relative working directories inside allowed roots;
+- an absolute working directory inside the session root, defaulting to that root;
 - separate stdout and stderr capture;
 - output byte limits at UTF-8 character boundaries;
-- specific-process kill and release;
-- explicit permission before execution unless a stored policy allows it.
+- process-tree ownership, cancellation, kill, release and shutdown cleanup;
+- explicit one-shot permission for each command, arguments and environment.
+
+`terminal/create` returns an owned ID without waiting for command completion.
+`terminal/output` returns a bounded snapshot. `terminal/wait_for_exit` does not
+block the ACP reader. `terminal/kill` preserves the handle and final output;
+`terminal/release` disposes it and invalidates the handle. These are command
+terminals with closed stdin, not an interactive shell UI.
+
+Native output events retain their session and terminal identity in the existing
+CLI activity view. Tool-call references follow the same output while it runs and
+retain the final displayed snapshot after release. Terminal control sequences are
+neutralized and output is not written to Harvest or conversation preferences.
 
 ### Permissions and elicitation
 
@@ -534,6 +590,33 @@ a turn returns the ACP `cancelled` outcome for every pending permission request.
 
 Structured elicitation maps to the existing form/dialog primitives. URL
 elicitation opens only after URL validation and user confirmation.
+
+Forms validate submitted values against the original native schema, not a schema
+returned by the renderer. Pattern constraints use a native ECMAScript engine in
+a time-bounded worker process. URLs are shown in full and opened only in the
+system browser after explicit acceptance; acceptance is not evidence that an
+external login completed. Cancelled or ended session/request scopes cannot be
+answered later.
+
+The `protocol-audit` store under local app data contains hashed scope identifiers,
+operation/outcome enums, sequence numbers and timestamps. Its retention limit is
+1024 rows per scope with persisted eviction counts. Commands, form contents,
+tokens, URLs, prompts and terminal output are not audit fields. A failed
+pre-action audit write blocks the action.
+
+### Microsoft Activity adapter
+
+The Teams channel uses the Microsoft Agents SDK for transport and authentication.
+Message creation, edits/deletes, reactions, conversation/installation welcomes
+and Adaptive Card Action.Execute dispatch use the channel's existing handlers.
+Invoke requests wait for the actual interaction result and return an SDK invoke
+response; an expired action is an error, not a successful acknowledgement.
+Anonymous development listeners bind only to loopback.
+
+This channel profile is not a generic implementation of every Microsoft channel
+API. Unsupported invoke names/commands are explicit protocol errors; ignored
+typing/unknown notification types are not advertised as executed application
+features. Real tenant delivery requires the deployment's own credentials.
 
 ## Frontend
 
@@ -616,7 +699,7 @@ status.
    - initial personal-agent discovery and authoritative ACP agent selection;
    - new, list, load, prompt, stream, cancel and close;
    - model/reasoning configuration and permission UI;
-   - future elicitation, filesystem and terminal callbacks.
+   - native elicitation, filesystem and terminal callbacks.
 3. **Copilot-specific extensions**
    - tasks, fleet, factories, memory management and remote-session extensions;
    - plugin reload and detailed MCP management;

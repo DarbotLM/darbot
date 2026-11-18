@@ -4,8 +4,8 @@ import type { FileDeliveryConfig } from "./download-files.js";
 
 /**
  * Stable per-conversation key. Teams gives every conversation (1:1 chat, group
- * chat, or channel) a durable `conversation.id`, which is exactly the grain we
- * want: one agent session per conversation.
+ * chat, or channel) a durable `conversation.id`. Keys also include channel and
+ * tenant, so identical conversation ids from separate tenants cannot collide.
  */
 export type ConversationKey = string;
 

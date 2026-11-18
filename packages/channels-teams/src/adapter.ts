@@ -1,9 +1,14 @@
+import { createHash } from "node:crypto";
 import {
   CloudAdapter,
   CardFactory,
   MessageFactory,
 } from "@microsoft/agents-hosting";
-import type { AuthConfiguration, TurnContext } from "@microsoft/agents-hosting";
+import type {
+  AuthConfiguration,
+  TurnContext,
+  InvokeResponse,
+} from "@microsoft/agents-hosting";
 import { ActivityTypes, Activity } from "@microsoft/agents-activity";
 import type {
   PlatformAdapter,
@@ -25,6 +30,7 @@ import type {
 } from "@darbotlm/channels-ui";
 import type { ConversationReference } from "@microsoft/agents-activity";
 import { TeamsConversationStore } from "./conversation-store.js";
+import type { TeamsUserRevision } from "./conversation-store.js";
 import { buildFileContentParts } from "./download-files.js";
 import type { TeamsAttachmentRef } from "./download-files.js";
 import { buildChannelFileContentParts } from "./graph-files.js";
@@ -69,7 +75,9 @@ interface TeamsMessageRef extends MessageRef {
  * Adaptive Card `Action.Submit` clicks arrive as Message activities carrying
  * the action `data` in `activity.value`; those are decoded and routed to
  * `sink.onInteraction` to resolve the waiter. This path needs no Microsoft
- * credentials in the local M365 Agents Playground.
+ * credentials in the local M365 Agents Playground. `Action.Execute` instead
+ * arrives as `invoke/adaptiveCard/action`; it awaits the interaction and returns
+ * an SDK InvokeResponse on the authenticated inbound turn.
  */
 export class TeamsAdapter implements PlatformAdapter {
   readonly platform = "teams";
@@ -81,10 +89,11 @@ export class TeamsAdapter implements PlatformAdapter {
   private readonly store = new TeamsConversationStore();
   private cloud: CloudAdapter | undefined;
   private server: TeamsServer | undefined;
-  private sink: IngressSink | undefined;
+  private readonly detachedRuns = new Set<Promise<void>>();
 
   constructor(private readonly opts: TeamsAdapterOptions = {}) {
     this.capabilities = {
+      supportsMessageEvents: true,
       supportsModals: false,
       supportsTyping: true,
       supportsReactions: false,
@@ -95,8 +104,6 @@ export class TeamsAdapter implements PlatformAdapter {
   }
 
   async start(sink: IngressSink): Promise<void> {
-    this.sink = sink;
-
     const authConfig: AuthConfiguration = {
       clientId: this.opts.clientId ?? process.env.clientId,
       clientSecret: this.opts.clientSecret ?? process.env.clientSecret,
@@ -107,12 +114,21 @@ export class TeamsAdapter implements PlatformAdapter {
     // adapter rethrows (e.g. a Bot Connector 401 surfaces as "Unknown error
     // type"), which becomes an unhandled rejection and crashes the process,
     // turning one bad turn into a service-wide outage + restart loop.
-    this.cloud.onTurnError = async (_context, error) => {
+    this.cloud.onTurnError = async (context, error) => {
       console.error("[bot-teams] turn error:", error);
+      if (context.activity.type === ActivityTypes.Invoke) {
+        await this.sendInvokeResponse(
+          context,
+          this.invokeError(500, "InternalServerError", "Interaction failed."),
+        );
+      } else {
+        throw error;
+      }
     };
 
     this.server = createTeamsServer({
       adapter: this.cloud,
+      authConfig,
       port: this.opts.port ?? 3978,
       onTurnContext: (context) => this.handleActivity(context, sink),
     });
@@ -121,35 +137,49 @@ export class TeamsAdapter implements PlatformAdapter {
 
   async stop(): Promise<void> {
     await this.server?.stop();
+    await Promise.allSettled(this.detachedRuns);
   }
 
   /**
-   * Normalize an inbound activity, ack the HTTP turn immediately, and drive the
-   * work into the engine on a **detached** `continueConversation` so it can
-   * outlive this turn (HITL suspends the run until a later click).
+   * Normalize inbound activities. Messages and edits may detach for HITL;
+   * invokes and notifications complete their operation before the HTTP ack.
    */
   private async handleActivity(
     context: TurnContext,
     sink: IngressSink,
   ): Promise<void> {
     const activity = context.activity;
-    if (activity.type !== ActivityTypes.Message) return;
+    if (activity.type === ActivityTypes.Invoke) {
+      await this.handleInvoke(context, sink);
+      return;
+    }
+    if (
+      activity.type !== ActivityTypes.Message &&
+      activity.type !== ActivityTypes.MessageUpdate
+    ) {
+      await this.handleNotification(context, sink);
+      return;
+    }
 
-    const conversationKey = conversationKeyOf(activity);
+    this.validateIdentity(activity);
+    const conversationKey = this.conversationKey(activity);
     const reference = activity.getConversationReference();
     const actor = this.actorFrom(activity);
     const identityContext = this.identityContext(
       activity,
       conversationKey,
       actor,
-      "message",
+      activity.type,
     );
 
     // An Adaptive Card `Action.Submit` arrives as a Message activity carrying
     // our action `data` in `value` (and no user text). Route it as an
     // interaction so the engine resolves the matching `awaitChoice` waiter and
     // runs the button's `onClick` (which edits the picker card in place).
-    const action = parseCardAction(activity);
+    const action =
+      activity.type === ActivityTypes.Message
+        ? parseCardAction(activity)
+        : undefined;
     if (action) {
       const onInteraction = (replyContext: TurnContext): Promise<void> =>
         Promise.resolve(
@@ -203,6 +233,14 @@ export class TeamsAdapter implements PlatformAdapter {
     } catch {
       text = (activity.text ?? "").trim();
     }
+    if (activity.type === ActivityTypes.MessageUpdate && !activity.id) {
+      throw new Error("Message update requires an id.");
+    }
+    const revision = this.userRevision(activity, conversationKey);
+    const token = activity.id
+      ? this.store.beginUserRevision(conversationKey, activity.id, text, revision)
+      : undefined;
+    if (activity.id && !token) return;
 
     // Uploaded files (e.g. a CSV the user wants charted) ride along as
     // attachments. Download them and hand the model multimodal content parts —
@@ -211,6 +249,7 @@ export class TeamsAdapter implements PlatformAdapter {
     // the transcript records the file's CONTENT (not just the text), letting a
     // follow-up turn ("now make it a bar chart") still act on the data.
     const drive = async (target: TeamsReplyTarget): Promise<void> => {
+      if (token && !token.isCurrent()) return;
       // Keep "…is typing" visible for the whole turn. Teams' indicator expires
       // after a few seconds, and slow work (downloading a file, rendering a
       // chart) posts nothing in the meantime, so a one-shot ping leaves dead
@@ -241,18 +280,33 @@ export class TeamsAdapter implements PlatformAdapter {
         // model this turn via the seeded history and (b) persists for later
         // turns. Store the multimodal content when present (so an uploaded CSV
         // is remembered), else the plain text.
-        this.store.recordUser(conversationKey, contentParts ?? text);
+        // No await between the token check/commit and sink dispatch: an edit or
+        // deletion during attachment resolution invalidates both operations.
+        if (token) {
+          if (!token.commit(contentParts ?? text)) return;
+        } else {
+          this.store.recordUser(conversationKey, contentParts ?? text);
+        }
         await sink.onTurn({
           conversationKey,
           replyTarget: target,
           userText: text,
           operation: {
-            kind: "created",
+            kind:
+              activity.type === ActivityTypes.MessageUpdate
+                ? "updated"
+                : "created",
             logicalMessageId: activity.id ?? conversationKey,
-            revisionId: activity.id ?? conversationKey,
+            revisionId: revision.revisionId,
             mentioned: false,
           },
           actor,
+          messageRef: {
+            id: activity.id ?? "",
+            conversationKey,
+            reference,
+            context: target.context,
+          } as TeamsMessageRef,
           identityContext,
           platform: this.platform,
           contentParts,
@@ -276,8 +330,314 @@ export class TeamsAdapter implements PlatformAdapter {
       try {
         await drive({ conversationKey, reference, context });
       } catch (err) {
+        if (activity.type === ActivityTypes.MessageUpdate) throw err;
         console.error("[bot-teams] in-turn run failed:", err);
       }
+    }
+  }
+
+  private conversationKey(activity: Activity): string {
+    return conversationKeyOf(
+      activity,
+      this.opts.tenantId ?? process.env.tenantId ?? "unknown",
+    );
+  }
+
+  private validateIdentity(activity: Activity): void {
+    if (!activity.conversation?.id || !activity.from?.id) {
+      throw new Error("Activity requires conversation and sender identifiers.");
+    }
+    const tenant = activity.conversation.tenantId;
+    const channelTenant = activity.channelData?.tenant?.id;
+    if (tenant && channelTenant && tenant !== channelTenant) {
+      throw new Error("Conflicting tenant identifiers.");
+    }
+  }
+
+  private userRevision(activity: Activity, fallback: string): TeamsUserRevision {
+    const parsed = activity.timestamp
+      ? new Date(activity.timestamp).getTime()
+      : NaN;
+    const timestamp = Number.isFinite(parsed) ? parsed : undefined;
+    // Undated edits have no provider sequence. A content fingerprint identifies
+    // exact redelivery, never orders revisions or exposes file URLs in IDs.
+    const identity =
+      timestamp ??
+      createHash("sha256")
+        .update(JSON.stringify([activity.text ?? "", activity.attachments ?? []]))
+        .digest("hex");
+    return {
+      kind:
+        activity.type === ActivityTypes.MessageDelete
+          ? "deleted"
+          : activity.type === ActivityTypes.MessageUpdate
+            ? "updated"
+            : "created",
+      revisionId: JSON.stringify([
+        activity.id ?? fallback,
+        activity.type,
+        identity,
+      ]),
+      timestamp,
+    };
+  }
+
+  private invokeError(
+    status: number,
+    code: string,
+    message: string,
+  ): InvokeResponse {
+    return {
+      status,
+      body: {
+        statusCode: status,
+        type: "application/vnd.microsoft.error",
+        value: { code, message },
+      },
+    };
+  }
+
+  private async sendInvokeResponse(
+    context: TurnContext,
+    response: InvokeResponse,
+  ): Promise<void> {
+    await context.sendActivity(
+      Activity.fromObject({
+        type: ActivityTypes.InvokeResponse,
+        value: response,
+      }),
+    );
+  }
+
+  private async handleInvoke(
+    context: TurnContext,
+    sink: IngressSink,
+  ): Promise<void> {
+    const activity = context.activity;
+    let response: InvokeResponse;
+    if (activity.name !== "adaptiveCard/action") {
+      response = this.invokeError(
+        501,
+        "NotSupported",
+        "Invoke name is not supported.",
+      );
+    } else {
+      try {
+        this.validateIdentity(activity);
+      } catch {
+        await this.sendInvokeResponse(
+          context,
+          this.invokeError(400, "BadRequest", "Invalid activity identity."),
+        );
+        return;
+      }
+      const action = parseCardAction(activity);
+      const invokeValue = activity.value as
+        | { action?: { type?: unknown } }
+        | undefined;
+      if (invokeValue?.action?.type !== "Action.Execute" || !action) {
+        response = this.invokeError(
+          400,
+          "BadRequest",
+          "Expected Action.Execute with ckActionId.",
+        );
+      } else {
+        const conversationKey = this.conversationKey(activity);
+        const reference = activity.getConversationReference();
+        const actor = this.actorFrom(activity);
+        try {
+          // Invoke is synchronous. Do not detach, acknowledge early, or replace
+          // the originating sender with a proactive bot identity.
+          await sink.onInteraction({
+            ...action,
+            requireAcknowledgement: true,
+            conversationKey,
+            actor,
+            platform: this.platform,
+            identityContext: this.identityContext(
+              activity,
+              conversationKey,
+              actor,
+              "interaction",
+            ),
+            replyTarget: {
+              conversationKey,
+              reference,
+              context,
+            } satisfies TeamsReplyTarget,
+            messageRef: {
+              id: activity.replyToId ?? "",
+              conversationKey,
+              reference,
+              context,
+            } as TeamsMessageRef,
+          });
+          response = {
+            status: 200,
+            body: {
+              statusCode: 200,
+              type: "application/vnd.microsoft.activity.message",
+              value: "Action processed.",
+            },
+          };
+        } catch (error) {
+          const expired =
+            error !== null &&
+            typeof error === "object" &&
+            "code" in error &&
+            error.code === "channel_action_expired";
+          console.error(
+            "[bot-teams] invoke interaction failed:",
+            expired ? "expired-action" : "handler-failure",
+          );
+          response = this.invokeError(
+            expired ? 410 : 500,
+            expired ? "ActionExpired" : "InternalServerError",
+            expired
+              ? "This action has expired. Request a new card."
+              : "Interaction failed.",
+          );
+        }
+      }
+    }
+    await this.sendInvokeResponse(context, response);
+  }
+
+  private async handleNotification(
+    context: TurnContext,
+    sink: IngressSink,
+  ): Promise<void> {
+    const activity = context.activity;
+    switch (activity.type) {
+      case ActivityTypes.MessageDelete:
+      case ActivityTypes.MessageReaction:
+      case ActivityTypes.ConversationUpdate:
+      case ActivityTypes.InstallationUpdate:
+      case ActivityTypes.Command:
+        break;
+      // No UI or application event contract exists for typing or named events.
+      // Unknown activities/events are intentionally ignored (A2014/A5002).
+      default:
+        return;
+    }
+    this.validateIdentity(activity);
+    const conversationKey = this.conversationKey(activity);
+    const reference = activity.getConversationReference();
+    const actor = this.actorFrom(activity);
+    const base = {
+      conversationKey,
+      actor,
+      platform: this.platform,
+      identityContext: this.identityContext(
+        activity,
+        conversationKey,
+        actor,
+        activity.type,
+      ),
+      replyTarget: {
+        conversationKey,
+        reference,
+        context,
+      } satisfies TeamsReplyTarget,
+    };
+    if (activity.type === ActivityTypes.MessageDelete) {
+      if (!activity.id) throw new Error("Message delete requires an id.");
+      const revision = this.userRevision(activity, conversationKey);
+      if (!this.store.deleteUser(conversationKey, activity.id, revision)) return;
+      await sink.onTurn({
+        ...base,
+        userText: "",
+        operation: {
+          kind: "deleted",
+          logicalMessageId: activity.id,
+          revisionId: revision.revisionId,
+          mentioned: false,
+        },
+        messageRef: {
+          id: activity.id,
+          conversationKey,
+          reference,
+          context,
+        } as TeamsMessageRef,
+      });
+    } else if (activity.type === ActivityTypes.MessageReaction) {
+      // Teams supplies replyToId; generic Activity notifications use id.
+      const messageId = activity.replyToId ?? activity.id;
+      if (!messageId) throw new Error("Message reaction requires a target id.");
+      for (const [reactions, added] of [
+        [activity.reactionsAdded, true],
+        [activity.reactionsRemoved, false],
+      ] as const) {
+        for (const reaction of reactions ?? []) {
+          if (!reaction.type) continue;
+          await sink.onReaction({
+            ...base,
+            rawEmoji: reaction.type,
+            added,
+            messageId,
+            raw: activity,
+            messageRef: {
+              id: messageId,
+              conversationKey,
+              reference,
+              context,
+            } as TeamsMessageRef,
+          });
+        }
+      }
+    } else if (activity.type === ActivityTypes.InstallationUpdate) {
+      if (activity.action === "add" || activity.action === "add-upgrade")
+        await sink.onWelcome(base);
+      else if (activity.action === "remove") this.store.clear(conversationKey);
+    } else if (activity.type === ActivityTypes.ConversationUpdate) {
+      const botId = activity.recipient?.id;
+      if (
+        botId &&
+        activity.membersRemoved?.some((member) => member.id === botId)
+      ) {
+        this.store.clear(conversationKey);
+      } else if (
+        botId &&
+        activity.membersAdded?.some((member) => member.id === botId)
+      ) {
+        await sink.onWelcome(base);
+      }
+    } else {
+      // Activity commands are not slash commands. No command protocol is
+      // registered here, so reject rather than report a fictitious success.
+      const name = activity.name;
+      const value = activity.value as Record<string, unknown> | undefined;
+      const sessionCommand =
+        name === "session.init" ||
+        name === "session.update" ||
+        name === "session.end";
+      if (
+        !name ||
+        (!sessionCommand &&
+          !/^[\w!#$%&'*+.^`|~-]+\/[\w!#$%&'*+.^`|~-]+$/.test(name)) ||
+        !value ||
+        typeof value !== "object" ||
+        Array.isArray(value) ||
+        (value.commandId !== undefined && typeof value.commandId !== "string")
+      )
+        return;
+      await context.sendActivity(
+        Activity.fromObject({
+          type: ActivityTypes.CommandResult,
+          name,
+          replyToId: activity.id,
+          value: {
+            ...(sessionCommand ? { status: "error" } : {}),
+            ...(typeof value.commandId === "string"
+              ? { commandId: value.commandId }
+              : {}),
+            error: {
+              code: "NotSupported",
+              message: "Command is not supported.",
+            },
+          },
+        }),
+      );
     }
   }
 
@@ -379,9 +739,11 @@ export class TeamsAdapter implements PlatformAdapter {
     reference: Partial<ConversationReference>,
     fn: (context: TurnContext) => Promise<void>,
   ): void {
-    void this.withProactive(reference, fn).catch((err) => {
+    const run = this.withProactive(reference, fn).catch((err) => {
       console.error("[bot-teams] detached turn failed:", err);
     });
+    this.detachedRuns.add(run);
+    void run.finally(() => this.detachedRuns.delete(run));
   }
 
   /** Open a proactive `TurnContext` for the conversation and await `fn`. */
@@ -542,16 +904,18 @@ export class TeamsAdapter implements PlatformAdapter {
   }
 
   decodeInteraction(raw: unknown): InteractionEvent | undefined {
+    if (!raw || typeof raw !== "object") return undefined;
     const activity = raw as Activity;
     const action = parseCardAction(activity);
     if (!action) return undefined;
-    const conversationKey = conversationKeyOf(activity);
+    const conversationKey = this.conversationKey(activity);
     const reference = activity.getConversationReference?.();
     const actor = this.actorFrom(activity);
     return {
       id: action.id,
       conversationKey,
       value: action.value,
+      values: action.values,
       actor,
       identityContext: this.identityContext(
         activity,
@@ -617,6 +981,7 @@ export class TeamsAdapter implements PlatformAdapter {
           value.conversation?.tenantId ??
           value.channelData?.tenant?.id ??
           this.opts.tenantId ??
+          process.env.tenantId ??
           "unknown",
       },
       installation: {

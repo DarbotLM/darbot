@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+## 0.0.23
+
+- Implement the native ACP terminal lifecycle: create, bounded output,
+  wait-for-exit, kill and release, with process ownership and cancellation.
+- Add reviewed form and external-URL elicitation through the existing consent
+  dialog, scoped to native requests and validated before responding.
+- Retain terminal/tool metadata, live plan updates, message identities and
+  compaction updates without persisting their contents in Harvest.
+- Add durable metadata-only protocol audit records and retry failed draft
+  feedback promotion without losing the recorded conversation.
+- Pass explicitly configured Agent Plugins 1.0 directories to the actual ACP
+  and SDK runtime loaders after root-manifest validation.
+- Handle Microsoft Activity edits, deletes, reactions and Adaptive Card invokes
+  through the authenticated Teams adapter rather than silently dropping them.
+- Move the native extension client to the official Copilot SDK 2.0.1 and SDK
+  protocol 4, preserving installed-CLI authentication and native permission review.
+
+## 0.0.22
+
 - Persist desktop Harvest decisions and validated flashcard
   references per agent in Darbot's app data. Keep the original WebView ledger
   during migration, and report storage errors without replacing existing data.

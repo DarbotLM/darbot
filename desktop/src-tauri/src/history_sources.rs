@@ -1489,7 +1489,7 @@ impl Pool {
     }
 }
 
-/// Darbot-owned curation only. None of the archive census paths above are write targets.
+/// Darbot-owned curation and metadata audit. Archive census paths are never write targets.
 pub mod ledger {
     use crate::problem::Problem;
     use serde::{Deserialize, Deserializer, Serialize};
@@ -1508,6 +1508,192 @@ pub mod ledger {
     const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
     // A single gate also covers aliases of the same app directory, without an unbounded lock map.
     static STORE: OnceLock<Mutex<()>> = OnceLock::new();
+
+    /// Schema v1 keeps the newest 1024 events per runtime/session scope in one atomic file.
+    /// `droppedRecords` counts evicted events; each event's `droppedBefore` records the
+    /// cumulative eviction count at its commit. Sequence numbers never restart on eviction.
+    pub const PROTOCOL_AUDIT_MAX_RECORDS: usize = 1024;
+    const PROTOCOL_AUDIT_SCHEMA: &str = "darbot.protocol-audit";
+
+    /// Closed vocabulary: never add payloads, commands, paths, prompts, or error strings.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum ProtocolOperation {
+        TerminalCreate,
+        TerminalOutput,
+        TerminalWait,
+        TerminalKill,
+        TerminalRelease,
+        FileRead,
+        FileWrite,
+        Permission,
+        Elicitation,
+        Prompt,
+        SessionClose,
+        PluginLoad,
+        Lifecycle,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum AuditOutcome {
+        Requested,
+        Approved,
+        Rejected,
+        Cancelled,
+        Succeeded,
+        Failed,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct ProtocolAuditRecord {
+        sequence: u64,
+        timestamp_unix_ms: u64,
+        operation: ProtocolOperation,
+        outcome: AuditOutcome,
+        dropped_before: u64,
+    }
+
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct ProtocolAudit {
+        schema: String,
+        version: u8,
+        runtime_hash: String,
+        #[serde(deserialize_with = "nullable")]
+        session_hash: Option<String>,
+        max_records: usize,
+        total_records: u64,
+        dropped_records: u64,
+        records: Vec<ProtocolAuditRecord>,
+    }
+
+    fn invalid_audit() -> Problem {
+        Problem::plain("Invalid or unsupported protocol audit. Existing data was kept.")
+    }
+
+    fn audit_storage_problem() -> Problem {
+        Problem::plain(
+            "Protocol audit could not be durably recorded. Inspect app-local storage before retrying.",
+        )
+    }
+
+    fn audit_identity(value: &str) -> Result<String, Problem> {
+        if value.trim().is_empty() || value.len() > 4096 || value.chars().any(char::is_control) {
+            return Err(Problem::plain("Invalid protocol audit identity."));
+        }
+        Ok(format!("{:x}", Sha256::digest(value.as_bytes())))
+    }
+
+    fn audit_filename(runtime_hash: &str, session_hash: Option<&str>) -> String {
+        // Fixed-width runtime digest plus an explicit optional-session discriminator.
+        let scope = format!("{runtime_hash}:{}", session_hash.unwrap_or("none"));
+        format!("{:x}.json", Sha256::digest(scope.as_bytes()))
+    }
+
+    impl ProtocolAudit {
+        fn parse(
+            raw: &str,
+            runtime_hash: &str,
+            session_hash: Option<&str>,
+        ) -> Result<Self, Problem> {
+            let audit: Self = serde_json::from_str(raw).map_err(|_| invalid_audit())?;
+            if audit.schema != PROTOCOL_AUDIT_SCHEMA
+                || audit.version != 1
+                || audit.runtime_hash != runtime_hash
+                || audit.session_hash.as_deref() != session_hash
+                || audit.max_records != PROTOCOL_AUDIT_MAX_RECORDS
+                || audit.total_records == 0
+                || audit.total_records > MAX_SAFE_INTEGER
+                || audit.records.len()
+                    != audit.total_records.min(PROTOCOL_AUDIT_MAX_RECORDS as u64) as usize
+                || audit.dropped_records
+                    != audit
+                        .total_records
+                        .saturating_sub(PROTOCOL_AUDIT_MAX_RECORDS as u64)
+            {
+                return Err(invalid_audit());
+            }
+            for (index, record) in audit.records.iter().enumerate() {
+                if record.sequence != audit.dropped_records + index as u64 + 1
+                    || record.timestamp_unix_ms > MAX_SAFE_INTEGER
+                    || record.dropped_before
+                        != record
+                            .sequence
+                            .saturating_sub(PROTOCOL_AUDIT_MAX_RECORDS as u64)
+                {
+                    return Err(invalid_audit());
+                }
+            }
+            Ok(audit)
+        }
+    }
+
+    /// Persist one metadata-only event under Darbot's app-local-data `protocol-audit` child.
+    /// `app_root` MUST come from the native app-local-data resolver, never IPC or archive paths.
+    /// Only SHA-256 identity digests, closed enums, counters and timestamps reach disk.
+    /// Calls in this process are serialized (including aliased roots); existing filesystem
+    /// guards reject links and nonlocal storage. Success means the atomic replacement completed.
+    /// Record permission approval and operation completion separately: approval is not success.
+    pub fn record_protocol_audit(
+        app_root: &Path,
+        runtime_id: &str,
+        session_id: Option<&str>,
+        operation: ProtocolOperation,
+        outcome: AuditOutcome,
+    ) -> Result<(), Problem> {
+        let runtime_hash = audit_identity(runtime_id)?;
+        let session_hash = session_id.map(audit_identity).transpose()?;
+        let name = audit_filename(&runtime_hash, session_hash.as_deref());
+        let _guard = STORE
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .map_err(|_| audit_storage_problem())?;
+        let dir = owned_directory(app_root, "protocol-audit", true)
+            .map_err(|_| audit_storage_problem())?
+            .ok_or_else(audit_storage_problem)?;
+        let previous = contents(&dir, &name, true).map_err(|_| audit_storage_problem())?;
+        let mut audit = match previous.as_deref() {
+            Some(raw) => ProtocolAudit::parse(raw, &runtime_hash, session_hash.as_deref())?,
+            None => ProtocolAudit {
+                schema: PROTOCOL_AUDIT_SCHEMA.into(),
+                version: 1,
+                runtime_hash,
+                session_hash,
+                max_records: PROTOCOL_AUDIT_MAX_RECORDS,
+                total_records: 0,
+                dropped_records: 0,
+                records: Vec::new(),
+            },
+        };
+        if audit.total_records == MAX_SAFE_INTEGER {
+            return Err(Problem::plain("Protocol audit sequence limit reached."));
+        }
+        let timestamp_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok())
+            .filter(|value| *value <= MAX_SAFE_INTEGER)
+            .ok_or_else(audit_storage_problem)?;
+        audit.total_records += 1;
+        if audit.records.len() == PROTOCOL_AUDIT_MAX_RECORDS {
+            audit.records.remove(0);
+            audit.dropped_records += 1;
+        }
+        audit.records.push(ProtocolAuditRecord {
+            sequence: audit.total_records,
+            timestamp_unix_ms,
+            operation,
+            outcome,
+            dropped_before: audit.dropped_records,
+        });
+        let json = serde_json::to_string(&audit).map_err(|_| invalid_audit())?;
+        replace(&dir, &name, previous.as_deref(), |file| {
+            file.write_all(json.as_bytes())
+        })
+        .map_err(|_| audit_storage_problem())
+    }
 
     #[derive(Debug, Deserialize)]
     #[serde(
@@ -1985,7 +2171,33 @@ pub mod ledger {
         fn rename(&self, from: &str, to: &str) -> io::Result<()> {
             #[cfg(windows)]
             {
-                fs::rename(self.inner.path.join(from), self.inner.path.join(to))
+                use std::os::windows::ffi::OsStrExt;
+                #[link(name = "kernel32")]
+                extern "system" {
+                    fn MoveFileExW(
+                        existing: *const u16,
+                        replacement: *const u16,
+                        flags: u32,
+                    ) -> i32;
+                }
+                let directory = fs::canonicalize(&self.inner.path)?;
+                let source: Vec<u16> = directory
+                    .join(from)
+                    .as_os_str()
+                    .encode_wide()
+                    .chain(Some(0))
+                    .collect();
+                let destination: Vec<u16> = directory
+                    .join(to)
+                    .as_os_str()
+                    .encode_wide()
+                    .chain(Some(0))
+                    .collect();
+                // Replacement must be committed before an approved acting call proceeds.
+                if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0x1 | 0x8) } == 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
             }
             #[cfg(unix)]
             {
@@ -2076,14 +2288,22 @@ pub mod ledger {
         Ok(metadata)
     }
 
-    // Only the app directory itself and its Harvest child may be created. Ancestors are never
+    // Only the app directory itself and a fixed owned child may be created. Ancestors are never
     // created, followed through links, or taken from an IPC argument. Unix operations are dirfd-
     // relative; Windows ancestors stay pinned against rename/reparse substitution.
     fn directory(app_root: &Path, create: bool) -> io::Result<Option<Directory>> {
+        owned_directory(app_root, "harvest", create)
+    }
+
+    fn owned_directory(
+        app_root: &Path,
+        child: &str,
+        create: bool,
+    ) -> io::Result<Option<Directory>> {
         let parent = Directory::open(app_root.parent().ok_or_else(refused)?)?;
         let result = parent
             .child(app_root.file_name().ok_or_else(refused)?, create)
-            .and_then(|root| root.child(OsStr::new("harvest"), create));
+            .and_then(|root| root.child(OsStr::new(child), create));
         match result {
             Ok(dir) => Ok(Some(dir)),
             Err(e) if !create && e.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -2343,6 +2563,22 @@ pub mod ledger {
             fn ledger(&self) -> Ledger {
                 Ledger::parse(&read(&self.app, "agent").unwrap().unwrap()).unwrap()
             }
+
+            fn audit_path(&self, runtime: &str, session: Option<&str>) -> PathBuf {
+                self.app.join("protocol-audit").join(audit_filename(
+                    &audit_identity(runtime).unwrap(),
+                    session.map(audit_identity).transpose().unwrap().as_deref(),
+                ))
+            }
+
+            fn audit(&self, runtime: &str, session: Option<&str>) -> ProtocolAudit {
+                ProtocolAudit::parse(
+                    &fs::read_to_string(self.audit_path(runtime, session)).unwrap(),
+                    &audit_identity(runtime).unwrap(),
+                    session.map(audit_identity).transpose().unwrap().as_deref(),
+                )
+                .unwrap()
+            }
         }
 
         impl Drop for Fixture {
@@ -2356,6 +2592,386 @@ pub mod ledger {
                 row: row.into(),
                 field,
             }
+        }
+
+        #[test]
+        fn protocol_audit_reloads_durable_rows_and_distinguishes_approval_from_failure() {
+            let f = Fixture::new();
+            for (operation, outcome) in [
+                (ProtocolOperation::Permission, AuditOutcome::Approved),
+                (ProtocolOperation::FileWrite, AuditOutcome::Failed),
+            ] {
+                record_protocol_audit(&f.app, "runtime", Some("session"), operation, outcome)
+                    .unwrap();
+                // Every call reopens and validates disk state; no cached records supply the result.
+                let audit = f.audit("runtime", Some("session"));
+                assert_eq!(audit.records.last().unwrap().operation, operation);
+                assert_eq!(audit.records.last().unwrap().outcome, outcome);
+            }
+            let audit = f.audit("runtime", Some("session"));
+            assert_eq!(audit.total_records, 2);
+            assert_eq!(audit.dropped_records, 0);
+            assert_eq!(audit.records[0].sequence, 1);
+            assert_eq!(audit.records[1].sequence, 2);
+            assert!(audit.records.iter().all(|row| row.timestamp_unix_ms > 0));
+            let entries: Vec<_> = fs::read_dir(f.app.join("protocol-audit"))
+                .unwrap()
+                .collect();
+            assert_eq!(entries.len(), 1, "no staging files remain after success");
+        }
+
+        #[test]
+        #[cfg(windows)]
+        fn protocol_audit_replaces_records_beyond_windows_legacy_path_limit() {
+            let mut f = Fixture::new();
+            f.app = f.app.join("a".repeat(90)).join("b".repeat(90));
+            fs::create_dir_all(f.app.parent().unwrap()).unwrap();
+            assert!(f.audit_path("runtime", Some("session")).as_os_str().len() > 260);
+            for outcome in [AuditOutcome::Requested, AuditOutcome::Succeeded] {
+                record_protocol_audit(
+                    &f.app,
+                    "runtime",
+                    Some("session"),
+                    ProtocolOperation::TerminalCreate,
+                    outcome,
+                )
+                .unwrap();
+            }
+            let audit = f.audit("runtime", Some("session"));
+            assert_eq!(audit.total_records, 2);
+            assert_eq!(audit.records[1].outcome, AuditOutcome::Succeeded);
+        }
+
+        #[test]
+        fn protocol_audit_isolates_roots_runtime_session_and_harvest() {
+            let f = Fixture::new();
+            let other = Fixture::new();
+            f.edit(toggle("curation", DecisionField::Pinned));
+            let harvest = fs::read(f.path("agent")).unwrap();
+            for (runtime, session) in [
+                ("runtime", None),
+                ("runtime", Some("one")),
+                ("runtime", Some("two")),
+                ("another", Some("one")),
+            ] {
+                record_protocol_audit(
+                    &f.app,
+                    runtime,
+                    session,
+                    ProtocolOperation::Lifecycle,
+                    AuditOutcome::Requested,
+                )
+                .unwrap();
+                assert_eq!(f.audit(runtime, session).total_records, 1);
+            }
+            record_protocol_audit(
+                &other.app,
+                "runtime",
+                Some("one"),
+                ProtocolOperation::Prompt,
+                AuditOutcome::Cancelled,
+            )
+            .unwrap();
+            assert_eq!(
+                other.audit("runtime", Some("one")).records[0].outcome,
+                AuditOutcome::Cancelled
+            );
+            assert_eq!(
+                f.audit("runtime", Some("one")).records[0].outcome,
+                AuditOutcome::Requested
+            );
+            assert_eq!(fs::read(f.path("agent")).unwrap(), harvest);
+            assert_eq!(
+                fs::read_dir(f.app.join("protocol-audit")).unwrap().count(),
+                4
+            );
+        }
+
+        #[test]
+        fn protocol_audit_bad_identity_creates_nothing() {
+            let f = Fixture::new();
+            for value in ["", " ", "line\nbreak", "\0", &"x".repeat(4097)] {
+                assert!(record_protocol_audit(
+                    &f.app,
+                    value,
+                    None,
+                    ProtocolOperation::Lifecycle,
+                    AuditOutcome::Requested,
+                )
+                .is_err());
+                assert!(record_protocol_audit(
+                    &f.app,
+                    "runtime",
+                    Some(value),
+                    ProtocolOperation::Lifecycle,
+                    AuditOutcome::Requested,
+                )
+                .is_err());
+            }
+            assert!(!f.app.exists());
+        }
+
+        #[test]
+        fn protocol_audit_preserves_corrupt_or_unsupported_previous_bytes() {
+            let f = Fixture::new();
+            record_protocol_audit(
+                &f.app,
+                "runtime",
+                None,
+                ProtocolOperation::PluginLoad,
+                AuditOutcome::Requested,
+            )
+            .unwrap();
+            let path = f.audit_path("runtime", None);
+            let valid: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            let mut cases = vec![b"broken json".to_vec(), vec![0xff, 0xfe]];
+            for (field, value) in [
+                ("version", json!(2)),
+                ("runtimeHash", json!("wrong-scope")),
+                ("sessionHash", json!("wrong-session")),
+                ("totalRecords", json!(9)),
+                ("droppedRecords", json!(1)),
+                ("maxRecords", json!(999)),
+                ("payload", json!("MUST-NOT-BE-IMPORTED")),
+                ("records", json!([])),
+            ] {
+                let mut invalid = valid.clone();
+                invalid[field] = value;
+                cases.push(serde_json::to_vec(&invalid).unwrap());
+            }
+            for (field, value) in [
+                ("sequence", json!(2)),
+                ("droppedBefore", json!(1)),
+                ("operation", json!("execute-secret")),
+                ("outcome", json!("unknown")),
+                ("prompt", json!("MUST-NOT-BE-IMPORTED")),
+            ] {
+                let mut invalid = valid.clone();
+                invalid["records"][0][field] = value;
+                cases.push(serde_json::to_vec(&invalid).unwrap());
+            }
+            for bytes in cases {
+                fs::write(&path, &bytes).unwrap();
+                assert!(record_protocol_audit(
+                    &f.app,
+                    "runtime",
+                    None,
+                    ProtocolOperation::PluginLoad,
+                    AuditOutcome::Succeeded,
+                )
+                .is_err());
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+            }
+            assert_eq!(
+                fs::read_dir(f.app.join("protocol-audit")).unwrap().count(),
+                1
+            );
+        }
+
+        #[test]
+        fn protocol_audit_retention_is_bounded_and_eviction_is_explicit() {
+            let f = Fixture::new();
+            record_protocol_audit(
+                &f.app,
+                "runtime",
+                None,
+                ProtocolOperation::TerminalOutput,
+                AuditOutcome::Succeeded,
+            )
+            .unwrap();
+            let mut audit = f.audit("runtime", None);
+            // Seed a validated full window to exercise the exact boundary without 1024 fsyncs.
+            for sequence in 2..=PROTOCOL_AUDIT_MAX_RECORDS as u64 {
+                audit.records.push(ProtocolAuditRecord {
+                    sequence,
+                    timestamp_unix_ms: audit.records[0].timestamp_unix_ms,
+                    operation: ProtocolOperation::TerminalOutput,
+                    outcome: AuditOutcome::Succeeded,
+                    dropped_before: 0,
+                });
+            }
+            audit.total_records = PROTOCOL_AUDIT_MAX_RECORDS as u64;
+            fs::write(
+                f.audit_path("runtime", None),
+                serde_json::to_vec(&audit).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                f.audit("runtime", None).records.len(),
+                PROTOCOL_AUDIT_MAX_RECORDS
+            );
+            for _ in 0..3 {
+                record_protocol_audit(
+                    &f.app,
+                    "runtime",
+                    None,
+                    ProtocolOperation::TerminalOutput,
+                    AuditOutcome::Succeeded,
+                )
+                .unwrap();
+            }
+            let audit = f.audit("runtime", None);
+            assert_eq!(audit.records.len(), PROTOCOL_AUDIT_MAX_RECORDS);
+            assert_eq!(audit.total_records, PROTOCOL_AUDIT_MAX_RECORDS as u64 + 3);
+            assert_eq!(audit.dropped_records, 3);
+            assert_eq!(audit.records[0].sequence, 4);
+            assert_eq!(audit.records[0].dropped_before, 0);
+            assert_eq!(audit.records.last().unwrap().dropped_before, 3);
+            assert!(fs::metadata(f.audit_path("runtime", None)).unwrap().len() < 256 * 1024);
+            assert_eq!(
+                fs::read_dir(f.app.join("protocol-audit")).unwrap().count(),
+                1
+            );
+        }
+
+        #[test]
+        fn protocol_audit_concurrent_calls_do_not_lose_rows() {
+            let f = Fixture::new();
+            std::thread::scope(|scope| {
+                for _ in 0..4 {
+                    let app = &f.app;
+                    scope.spawn(move || {
+                        for _ in 0..12 {
+                            record_protocol_audit(
+                                app,
+                                "runtime",
+                                Some("session"),
+                                ProtocolOperation::Elicitation,
+                                AuditOutcome::Rejected,
+                            )
+                            .unwrap();
+                        }
+                    });
+                }
+            });
+            let audit = f.audit("runtime", Some("session"));
+            assert_eq!(audit.total_records, 48);
+            assert_eq!(audit.records.len(), 48);
+            assert!(audit
+                .records
+                .iter()
+                .enumerate()
+                .all(|(i, row)| row.sequence == i as u64 + 1));
+        }
+
+        #[test]
+        fn protocol_audit_has_closed_vocabulary_and_no_identity_plaintext() {
+            let f = Fixture::new();
+            let runtime = "https://private.example/SECRET-RUNTIME-TOKEN";
+            let session = "SECRET-SESSION-ID";
+            let operations = [
+                (ProtocolOperation::TerminalCreate, "terminal-create"),
+                (ProtocolOperation::TerminalOutput, "terminal-output"),
+                (ProtocolOperation::TerminalWait, "terminal-wait"),
+                (ProtocolOperation::TerminalKill, "terminal-kill"),
+                (ProtocolOperation::TerminalRelease, "terminal-release"),
+                (ProtocolOperation::FileRead, "file-read"),
+                (ProtocolOperation::FileWrite, "file-write"),
+                (ProtocolOperation::Permission, "permission"),
+                (ProtocolOperation::Elicitation, "elicitation"),
+                (ProtocolOperation::Prompt, "prompt"),
+                (ProtocolOperation::SessionClose, "session-close"),
+                (ProtocolOperation::PluginLoad, "plugin-load"),
+                (ProtocolOperation::Lifecycle, "lifecycle"),
+            ];
+            for (operation, wire) in operations {
+                assert_eq!(serde_json::to_value(operation).unwrap(), json!(wire));
+                record_protocol_audit(
+                    &f.app,
+                    runtime,
+                    Some(session),
+                    operation,
+                    AuditOutcome::Requested,
+                )
+                .unwrap();
+            }
+            for (outcome, wire) in [
+                (AuditOutcome::Requested, "requested"),
+                (AuditOutcome::Approved, "approved"),
+                (AuditOutcome::Rejected, "rejected"),
+                (AuditOutcome::Cancelled, "cancelled"),
+                (AuditOutcome::Succeeded, "succeeded"),
+                (AuditOutcome::Failed, "failed"),
+            ] {
+                assert_eq!(serde_json::to_value(outcome).unwrap(), json!(wire));
+            }
+            for payload in [
+                json!("SECRET"),
+                json!({"file-write": {"command": "SECRET"}}),
+            ] {
+                assert!(serde_json::from_value::<ProtocolOperation>(payload.clone()).is_err());
+                assert!(serde_json::from_value::<AuditOutcome>(payload).is_err());
+            }
+            let path = f.audit_path(runtime, Some(session));
+            assert!(fingerprint(path.file_stem().unwrap().to_str().unwrap()));
+            let raw = fs::read_to_string(path).unwrap();
+            assert!(!raw.contains("SECRET"));
+            assert!(!raw.contains("private.example"));
+            assert!(!raw.contains(runtime));
+            assert!(!raw.contains(session));
+            let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(json.as_object().unwrap().len(), 8);
+            for row in json["records"].as_array().unwrap() {
+                assert_eq!(
+                    row.as_object()
+                        .unwrap()
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<BTreeSet<_>>(),
+                    BTreeSet::from([
+                        "sequence",
+                        "timestampUnixMs",
+                        "operation",
+                        "outcome",
+                        "droppedBefore"
+                    ]),
+                );
+            }
+        }
+
+        #[test]
+        fn protocol_audit_read_only_or_obstructed_storage_never_reports_success() {
+            let f = Fixture::new();
+            record_protocol_audit(
+                &f.app,
+                "runtime",
+                None,
+                ProtocolOperation::Lifecycle,
+                AuditOutcome::Requested,
+            )
+            .unwrap();
+            let path = f.audit_path("runtime", None);
+            let before = fs::read(&path).unwrap();
+            let original_permissions = fs::metadata(&path).unwrap().permissions();
+            let mut readonly = original_permissions.clone();
+            readonly.set_readonly(true);
+            fs::set_permissions(&path, readonly).unwrap();
+            let result = record_protocol_audit(
+                &f.app,
+                "runtime",
+                None,
+                ProtocolOperation::Lifecycle,
+                AuditOutcome::Succeeded,
+            );
+            fs::set_permissions(&path, original_permissions).unwrap();
+            assert!(result.is_err());
+            assert_eq!(fs::read(&path).unwrap(), before);
+            let other = Fixture::new();
+            fs::create_dir(&other.app).unwrap();
+            fs::write(other.app.join("protocol-audit"), b"obstruction").unwrap();
+            assert!(record_protocol_audit(
+                &other.app,
+                "runtime",
+                None,
+                ProtocolOperation::Lifecycle,
+                AuditOutcome::Requested,
+            )
+            .is_err());
+            assert_eq!(
+                fs::read(other.app.join("protocol-audit")).unwrap(),
+                b"obstruction"
+            );
         }
 
         fn card(number: u8) -> String {
@@ -2939,14 +3555,8 @@ mod tests {
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {
-            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("target")
-                .join(format!(
-                    "history-index-test-{}-{:016x}",
-                    std::process::id(),
-                    rand::random::<u64>()
-                ));
-            fs::create_dir(&path).unwrap();
+            let path = crate::test_support::temp_root("history-index");
+            fs::create_dir_all(&path).unwrap();
             Self(path)
         }
         fn put(&self, name: &str, data: impl AsRef<[u8]>) {

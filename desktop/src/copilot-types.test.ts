@@ -5,6 +5,8 @@ import {
   fleetIdentity,
   type CopilotAgentSummary,
   mergeToolActivity,
+  mergeCompaction,
+  terminalDisplayText,
   requireLocalAgent,
   studioAgentId,
   studioAgentUrl,
@@ -146,6 +148,78 @@ test("blank update titles do not erase a known tool identity", () => {
   expect(
     mergeToolActivity(previous, { title: "  ", status: "completed" }).title,
   ).toBe("Create review artifact");
+});
+
+test("ACP compactions preserve receive-order patches, summary replacement and explicit clearing", () => {
+  const initial = mergeCompaction(undefined, {
+    sessionUpdate: "compaction_summary_chunk",
+    compactionId: "c1",
+    content: { type: "text", text: "partial" },
+  });
+  expect(initial.status).toBe("in_progress");
+  const patched = mergeCompaction(initial, {
+    sessionUpdate: "compaction_update",
+    compactionId: "c1",
+    status: "completed",
+    error: null,
+  });
+  expect(patched.summary).toEqual(initial.summary);
+  const replaced = mergeCompaction(patched, {
+    sessionUpdate: "compaction_update",
+    compactionId: "c1",
+    status: "custom-status",
+    summary: [],
+    _meta: { trace: "one" },
+  });
+  expect(replaced.summary).toEqual([]);
+  expect(replaced.status).toBe("custom-status");
+  const cleared = mergeCompaction(replaced, {
+    sessionUpdate: "compaction_update",
+    compactionId: "c1",
+    status: "cancelled",
+    summary: null,
+    _meta: null,
+  });
+  expect(cleared.summary).toBeUndefined();
+  expect(cleared._meta).toBeUndefined();
+  expect(() =>
+    mergeCompaction(initial, { compactionId: "other", status: "completed" }),
+  ).toThrow();
+});
+
+test("terminal output remains plain text with Unicode and no actionable terminal controls", () => {
+  const esc = String.fromCharCode(27);
+  const bell = String.fromCharCode(7);
+  const input = `before ${esc}[31m红色✓${esc}[0m\n${esc}]52;c;clipboard${bell}after\tend`;
+  expect(terminalDisplayText(input)).toBe("before 红色✓\nafter\tend");
+  expect(
+    terminalDisplayText(
+      `${esc}]8;;https://example.com${esc}\\link${esc}]8;;${esc}\\`,
+    ),
+  ).toBe("link");
+});
+
+test("tool updates retain terminal snapshots, kind and file locations after completion", () => {
+  const terminals = [
+    {
+      sessionId: "session-a",
+      terminalId: "terminal-a",
+      output: "complete",
+      truncated: false,
+      exitStatus: { exitCode: 0, signal: null },
+    },
+  ];
+  const active = mergeToolActivity(undefined, {
+    title: "Build project",
+    kind: "execute",
+    locations: [{ path: "/project/file" }],
+    terminals,
+  });
+  expect(mergeToolActivity(active, { status: "completed" })).toEqual({
+    ...active,
+    status: "completed",
+  });
+  expect(active.terminals).toEqual(terminals);
 });
 
 const source: StudioAgentSource = {

@@ -170,6 +170,8 @@ export interface IncomingTurn extends IngressEventBase, IngressIds {
 
 export interface InteractionEvent extends IngressEventBase, IngressIds {
   id: string; // opaque minted action id (ck:...)
+  /** Synchronous protocol invokes must distinguish rejected/expired actions from success. */
+  requireAcknowledgement?: boolean;
   value?: unknown;
   /** Submitted input id → value, separate from the clicked action's envelope. */
   values?: Record<string, unknown>;

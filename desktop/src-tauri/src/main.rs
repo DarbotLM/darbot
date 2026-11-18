@@ -2800,6 +2800,41 @@ async fn copilot_session_configure(
 }
 
 #[tauri::command]
+async fn copilot_session_delete<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    runtime: tauri::State<'_, Arc<copilot::CopilotRuntimeState>>,
+    session_id: String,
+) -> Result<(), Problem> {
+    let runtime = Arc::clone(&runtime);
+    copilot_task(
+        "The agent could not delete the selected session",
+        move || {
+            let decision = runtime.consent.ask(&app, "darbot-session-delete", &session_id,
+                copilot::CopilotPermissionOrigin::Background,
+                serde_json::json!({"title":"Delete the selected agent session history","sessionId":session_id}))?;
+            if decision != darbot_desktop_lib::copilot_client::ConsentDecision::Allow {
+                return Err(Problem::plain("The session history deletion was not approved."));
+            }
+            runtime.delete_session(session_id)
+        },
+    )
+    .await
+}
+
+#[tauri::command]
+async fn copilot_session_set_mode(
+    runtime: tauri::State<'_, Arc<copilot::CopilotRuntimeState>>,
+    session_id: String,
+    mode_id: String,
+) -> Result<serde_json::Value, Problem> {
+    let runtime = Arc::clone(&runtime);
+    copilot_task("The agent could not change session mode", move || {
+        runtime.set_mode(session_id, mode_id)
+    })
+    .await
+}
+
+#[tauri::command]
 async fn copilot_session_cancel<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     runtime: tauri::State<'_, Arc<copilot::CopilotRuntimeState>>,
@@ -2848,6 +2883,26 @@ fn copilot_extensions_status(
     extensions: tauri::State<'_, Arc<copilot_extensions::ExtensionState>>,
 ) -> Option<copilot_extensions::ExtensionSnapshot> {
     extensions.status()
+}
+
+#[tauri::command]
+async fn copilot_elicitation_respond(
+    runtime: tauri::State<'_, Arc<copilot::CopilotRuntimeState>>,
+    request_id: String,
+    action: copilot_extensions::elicitation::Action,
+    content: Option<serde_json::Value>,
+) -> Result<(), Problem> {
+    let runtime = Arc::clone(&runtime);
+    copilot_task(
+        "The agent could not receive the information response",
+        move || {
+            runtime.respond_elicitation(
+                request_id,
+                copilot_extensions::elicitation::Response { action, content },
+            )
+        },
+    )
+    .await
 }
 
 #[tauri::command]
@@ -3180,6 +3235,9 @@ fn quit_menu_accelerator() -> Option<&'static str> {
 }
 
 fn main() {
+    if let Some(code) = copilot_extensions::elicitation::run_pattern_worker() {
+        std::process::exit(code);
+    }
     tauri::Builder::default()
         // A second launch is somebody looking for the window they already have, not a request for a
         // second stack. Without this both copies bind the same ports and the loser reports a
@@ -3231,9 +3289,12 @@ fn main() {
             copilot_session_resume,
             copilot_session_prompt,
             copilot_session_configure,
+            copilot_session_delete,
+            copilot_session_set_mode,
             copilot_session_cancel,
             copilot_session_close,
             copilot_permission_respond,
+            copilot_elicitation_respond,
             copilot_extensions_status,
             copilot_extensions_action,
             already_configured,

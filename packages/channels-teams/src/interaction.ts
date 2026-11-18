@@ -12,7 +12,9 @@
 /** Minimal shape of the inbound Teams activity we read for interaction decoding. */
 export interface TeamsActivityLike {
   value?: unknown;
-  conversation?: { id?: string };
+  channelId?: string;
+  conversation?: { id?: string; tenantId?: string };
+  channelData?: { tenant?: { id?: string } };
 }
 
 /** The `data` our buttons round-trip (see `render/adaptive-card.ts` `renderButton`). */
@@ -28,8 +30,17 @@ interface CardActionData {
  * conversation; **both paths MUST derive the key here**. A mismatch silently
  * strands the waiter. (The issue mandates a single shared helper.)
  */
-export function conversationKeyOf(activity: TeamsActivityLike): string {
-  return activity.conversation?.id ?? "";
+export function conversationKeyOf(
+  activity: TeamsActivityLike,
+  fallbackTenant = "unknown",
+): string {
+  return JSON.stringify([
+    activity.channelId ?? "msteams",
+    activity.conversation?.tenantId ??
+      activity.channelData?.tenant?.id ??
+      fallbackTenant,
+    activity.conversation?.id ?? "",
+  ]);
 }
 
 /**
@@ -51,12 +62,14 @@ export function parseCardAction(
   if (
     !data ||
     typeof data !== "object" ||
-    typeof data.ckActionId !== "string"
+    Array.isArray(data) ||
+    typeof data.ckActionId !== "string" ||
+    !data.ckActionId.trim()
   ) {
     return undefined;
   }
   const values = Object.fromEntries(
-    Object.entries(activityValue ?? {}).filter(
+    Object.entries(data).filter(
       ([name]) =>
         name !== "action" && name !== "ckActionId" && name !== "value",
     ),
