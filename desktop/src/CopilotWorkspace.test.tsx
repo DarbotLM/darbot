@@ -918,7 +918,7 @@ test("missing runtime session is converted into a local draft and can be resent"
   await view.findByText(
     "Copilot could not reopen that runtime session. Darbot kept this chat as a local draft; send to start a new session.",
   );
-  expect(saved().chats[0].sessionId).toBeNull();
+  await waitFor(() => expect(saved().chats[0].sessionId).toBeNull());
   expect(draftInput(view, "Architect").value).toBe("Keep this draft");
   expect(
     view.queryByRole("button", { name: "Retry opening conversation" }),
