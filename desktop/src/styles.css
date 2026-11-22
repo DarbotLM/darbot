@@ -2625,6 +2625,86 @@ html[data-copilot-theme="dark"] .fleet-face {
   font-size: 0.68rem;
 }
 
+.copilot-content {
+  min-width: 0;
+  max-height: min(38vh, 23rem);
+  overflow: auto;
+  margin-bottom: 0.4rem;
+  scrollbar-gutter: stable;
+}
+.copilot-content-toolbar, .copilot-content-menu {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+}
+.copilot-content-toolbar .capture-stop { margin-left: auto; }
+.copilot-content-toolbar { position: sticky; top: 0; z-index: 1; background: var(--ground); }
+.copilot-content-menu, .copilot-content-selection {
+  padding: 0.6rem;
+  border: 1px solid var(--hair);
+  border-radius: 0.65rem;
+  background: var(--raised);
+}
+.copilot-content-selection p { margin-block: 0.3rem; overflow-wrap: anywhere; }
+.copilot-content-selection select { max-width: 100%; width: 100%; }
+.copilot-content-selection textarea:focus-visible { outline: 2px solid var(--focus); }
+.copilot-sharing-status { color: var(--ink); font-size: 0.8rem; }
+.copilot-attachments {
+  list-style: none;
+  margin: 0.4rem 0;
+  padding: 0;
+  display: grid;
+  gap: 0.4rem;
+}
+.copilot-attachments li {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem;
+  border: 1px solid var(--hair);
+  border-radius: 0.5rem;
+  background: var(--raised);
+  min-width: 0;
+}
+.copilot-attachments img, .copilot-attachments pre {
+  width: 7rem;
+  height: 4.5rem;
+  object-fit: contain;
+  flex: 0 0 auto;
+  margin: 0;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 0.7rem;
+}
+.copilot-attachment-label { display: grid; min-width: 0; gap: 0.25rem; flex: 1; }
+.copilot-attachment-label strong { overflow-wrap: anywhere; font-size: 0.8rem; }
+.copilot-attachment-label span, .copilot-content > .hint { color: var(--ink-soft); font-size: 0.72rem; }
+.copilot-content-error { color: var(--ink); border-left: 3px solid var(--focus); padding-left: 0.5rem; }
+.desktop-widget .copilot-content { max-height: 28vh; }
+.desktop-widget .copilot-content-toolbar > .hint { display: none; }
+.desktop-widget .copilot-composer .copilot-content-selection label { display: block; }
+.desktop-widget .copilot-content-menu button { flex: 1 1 40%; }
+.desktop-widget .copilot-composer .copilot-content button,
+.desktop-widget .copilot-composer .row button,
+.desktop-widget .copilot-composer .copilot-composer-input textarea,
+.desktop-widget .copilot-composer .copilot-content textarea,
+.desktop-widget .copilot-content-selection select {
+  font-size: max(0.9rem, 11px);
+  min-height: 26px;
+}
+.desktop-widget .copilot-composer .copilot-content button { min-width: 26px; }
+.desktop-widget .copilot-content p,
+.desktop-widget .copilot-content label,
+.desktop-widget .copilot-attachment-label strong,
+.desktop-widget .copilot-attachment-label span,
+.desktop-widget .copilot-attachments pre { font-size: max(0.8rem, 10px); }
+.desktop-widget .copilot-message p { font-size: max(1rem, 11px); }
+.desktop-widget .copilot-attachments img, .desktop-widget .copilot-attachments pre {
+  width: 5rem; height: 3.5rem;
+}
+
 .provider-actions {
   padding-bottom: 1rem;
   scroll-snap-align: end;

@@ -1,6 +1,6 @@
 {
   "name": "darbot-desktop",
-  "version": "0.0.23",
+  "version": "0.0.26",
   "private": true,
   "type": "module",
   "scripts": {

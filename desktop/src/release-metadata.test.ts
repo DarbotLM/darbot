@@ -55,6 +55,7 @@ test("native release versions and chart metadata remain aligned", () => {
   const chart = parseDocument(read("charts", "darbot", "Chart.yaml"));
   expect(chart.errors).toEqual([]);
   expect(chart.get("appVersion")).toBe(expected);
+  expect(read("CHANGELOG.md").split(/\r?\n/)).toContain(`## ${expected}`);
 });
 
 test("CI and native packaging retain push triggers and support explicit verification", () => {

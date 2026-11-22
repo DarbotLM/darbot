@@ -1,6 +1,8 @@
 //! The parts of the shell that are worth testing without a window around them.
 pub mod acquire;
+pub mod app_control;
 pub mod ask;
+pub mod chat_content;
 pub mod copilot;
 pub mod copilot_client;
 pub mod copilot_extensions;

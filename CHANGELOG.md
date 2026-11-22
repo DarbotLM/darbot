@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## 0.0.26
+
+- Add a Windows x64 PowerShell toolbox for production packaging, prerequisite
+  discovery, hash-pinned installation and launching the installed desktop.
+- Include the local 0.0.24 app-control work: MCP and REST are off by default,
+  listen on loopback only, and require native approval for each connection.
+  Approved clients can navigate Darbot and request a snapshot of its own window;
+  sending, cancelling, and switching chats require separate approval.
+- Include the local 0.0.25 composer work: stage selected PNG files, UTF-8 text,
+  or a preview of an explicitly selected Windows window in a conversation.
+  Sending attachments requires native review. A shared preview stays local;
+  Send freezes one reviewed frame, and Stop discards the capture.
+- Keep plain Markdown agent definitions discoverable without warning about
+  conventional companion documents. Report skill-list problems without
+  displaying raw CLI diagnostics or discarding successfully listed skills.
+- Request only supported Dataverse bot fields so an invalid field does not
+  prevent discovery. Actual HTTP 403 responses still report an access denial.
+
 ## 0.0.23
 
 - Implement the native ACP terminal lifecycle: create, bounded output,

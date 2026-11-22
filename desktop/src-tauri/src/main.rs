@@ -12,7 +12,7 @@ mod desktop_window;
 mod test_support;
 
 use darbot_desktop_lib::{
-    acquire, copilot, copilot_extensions, deployment, deployment_release, engine,
+    acquire, chat_content, copilot, copilot_extensions, deployment, deployment_release, engine,
     env as darbot_env, harness, host_access, install, problem::Problem, provider, pull_metrics,
     quiet, stack, supervise, telemetry, tray, windows as win,
 };
@@ -2732,10 +2732,17 @@ async fn copilot_session_new<R: tauri::Runtime>(
     runtime: tauri::State<'_, Arc<copilot::CopilotRuntimeState>>,
     agent: Option<String>,
     cwd: String,
+    conversation_id: Option<String>,
 ) -> Result<copilot::CopilotSession, Problem> {
     let runtime = Arc::clone(&runtime);
     copilot_task("GitHub Copilot could not create a session", move || {
-        runtime.new_session(&app, agent, cwd)
+        let owner = chat_content::owner_for_session(conversation_id, agent.as_deref())?;
+        let session = runtime.new_session(&app, agent, cwd)?;
+        if let (Some(content), Some(owner)) = (app.try_state::<chat_content::ChatContent>(), owner)
+        {
+            content.bind_session("main", owner, &session.session_id);
+        }
+        Ok(session)
     })
     .await
 }
@@ -2747,10 +2754,17 @@ async fn copilot_session_load<R: tauri::Runtime>(
     agent: Option<String>,
     session_id: String,
     cwd: String,
+    conversation_id: Option<String>,
 ) -> Result<copilot::CopilotSession, Problem> {
     let runtime = Arc::clone(&runtime);
     copilot_task("GitHub Copilot could not load that session", move || {
-        runtime.load_session(&app, agent, session_id, cwd)
+        let owner = chat_content::owner_for_session(conversation_id, agent.as_deref())?;
+        let session = runtime.load_session(&app, agent, session_id, cwd)?;
+        if let (Some(content), Some(owner)) = (app.try_state::<chat_content::ChatContent>(), owner)
+        {
+            content.bind_session("main", owner, &session.session_id);
+        }
+        Ok(session)
     })
     .await
 }
@@ -2762,10 +2776,17 @@ async fn copilot_session_resume<R: tauri::Runtime>(
     agent: Option<String>,
     session_id: String,
     cwd: String,
+    conversation_id: Option<String>,
 ) -> Result<copilot::CopilotSession, Problem> {
     let runtime = Arc::clone(&runtime);
     copilot_task("GitHub Copilot could not resume that session", move || {
-        runtime.resume_session(&app, agent, session_id, cwd)
+        let owner = chat_content::owner_for_session(conversation_id, agent.as_deref())?;
+        let session = runtime.resume_session(&app, agent, session_id, cwd)?;
+        if let (Some(content), Some(owner)) = (app.try_state::<chat_content::ChatContent>(), owner)
+        {
+            content.bind_session("main", owner, &session.session_id);
+        }
+        Ok(session)
     })
     .await
 }
@@ -2777,10 +2798,22 @@ async fn copilot_session_prompt<R: tauri::Runtime>(
     agent: Option<String>,
     session_id: String,
     prompt: String,
+    app_control_ticket: Option<String>,
 ) -> Result<copilot::CopilotPromptResult, Problem> {
     let runtime = Arc::clone(&runtime);
     copilot_task("GitHub Copilot could not finish that prompt", move || {
-        runtime.prompt(&app, agent, session_id, prompt)
+        if app_control_ticket.is_some() {
+            if let Some(content) = app.try_state::<chat_content::ChatContent>() {
+                content.remote_send_allowed()?;
+            }
+        }
+        runtime.prompt(
+            &app,
+            agent,
+            session_id,
+            prompt,
+            app_control_ticket.as_deref(),
+        )
     })
     .await
 }
@@ -2840,9 +2873,19 @@ async fn copilot_session_cancel<R: tauri::Runtime>(
     runtime: tauri::State<'_, Arc<copilot::CopilotRuntimeState>>,
     agent: Option<String>,
     session_id: String,
+    app_control_ticket: Option<String>,
 ) -> Result<(), Problem> {
     let runtime = Arc::clone(&runtime);
     copilot_task("GitHub Copilot could not cancel that prompt", move || {
+        if let Some(ticket) = app_control_ticket {
+            return runtime.cancel_controlled(&session_id, &ticket);
+        }
+        if app
+            .try_state::<chat_content::ChatContent>()
+            .is_some_and(|content| content.cancel_session(&session_id))
+        {
+            let _ = app.emit("chat-content:screen-stopped", ());
+        }
         runtime.cancel(&app, agent, session_id)
     })
     .await
@@ -2857,6 +2900,15 @@ async fn copilot_session_close<R: tauri::Runtime>(
 ) -> Result<(), Problem> {
     let runtime = Arc::clone(&runtime);
     copilot_task("GitHub Copilot could not close that session", move || {
+        if let Some(content) = app.try_state::<chat_content::ChatContent>() {
+            content.retire_session(&session_id);
+        }
+        if app
+            .try_state::<chat_content::ChatContent>()
+            .is_some_and(|content| content.cancel_session(&session_id))
+        {
+            let _ = app.emit("chat-content:screen-stopped", ());
+        }
         runtime.close_session(&app, agent, session_id)
     })
     .await
@@ -3250,10 +3302,18 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .manage(Shell::default())
         .manage(desktop_window::DesktopWindowState::default())
+        .manage(darbot_desktop_lib::app_control::AppControl::default())
+        .manage(chat_content::ChatContent::default())
         .manage(darbot_desktop_lib::history_sources::IndexCache::default())
         .manage(Arc::new(copilot::CopilotRuntimeState::default()))
         .manage(Arc::new(copilot_extensions::ExtensionState::default()))
         .invoke_handler(tauri::generate_handler![
+            darbot_desktop_lib::app_control::app_control_start,
+            darbot_desktop_lib::app_control::app_control_stop,
+            darbot_desktop_lib::app_control::app_control_status,
+            darbot_desktop_lib::app_control::app_control_heartbeat,
+            darbot_desktop_lib::app_control::app_control_claim,
+            darbot_desktop_lib::app_control::app_control_ack,
             desktop_window::desktop_window_state,
             desktop_window::desktop_window_present,
             record_setup_event,
@@ -3288,6 +3348,15 @@ fn main() {
             copilot_session_load,
             copilot_session_resume,
             copilot_session_prompt,
+            chat_content::chat_content_activate,
+            chat_content::chat_content_pick,
+            chat_content::chat_content_text,
+            chat_content::chat_content_remove,
+            chat_content::chat_content_send,
+            chat_content::chat_capture_sources,
+            chat_content::chat_capture_start,
+            chat_content::chat_capture_frame,
+            chat_content::chat_capture_stop,
             copilot_session_configure,
             copilot_session_delete,
             copilot_session_set_mode,
@@ -3323,6 +3392,13 @@ fn main() {
         // screen can reach.
         .on_window_event(|window, event| {
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                window
+                    .state::<chat_content::ChatContent>()
+                    .revoke_window_content(window.label());
+                let _ = window.emit("chat-content:revoked", ());
+                window
+                    .state::<darbot_desktop_lib::app_control::AppControl>()
+                    .shutdown();
                 api.prevent_close();
                 let _ = window.hide();
             }
@@ -3398,6 +3474,8 @@ fn main() {
                     show_whichever_applies(app);
                 }
                 tauri::RunEvent::ExitRequested { api, code, .. } => {
+                    app.state::<darbot_desktop_lib::app_control::AppControl>()
+                        .shutdown();
                     // Exit runs on the event-loop thread. Waiting there for Windows process
                     // inventory or Compose made Quit show "Not Responding". Keep the loop alive
                     // until cleanup finishes, then allow its final exit without repeating work.

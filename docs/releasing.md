@@ -5,6 +5,20 @@ step involves a terminal, a tag pushed by hand, or an image built on somebody's 
 
 ## Cutting one
 
+**Windows desktop packaging:** from a trusted release checkout, run
+`.\scripts\toolbox.ps1 Package -Offline` to build the optimized x64 NSIS installer in
+a fresh target directory without running regression suites. The script prints the
+installer path, version, size and SHA-256. `-Offline` applies to Cargo; Bun and the
+bundler may need their caches populated. `Build` also runs the desktop regression
+suites; neither mode installs, signs, tags or publishes the package.
+
+On a new Windows x64 node, use the toolbox and installer from the *same trusted
+release*. Run `.\toolbox.ps1 Doctor`, then `.\toolbox.ps1 Prerequisites -For Runtime`.
+Exit Darbot before using `.\toolbox.ps1 Install -InstallerPath <local-installer> -ExpectedVersion <version> -ExpectedSha256 <trusted-release-digest>`.
+Use `.\toolbox.ps1 Launch` from a non-elevated shell. Presence in Doctor is not proof
+of provider authentication; use the node user's existing supported sign-in or official
+consent flow, never copied tokens.
+
 1. Check `## Unreleased` in [CHANGELOG.md](../CHANGELOG.md) reads the way you want it to. It is the
    release notes. Nothing is generated from commit subjects, because a commit subject is written for
    the person reading the diff and these notes are for the person deciding whether to upgrade.

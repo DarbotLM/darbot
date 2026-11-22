@@ -785,13 +785,69 @@ impl CopilotRuntimeState {
 
     pub fn prompt<R: Runtime>(
         &self,
-        _app: &AppHandle<R>,
+        app: &AppHandle<R>,
         agent: Option<String>,
         session_id: String,
         prompt: String,
+        control_ticket: Option<&str>,
     ) -> Result<CopilotPromptResult, Problem> {
         require_local_agent(agent.as_deref())?;
-        self.current()?.prompt(session_id, prompt)
+        let text = required_text(prompt.clone(), "prompt")?;
+        self.current()?.prompt_blocks(
+            session_id.clone(),
+            vec![json!({"type":"text","text":text})],
+            control_ticket.map(|_| agent.as_deref().unwrap_or("")),
+            control_ticket,
+            || {
+                if let Some(ticket) = control_ticket {
+                    app.state::<crate::app_control::AppControl>()
+                        .authorize_prompt(ticket, agent.as_deref().unwrap_or(""), &session_id, &prompt)
+                        .map_err(|_| Problem::plain("The exact app-control prompt authorization expired or was revoked."))?;
+                }
+                Ok(())
+            },
+        )
+    }
+
+    pub fn content_capabilities(&self) -> Result<(bool, bool), Problem> {
+        let runtime = self.current()?;
+        Ok((
+            runtime.capabilities.prompt_image,
+            runtime.capabilities.prompt_embedded_context,
+        ))
+    }
+
+    pub(crate) fn prompt_content(
+        &self,
+        agent: String,
+        session_id: String,
+        blocks: Vec<Value>,
+    ) -> Result<CopilotPromptResult, Problem> {
+        require_local_agent(Some(&agent))?;
+        let runtime = self.current()?;
+        for block in &blocks {
+            match block["type"].as_str() {
+                Some("text") => {}
+                Some("image") if runtime.capabilities.prompt_image => {}
+                Some("resource") if runtime.capabilities.prompt_embedded_context => {}
+                _ => {
+                    return Err(Problem::plain(
+                        "The connected agent does not support this prompt content.",
+                    ))
+                }
+            }
+        }
+        runtime
+            .prompt_blocks(session_id, blocks, Some(&agent), None, || Ok(()))
+            .map_err(|problem| Problem::plain(problem.said)) // ACP errors can echo prompt blocks.
+    }
+
+    pub fn cancel_controlled(&self, session_id: &str, ticket: &str) -> Result<(), Problem> {
+        let runtime = self.runtime.lock().unwrap().clone();
+        if let Some(runtime) = runtime {
+            runtime.cancel_controlled(session_id, ticket)?;
+        }
+        Ok(())
     }
 
     pub fn cancel<R: Runtime>(
@@ -1902,8 +1958,124 @@ struct PendingPermission {
 
 struct SessionState {
     cwd: String,
+    agent: Option<String>,
+    changing_agent: Option<u64>,
+    turn: Option<ActiveTurn>,
+    lifetime: Arc<()>,
     config_options: Value,
     modes: Value,
+}
+
+struct ActiveTurn {
+    request: u64,
+    ticket: Option<String>,
+    recipient: Option<String>,
+    dispatched: bool,
+}
+
+impl SessionState {
+    fn update_options(&mut self, options: Value) {
+        if let Some(list) = options.as_array() {
+            let mut agents = list.iter().filter(|option| option["id"] == "agent");
+            if let Some(agent) = agents.next() {
+                self.agent = agent["currentValue"]
+                    .as_str()
+                    .filter(|_| agents.next().is_none())
+                    .map(str::to_owned);
+            }
+        } else {
+            self.agent = None;
+        }
+        self.config_options = options;
+    }
+}
+
+// Apply identity-bearing replies on the ordered ACP reader, not on a woken worker which
+// could overwrite a newer config_option_update (or an entirely new session incarnation).
+enum ReplyEffect {
+    None,
+    Open {
+        cwd: String,
+        restored: Option<String>,
+    },
+    Config {
+        session: String,
+        lifetime: Arc<()>,
+        agent: bool,
+    },
+}
+
+impl ReplyEffect {
+    fn apply(self, core: &RuntimeCore, result: &Result<Value, Problem>) -> Result<(), Problem> {
+        match self {
+            Self::None => {}
+            Self::Open { cwd, restored } => {
+                if let Ok(value) = result {
+                    let id = restored
+                        .as_deref()
+                        .or_else(|| value["sessionId"].as_str())
+                        .ok_or_else(|| {
+                            Problem::plain("GitHub Copilot did not identify the session.")
+                        })?;
+                    let id = required_text(id.to_owned(), "session ID")?;
+                    let mut state = SessionState {
+                        cwd,
+                        // A fresh default CLI session needs no selector. A restored session
+                        // can already have a custom recipient; don't guess from its caller.
+                        agent: restored.is_none().then(String::new),
+                        changing_agent: None,
+                        turn: None,
+                        lifetime: Arc::default(),
+                        config_options: Value::Null,
+                        modes: value["modes"].clone(),
+                    };
+                    state.update_options(
+                        value
+                            .get("configOptions")
+                            .cloned()
+                            .unwrap_or_else(|| json!([])),
+                    );
+                    core.terminals.activate(&id)?;
+                    core.sessions.lock().unwrap().insert(id, state);
+                }
+            }
+            Self::Config {
+                session,
+                lifetime,
+                agent,
+            } => {
+                let mut sessions = core.sessions.lock().unwrap();
+                if let Some(state) = sessions
+                    .get_mut(&session)
+                    .filter(|s| Arc::ptr_eq(&s.lifetime, &lifetime))
+                {
+                    if agent {
+                        state.changing_agent = None;
+                    }
+                    if let Ok(value) = result {
+                        if agent {
+                            // A successful switch without an identified recipient isn't confirmation.
+                            state.agent = None;
+                        }
+                        state.update_options(value["configOptions"].clone());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+struct PendingRpc {
+    sender: Sender<Result<Value, Problem>>,
+    effect: ReplyEffect,
+}
+
+struct InFlight {
+    id: u64,
+    receiver: Receiver<Result<Value, Problem>>,
+    session: Option<String>,
+    operation: ProtocolOperation,
 }
 
 struct RuntimeCore {
@@ -1918,7 +2090,7 @@ struct RuntimeCore {
     client_requests: Mutex<HashMap<String, bool>>,
     report_cleanup: Arc<dyn Fn(&Problem) + Send + Sync>,
     outgoing: mpsc::SyncSender<Value>,
-    pending: Mutex<HashMap<String, Sender<Result<Value, Problem>>>>,
+    pending: Mutex<HashMap<String, PendingRpc>>,
     permissions: Mutex<HashMap<String, PendingPermission>>,
     sessions: Mutex<HashMap<String, SessionState>>,
     next_request_id: AtomicU64,
@@ -2083,8 +2255,13 @@ impl CopilotRuntime {
     }
 
     fn open_session(&self, method: &str, params: Value) -> Result<Value, Problem> {
+        let effect = ReplyEffect::Open {
+            cwd: params["cwd"].as_str().unwrap_or_default().into(),
+            restored: params["sessionId"].as_str().map(str::to_owned),
+        };
+        let call = self.core.begin_request(method, params, effect)?;
         self.core
-            .request_with_timeout(method, params, ACP_SESSION_OPEN_TIMEOUT, || {
+            .finish_request(call, ACP_SESSION_OPEN_TIMEOUT, || {
                 Problem::with(
                     "Copilot took too long to open the conversation. Your message was not sent. \
                      Check unavailable MCP servers in Resources before retrying.",
@@ -2153,15 +2330,6 @@ impl CopilotRuntime {
         mut session: CopilotSession,
         agent: Option<String>,
     ) -> Result<CopilotSession, Problem> {
-        self.core.terminals.activate(&session.session_id)?;
-        self.core.sessions.lock().unwrap().insert(
-            session.session_id.clone(),
-            SessionState {
-                cwd: session.cwd.clone(),
-                config_options: session.config_options.clone().unwrap_or_else(|| json!([])),
-                modes: session.modes.clone().unwrap_or(Value::Null),
-            },
-        );
         // A resumed autopilot session must not silently bypass the native permission UI.
         for (id, allowed) in [
             ("allow_all", "off"),
@@ -2226,11 +2394,14 @@ impl CopilotRuntime {
     ) -> Result<CopilotSessionConfig, Problem> {
         let session_id = self.known_session(session_id)?;
         let config_id = required_text(config_id, "configuration ID")?;
-        {
-            let sessions = self.core.sessions.lock().unwrap();
-            let option = sessions
-                .get(&session_id)
-                .and_then(|session| session.config_options.as_array())
+        let call = {
+            let mut sessions = self.core.sessions.lock().unwrap();
+            let session = sessions
+                .get_mut(&session_id)
+                .ok_or_else(|| Problem::plain("The session closed."))?;
+            let option = session
+                .config_options
+                .as_array()
                 .and_then(|options| options.iter().find(|option| option["id"] == config_id))
                 .ok_or_else(|| {
                     Problem::plain("This Copilot session does not offer that setting.")
@@ -2247,12 +2418,38 @@ impl CopilotRuntime {
                     "Darbot keeps tool approval enabled. Use Agent or Plan mode.",
                 ));
             }
+            let agent = config_id == "agent";
+            if agent && session.changing_agent.is_some() {
+                return Err(Problem::plain("An agent change is already pending."));
+            }
+            let call = self.core.begin_request(
+                "session/set_config_option",
+                json!({"sessionId": session_id, "configId": config_id, "value": value}),
+                ReplyEffect::Config {
+                    session: session_id.clone(),
+                    lifetime: Arc::clone(&session.lifetime),
+                    agent,
+                },
+            )?;
+            if agent {
+                session.changing_agent = Some(call.id);
+            }
+            call
+        };
+        let id = call.id;
+        let result = self.core.finish_request(call, ACP_SESSION_TIMEOUT, || {
+            request_timeout("session/set_config_option", ACP_SESSION_TIMEOUT)
+        });
+        if result.is_err() {
+            // A missing reply isn't proof the requested switch did not take effect.
+            if let Some(session) = self.core.sessions.lock().unwrap().get_mut(&session_id) {
+                if session.changing_agent == Some(id) {
+                    session.agent = None;
+                    session.changing_agent = None;
+                }
+            }
         }
-        let result = self.core.request(
-            "session/set_config_option",
-            json!({"sessionId": session_id, "configId": config_id, "value": value}),
-            ACP_SESSION_TIMEOUT,
-        )?;
+        let result = result?;
         let config_options = result
             .get("configOptions")
             .filter(|options| options.is_array())
@@ -2260,9 +2457,6 @@ impl CopilotRuntime {
             .ok_or_else(|| {
                 Problem::plain("GitHub Copilot returned an invalid configuration response.")
             })?;
-        if let Some(session) = self.core.sessions.lock().unwrap().get_mut(&session_id) {
-            session.config_options = config_options.clone();
-        }
         Ok(CopilotSessionConfig { config_options })
     }
 
@@ -2310,38 +2504,95 @@ impl CopilotRuntime {
         Ok(())
     }
 
-    fn prompt(&self, session_id: String, prompt: String) -> Result<CopilotPromptResult, Problem> {
-        let session_id = self.known_session(session_id)?;
-        let prompt = required_text(prompt, "prompt")?;
-        let result = self.core.request(
-            "session/prompt",
-            json!({
-                "sessionId": session_id,
-                "prompt": [{"type": "text", "text": prompt}],
-            }),
-            ACP_PROMPT_TIMEOUT,
-        );
-        if result.is_err() {
-            let _ = self.cancel(session_id.clone());
+    fn prompt_blocks(
+        &self,
+        session_id: String,
+        blocks: Vec<Value>,
+        recipient: Option<&str>,
+        ticket: Option<&str>,
+        authorize: impl FnOnce() -> Result<(), Problem>,
+    ) -> Result<CopilotPromptResult, Problem> {
+        let params = json!({"sessionId":session_id,"prompt":blocks});
+        // Check, consume the exact authorization, enqueue, and publish ownership under the
+        // same lock as config updates and cleanup. Never hold it waiting for the ACP reply.
+        let call = {
+            let mut sessions = self.core.sessions.lock().unwrap();
+            let session = sessions
+                .get_mut(&session_id)
+                .ok_or_else(|| Problem::plain("The session is no longer active."))?;
+            if recipient.is_some_and(|agent| {
+                session.changing_agent.is_some() || session.agent.as_deref() != Some(agent)
+            }) {
+                return Err(Problem::plain(
+                    "The approved recipient no longer matches the active session.",
+                ));
+            }
+            if session.turn.is_some() {
+                return Err(Problem::plain("A turn is already active in this session."));
+            }
+            authorize()?;
+            let call = self
+                .core
+                .begin_request("session/prompt", params, ReplyEffect::None)?;
+            session.turn = Some(ActiveTurn {
+                request: call.id,
+                ticket: ticket.map(str::to_owned),
+                recipient: recipient.map(str::to_owned),
+                dispatched: false,
+            });
+            call
+        };
+        let id = call.id;
+        let result = self.core.finish_request(call, ACP_PROMPT_TIMEOUT, || {
+            request_timeout("session/prompt", ACP_PROMPT_TIMEOUT)
+        });
+        if let Some(session) = self.core.sessions.lock().unwrap().get_mut(&session_id) {
+            if let Some(turn) = session.turn.as_ref().filter(|turn| turn.request == id) {
+                if result.is_err() && turn.dispatched {
+                    let _ = self.cancel_session_work(&session_id);
+                }
+                session.turn = None;
+            }
         }
         let result = result?;
         let stop_reason = result
             .get("stopReason")
             .and_then(Value::as_str)
-            .ok_or_else(|| {
-                Problem::with(
-                    "GitHub Copilot returned an invalid prompt result.",
-                    result.to_string(),
-                )
-            })?
+            .ok_or_else(|| Problem::plain("GitHub Copilot returned an invalid prompt result."))?
             .to_string();
         Ok(CopilotPromptResult { stop_reason })
     }
 
     fn cancel(&self, session_id: String) -> Result<(), Problem> {
         let session_id = self.known_session(session_id)?;
-        let terminals = self.core.terminals.cancel(Some(&session_id), false);
-        let permissions = self.core.cancel_permissions(&session_id);
+        self.cancel_session_work(&session_id)
+    }
+
+    fn cancel_controlled(&self, session_id: &str, ticket: &str) -> Result<(), Problem> {
+        let mut sessions = self.core.sessions.lock().unwrap();
+        if let Some(turn) = sessions.get_mut(session_id).and_then(|s| s.turn.as_mut()) {
+            if turn.ticket.as_deref() == Some(ticket)
+                && self
+                    .core
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .contains_key(&turn.request.to_string())
+            {
+                if turn.dispatched {
+                    self.cancel_session_work(session_id)?;
+                } else {
+                    self.core.refuse_queued_prompt(turn.request);
+                }
+                turn.ticket = None;
+            }
+        }
+        Ok(())
+    }
+
+    fn cancel_session_work(&self, session_id: &str) -> Result<(), Problem> {
+        let terminals = self.core.terminals.cancel(Some(session_id), false);
+        let permissions = self.core.cancel_permissions(session_id);
         let notified = self
             .core
             .notify("session/cancel", json!({"sessionId": session_id}));
@@ -2417,7 +2668,50 @@ impl Drop for CopilotRuntime {
     }
 }
 
+fn request_timeout(method: &str, timeout: Duration) -> Problem {
+    Problem::with(
+        "GitHub Copilot did not answer in time. Cancel the operation and try again.",
+        format!("ACP {method} exceeded {} seconds.", timeout.as_secs()),
+    )
+}
+
 impl RuntimeCore {
+    fn refuse_queued_prompt(&self, id: u64) {
+        if let Some(rpc) = self.pending.lock().unwrap().remove(&id.to_string()) {
+            let _ = rpc.sender.send(Err(Problem::plain(
+                "The reviewed turn is no longer authorized. Nothing was sent.",
+            )));
+        }
+    }
+
+    // The writer may have been back-pressured since enqueue. Commit the dispatch here,
+    // without blocking the ACP reader on OS pipe I/O. No approval metadata goes on the wire.
+    fn commit_prompt_write(&self, message: &Value) -> bool {
+        if message["method"] != "session/prompt" {
+            return true;
+        }
+        let Some(id) = message["id"].as_u64() else {
+            return false;
+        };
+        let mut sessions = self.sessions.lock().unwrap();
+        if let Some(session) = message["params"]["sessionId"]
+            .as_str()
+            .and_then(|id| sessions.get_mut(id))
+        {
+            if let Some(turn) = session.turn.as_mut().filter(|turn| turn.request == id) {
+                if turn.recipient.as_deref().is_none_or(|agent| {
+                    session.changing_agent.is_none() && session.agent.as_deref() == Some(agent)
+                }) && self.pending.lock().unwrap().contains_key(&id.to_string())
+                {
+                    turn.dispatched = true;
+                    return true;
+                }
+            }
+        }
+        self.refuse_queued_prompt(id);
+        false
+    }
+
     fn audit(
         &self,
         session: Option<&str>,
@@ -2469,21 +2763,16 @@ impl RuntimeCore {
     }
 
     fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value, Problem> {
-        self.request_with_timeout(method, params, timeout, || {
-            Problem::with(
-                "GitHub Copilot did not answer in time. Cancel the operation and try again.",
-                format!("ACP {method} exceeded {} seconds.", timeout.as_secs()),
-            )
-        })
+        let call = self.begin_request(method, params, ReplyEffect::None)?;
+        self.finish_request(call, timeout, || request_timeout(method, timeout))
     }
 
-    fn request_with_timeout(
+    fn begin_request(
         &self,
         method: &str,
         params: Value,
-        timeout: Duration,
-        on_timeout: impl FnOnce() -> Problem,
-    ) -> Result<Value, Problem> {
+        effect: ReplyEffect,
+    ) -> Result<InFlight, Problem> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(self.closed_problem());
         }
@@ -2500,7 +2789,10 @@ impl RuntimeCore {
         let id = self.next_request_id.fetch_add(1, Ordering::SeqCst);
         let key = id.to_string();
         let (sender, receiver) = mpsc::channel();
-        self.pending.lock().unwrap().insert(key.clone(), sender);
+        self.pending
+            .lock()
+            .unwrap()
+            .insert(key.clone(), PendingRpc { sender, effect });
         if let Err(problem) = self.write(&json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -2511,16 +2803,36 @@ impl RuntimeCore {
             fail_pending(self, problem.clone());
             return Err(problem);
         }
+        Ok(InFlight {
+            id,
+            receiver,
+            session: audit_session,
+            operation,
+        })
+    }
+
+    fn finish_request(
+        &self,
+        call: InFlight,
+        timeout: Duration,
+        on_timeout: impl FnOnce() -> Problem,
+    ) -> Result<Value, Problem> {
+        let InFlight {
+            id,
+            receiver,
+            session,
+            operation,
+        } = call;
         let result =
             wait_for_runtime_response(receiver, timeout, on_timeout, || self.closed_problem());
         if let Some(controller) = &self.elicitation {
             controller.cancel_request(&self.identity, &json!(id));
         }
         if result.is_err() {
-            self.pending.lock().unwrap().remove(&key);
+            self.pending.lock().unwrap().remove(&id.to_string());
         }
         if let Err(problem) = self.audit(
-            audit_session.as_deref(),
+            session.as_deref(),
             operation,
             if result.is_ok() {
                 AuditOutcome::Succeeded
@@ -2720,6 +3032,9 @@ fn start_runtime_writer(mut stdin: ChildStdin, messages: Receiver<Value>, core: 
         else {
             break;
         };
+        if !core.commit_prompt_write(&message) {
+            continue;
+        }
         let written = serde_json::to_writer(&mut stdin, &message)
             .map_err(std::io::Error::other)
             .and_then(|()| stdin.write_all(b"\n"))
@@ -2839,7 +3154,8 @@ fn route_runtime_message<R: Runtime>(core: &Arc<RuntimeCore>, app: &AppHandle<R>
     }
     if message.get("result").is_some() || message.get("error").is_some() {
         if let Some(id) = message.get("id").and_then(json_id_key) {
-            if let Some(sender) = core.pending.lock().unwrap().remove(&id) {
+            let pending = core.pending.lock().unwrap().remove(&id);
+            if let Some(PendingRpc { sender, effect }) = pending {
                 let response = if let Some(error) = message.get("error") {
                     Err(Problem::with(
                         "GitHub Copilot returned a runtime error.",
@@ -2853,6 +3169,7 @@ fn route_runtime_message<R: Runtime>(core: &Arc<RuntimeCore>, app: &AppHandle<R>
                         )
                     })
                 };
+                let response = effect.apply(core, &response).and(response);
                 let _ = sender.send(response);
             }
         }
@@ -2904,14 +3221,9 @@ fn route_runtime_message<R: Runtime>(core: &Arc<RuntimeCore>, app: &AppHandle<R>
                     .and_then(Value::as_str)
                     == Some("config_option_update")
                 {
-                    if let (Some(session_id), Some(options)) = (
-                        params.get("sessionId").and_then(Value::as_str),
-                        params
-                            .pointer("/update/configOptions")
-                            .filter(|options| options.is_array()),
-                    ) {
+                    if let Some(session_id) = params.get("sessionId").and_then(Value::as_str) {
                         if let Some(session) = core.sessions.lock().unwrap().get_mut(session_id) {
-                            session.config_options = options.clone();
+                            session.update_options(params["update"]["configOptions"].clone());
                         }
                     }
                 }
@@ -3533,8 +3845,8 @@ fn fail_pending(core: &RuntimeCore, mut problem: Problem) {
         problem.detail = cleanup.detail;
     }
     let pending = std::mem::take(&mut *core.pending.lock().unwrap());
-    for (_, sender) in pending {
-        let _ = sender.send(Err(problem.clone()));
+    for (_, rpc) in pending {
+        let _ = rpc.sender.send(Err(problem.clone()));
     }
 }
 
@@ -4360,9 +4672,9 @@ fn discover_agents() -> Result<(Vec<CopilotAgent>, Vec<String>), Problem> {
                 definition.modified_at_unix = modified_at_unix(&path);
             }
             agents.push(agent);
-        } else {
+        } else if !is_companion_document(&path, &text) {
             warnings.push(format!(
-                "{} has no valid agent name/description. Copilot will validate it when loading a session.",
+                "{} is missing valid agent frontmatter or a nonempty name. Copilot will validate it when loading a session.",
                 entry.file_name().to_string_lossy()
             ));
         }
@@ -4373,6 +4685,29 @@ fn discover_agents() -> Result<(Vec<CopilotAgent>, Vec<String>), Problem> {
             .cmp(&right.name.to_ascii_lowercase())
     });
     Ok((agents, warnings))
+}
+
+fn is_companion_document(path: &Path, header: &str) -> bool {
+    // Conventional documents can coexist with plain .md agent definitions.
+    // A file that attempts frontmatter is still validated under any name.
+    header
+        .trim_start_matches('\u{feff}')
+        .lines()
+        .next()
+        .is_none_or(|line| line.trim_end() != "---")
+        && path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|name| {
+                [
+                    "AGENTS.md",
+                    "BULLETIN.md",
+                    "copilot-instructions.md",
+                    "README.md",
+                ]
+                .iter()
+                .any(|doc| name.eq_ignore_ascii_case(doc))
+            })
 }
 
 fn copilot_home() -> Result<PathBuf, Problem> {
@@ -4598,6 +4933,14 @@ fn read_inventory<T>(
                 Problem::plain(format!("Darbot could not read GitHub Copilot {label}."))
             })?;
         if !output.status.success() {
+            if operation == Operation::ListSkills {
+                let detail = skill_list_warning(&output.stderr).unwrap_or_else(|| {
+                    "Run `copilot skill list --json` in this workspace for details.".into()
+                });
+                return Err(Problem::plain(format!(
+                    "GitHub Copilot could not list skills. {detail}"
+                )));
+            }
             return Err(Problem::plain(format!(
                 "GitHub Copilot could not list {label}."
             )));
@@ -4605,10 +4948,83 @@ fn read_inventory<T>(
         let value = serde_json::from_slice(&output.stdout).map_err(|_| {
             Problem::plain(format!("GitHub Copilot returned invalid {label} data."))
         })?;
-        let warning = (!output.stderr.is_empty())
-            .then(|| format!("GitHub Copilot reported a warning while listing {label}."));
+        let warning = if operation == Operation::ListSkills {
+            skill_list_warning(&output.stderr)
+        } else {
+            (!output.stderr.is_empty())
+                .then(|| format!("GitHub Copilot reported a warning while listing {label}."))
+        };
         Ok((parse(value)?, warning))
     })
+}
+
+fn skill_list_warning(stderr: &[u8]) -> Option<String> {
+    // A partial list is usable. Report counts, never paths, names or arbitrary CLI text.
+    let mut frontmatter = 0usize;
+    let mut hint = 0usize;
+    let mut duplicates = 0usize;
+    let mut failed_heading = false;
+    let mut warning_heading = false;
+    let mut other = false;
+    for line in String::from_utf8_lossy(stderr)
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if line == "✖ The following skills failed to load:" {
+            failed_heading = true;
+            continue;
+        }
+        if line == "The following skills have warnings:" {
+            warning_heading = true;
+            continue;
+        }
+        let bullet = line.strip_prefix("• ");
+        if bullet
+            .and_then(|s| s.strip_prefix("Skipped duplicate skill name '"))
+            .and_then(|s| {
+                s.strip_suffix("'; a higher-priority entry with the same name was already loaded")
+            })
+            .is_some_and(|s| s.contains("' from '"))
+        {
+            duplicates += 1;
+            continue;
+        }
+        match bullet.and_then(|s| s.rsplit_once(": ")) {
+            Some((_, "missing or malformed YAML frontmatter")) => frontmatter += 1,
+            Some((_, "argument-hint must be a string")) => hint += 1,
+            _ => other = true,
+        }
+    }
+    let mut parts = Vec::new();
+    if frontmatter > 0 {
+        parts.push(format!(
+            "Skills skipped for missing or malformed SKILL.md YAML frontmatter: {frontmatter}."
+        ));
+    }
+    if hint > 0 {
+        parts.push(format!(
+            "Skills skipped because SKILL.md argument-hint must be a string: {hint}."
+        ));
+    }
+    if failed_heading && frontmatter == 0 && hint == 0 {
+        parts.push("Some skills failed to load.".into());
+    }
+    if duplicates > 0 {
+        parts.push(format!(
+            "Duplicate skill names skipped in favor of a higher-priority entry: {duplicates}."
+        ));
+    } else if warning_heading && !other {
+        parts.push("The CLI reported skill warnings.".into());
+    }
+    if other {
+        parts.push("The skills CLI reported other diagnostic output.".into());
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    parts.push("Run `copilot skill list --json` in this workspace for details.".into());
+    Some(parts.join(" "))
 }
 
 fn parse_status(initialized: &Value) -> Result<CopilotStatus, Problem> {
@@ -4657,9 +5073,8 @@ fn parse_status(initialized: &Value) -> Result<CopilotStatus, Problem> {
             list_sessions: capability_present(sessions, "list"),
             close_session: capability_present(sessions, "close"),
             delete_session: capability_present(sessions, "delete"),
-            // These are usable desktop capabilities, not merely the agent's declarations.
-            prompt_image: false,
-            prompt_embedded_context: false,
+            prompt_image: capability_enabled(prompt, "image"),
+            prompt_embedded_context: capability_enabled(prompt, "embeddedContext"),
             mcp_http: capability_enabled(mcp, "http"),
             mcp_sse: capability_enabled(mcp, "sse"),
         },
@@ -4668,10 +5083,6 @@ fn parse_status(initialized: &Value) -> Result<CopilotStatus, Problem> {
         has_more_sessions: false,
         warnings: {
             let mut warnings = Vec::new();
-            if capability_enabled(prompt, "image") || capability_enabled(prompt, "embeddedContext")
-            {
-                warnings.push("The agent supports additional prompt content, but this desktop sends text prompts only.".into());
-            }
             if initialized["authMethods"]
                 .as_array()
                 .is_some_and(|methods| !methods.is_empty())
@@ -4722,10 +5133,9 @@ fn parse_plugins(value: Value) -> Result<Vec<CopilotPlugin>, Problem> {
 }
 
 fn parse_skills(value: Value) -> Result<Vec<CopilotSkill>, Problem> {
-    let records: Vec<SkillRecord> = serde_json::from_value(value).map_err(|error| {
-        Problem::with(
-            "GitHub Copilot returned invalid skill data.",
-            error.to_string(),
+    let records: Vec<SkillRecord> = serde_json::from_value(value).map_err(|_| {
+        Problem::plain(
+            "GitHub Copilot returned invalid skill data. Check `copilot skill list --json` in this workspace.",
         )
     })?;
     Ok(records
@@ -4822,7 +5232,8 @@ mod studio_catalog {
     const MAX_PAGES: usize = 1000;
     const MAX_AGENTS: usize = 100_000;
     const BOTS_PATH: &str = "/api/data/v9.2/bots";
-    const BOT_SELECT: &str = "botid,name,schemaname,modifiedon,statecode,description";
+    // Dataverse rejects the entire request if $select includes the unsupported `description`.
+    const BOT_SELECT: &str = "botid,name,schemaname,modifiedon,statecode";
     const STALE_SECONDS: u64 = 3600;
 
     fn approved_assets(source: &SourceConfig) -> bool {
@@ -6401,8 +6812,8 @@ mod tests {
         assert!(status.capabilities.list_sessions);
         assert!(status.capabilities.close_session);
         assert!(!status.capabilities.delete_session);
-        assert!(!status.capabilities.prompt_image);
-        assert!(!status.capabilities.prompt_embedded_context);
+        assert!(status.capabilities.prompt_image);
+        assert!(status.capabilities.prompt_embedded_context);
         assert!(status.capabilities.mcp_http);
         assert!(!status.capabilities.mcp_sse);
         assert_eq!(status.auth_methods[0].kind, "terminal");
@@ -6481,6 +6892,66 @@ mod tests {
     }
 
     #[test]
+    fn only_known_plain_companion_documents_are_exempt_from_agent_warnings() {
+        let doc = "# Not an agent\r\n";
+        let valid = "\u{feff}---\r\nname: Example\r\n---\r\n";
+        let malformed = "---\nname: [\n---\n";
+        for name in [
+            "AGENTS.md",
+            "bulletin.MD",
+            "Copilot-Instructions.md",
+            "README.md",
+        ] {
+            assert!(is_companion_document(Path::new(name), doc));
+            assert!(!is_companion_document(Path::new(name), valid));
+            assert!(!is_companion_document(Path::new(name), malformed));
+        }
+        for name in ["helper.md", "README.agent.md", "project-AGENTS.md"] {
+            assert!(!is_companion_document(Path::new(name), doc));
+            assert!(!is_companion_document(Path::new(name), malformed));
+            assert!(parse_agent_definition(malformed, name).is_none());
+            assert_eq!(parse_agent_definition(valid, name).unwrap().name, "Example");
+        }
+    }
+
+    #[test]
+    fn skill_warnings_keep_partial_results_without_echoing_cli_output() {
+        let stderr = "✖ The following skills failed to load:\r\n\
+            • PRIVATE-path: missing or malformed YAML frontmatter\n\
+            • PRIVATE-other: missing or malformed YAML frontmatter\n\
+            • PRIVATE-name: argument-hint must be a string\n\
+            The following skills have warnings:\n\
+            • Skipped duplicate skill name 'PRIVATE' from 'PRIVATE'; a higher-priority entry with the same name was already loaded\n\
+            unrecognized PRIVATE diagnostic";
+        let mut warnings = Vec::new();
+        let rows = resource_result(
+            Ok((vec![1], skill_list_warning(stderr.as_bytes()))),
+            &mut warnings,
+        );
+        assert_eq!(rows, [1]);
+        let [message] = &warnings[..] else {
+            panic!("expected one summary")
+        };
+        for expected in [
+            "frontmatter: 2",
+            "string: 1",
+            "higher-priority entry: 1",
+            "other diagnostic",
+            "skill list --json",
+        ] {
+            assert!(message.contains(expected));
+        }
+        assert!(!message.contains("PRIVATE"));
+        assert!(skill_list_warning(b" \r\n").is_none());
+        assert!(skill_list_warning(b"\xff").is_some());
+        assert!(skill_list_warning("✖ The following skills failed to load:".as_bytes()).is_some());
+        assert!(parse_skills(json!([{"name": {"PRIVATE": true}}]))
+            .unwrap_err()
+            .detail
+            .is_none());
+    }
+
+    #[test]
     fn auth_required_detection_accepts_protocol_and_human_forms() {
         assert!(authentication_required(&Problem::with(
             "GitHub Copilot refused the request.",
@@ -6514,6 +6985,17 @@ mod tests {
 
     fn terminal_wire_core(
         fixture: &terminals::test_fixture::Fixture,
+    ) -> (
+        Arc<RuntimeCore>,
+        terminals::test_fixture::OwnedChild,
+        std::process::ChildStdout,
+    ) {
+        terminal_wire_with_writer(fixture, start_runtime_writer)
+    }
+
+    fn terminal_wire_with_writer(
+        fixture: &terminals::test_fixture::Fixture,
+        writer: impl FnOnce(ChildStdin, Receiver<Value>, Weak<RuntimeCore>),
     ) -> (
         Arc<RuntimeCore>,
         terminals::test_fixture::OwnedChild,
@@ -6555,6 +7037,10 @@ mod tests {
                 "one".into(),
                 SessionState {
                     cwd: fixture.root.to_string_lossy().into(),
+                    agent: Some(String::new()),
+                    changing_agent: None,
+                    turn: None,
+                    lifetime: Arc::default(),
                     config_options: json!([]),
                     modes: Value::Null,
                 },
@@ -6564,7 +7050,7 @@ mod tests {
             stopping: AtomicBool::new(false),
             stderr: Mutex::default(),
         });
-        start_runtime_writer(stdin, messages, Arc::downgrade(&core));
+        writer(stdin, messages, Arc::downgrade(&core));
         core.terminals.activate("one").unwrap();
         let stdout = child.stdout.take().unwrap();
         (core, child, stdout)
@@ -6591,6 +7077,243 @@ mod tests {
             }
         });
         (core, child, receiver)
+    }
+
+    #[test]
+    fn validated_images_and_resources_reach_the_owned_acp_writer_without_text_substitution() {
+        let fixture = terminals::test_fixture::Fixture::new();
+        let (core, child, requests) = terminal_wire(&fixture);
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let capabilities = parse_status(&json!({"protocolVersion":1,"agentCapabilities":{
+            "promptCapabilities":{"image":true,"embeddedContext":true}}}))
+        .unwrap()
+        .capabilities;
+        let runtime = Arc::new(CopilotRuntime {
+            child: Mutex::new(child.into_inner()),
+            opening: Mutex::new(()),
+            core: Arc::clone(&core),
+            capabilities,
+        });
+        let state = Arc::new(CopilotRuntimeState::default());
+        *state.runtime.lock().unwrap() = Some(runtime);
+        let blocks = crate::chat_content::tests::fixture_prompt();
+        assert!(state
+            .prompt_content("other-agent".into(), "one".into(), blocks.clone())
+            .is_err());
+        let update = |session: &str, options: Value| {
+            route_runtime_message(
+                &core,
+                app.handle(),
+                json!({
+                    "jsonrpc":"2.0","method":"session/update","params":{
+                        "sessionId":session,"update":{"sessionUpdate":"config_option_update","configOptions":options}
+                    }
+                }),
+            );
+        };
+        // Approval for the default agent predates the incoming switch. Neither an update
+        // for another session nor a model-only update restores that obsolete approval.
+        update("one", json!([{"id":"agent","currentValue":"reviewer"}]));
+        update("other", json!([{"id":"agent","currentValue":""}]));
+        update("one", json!([{"id":"model","currentValue":"fixture"}]));
+        assert!(state
+            .prompt_content(String::new(), "one".into(), blocks.clone())
+            .is_err());
+        update("one", json!([{"id":"agent","currentValue":null}]));
+        assert!(state
+            .prompt_content("reviewer".into(), "one".into(), blocks.clone())
+            .is_err());
+        assert!(state
+            .prompt_content(String::new(), "one".into(), blocks.clone())
+            .is_err());
+        update("one", json!([{"id":"agent","currentValue":"reviewer"}]));
+        update("one", json!([{"id":"mode","currentValue":"plan"}]));
+        assert!(requests.try_recv().is_err());
+        let sender = Arc::clone(&state);
+        let expected = blocks.clone();
+        let sending = std::thread::spawn(move || {
+            sender.prompt_content("reviewer".into(), "one".into(), blocks)
+        });
+        let request = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(request["method"], "session/prompt");
+        assert_eq!(request["params"]["prompt"], json!(expected));
+        assert_eq!(request["params"]["prompt"][1]["type"], "image");
+        assert_eq!(request["params"]["prompt"][2]["type"], "resource");
+        route_runtime_message(
+            &core,
+            app.handle(),
+            json!({"jsonrpc":"2.0","id":request["id"],"result":{"stopReason":"end_turn"}}),
+        );
+        assert_eq!(sending.join().unwrap().unwrap().stop_reason, "end_turn");
+        update(
+            "one",
+            json!([{"id":"agent","type":"select","currentValue":"reviewer",
+                "options":[{"value":"requested"}]}]),
+        );
+        let setter = state.clone();
+        let changing = std::thread::spawn(move || {
+            setter.configure("one".into(), "agent".into(), "requested".into())
+        });
+        let request = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(request["method"], "session/set_config_option");
+        assert!(state
+            .prompt_content("reviewer".into(), "one".into(), expected)
+            .is_err());
+        route_runtime_message(
+            &core,
+            app.handle(),
+            json!({"jsonrpc":"2.0","id":request["id"],"result":{
+                "configOptions":[{"id":"agent","currentValue":"effective"}]}}),
+        );
+        assert_eq!(
+            core.sessions.lock().unwrap()["one"].agent.as_deref(),
+            Some("effective")
+        );
+        update("one", json!([{"id":"agent","currentValue":"latest"}]));
+        assert!(changing.join().unwrap().is_ok());
+        assert_eq!(
+            core.sessions.lock().unwrap()["one"].agent.as_deref(),
+            Some("latest")
+        );
+        state.shutdown();
+    }
+
+    #[test]
+    fn queued_attachment_is_refused_at_the_writer_after_recipient_switch() {
+        let fixture = terminals::test_fixture::Fixture::new();
+        let mut writer = None;
+        let (core, child, stdout) = terminal_wire_with_writer(&fixture, |stdin, queue, weak| {
+            writer = Some((stdin, queue, weak));
+        });
+        let (stdin, queue, weak) = writer.unwrap();
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let runtime = Arc::new(CopilotRuntime {
+            child: Mutex::new(child.into_inner()),
+            opening: Mutex::default(),
+            core: core.clone(),
+            capabilities: parse_status(&json!({"protocolVersion":1,"agentCapabilities":{}}))
+                .unwrap()
+                .capabilities,
+        });
+        let sender = runtime.clone();
+        let sending = std::thread::spawn(move || {
+            sender.prompt_blocks(
+                "one".into(),
+                crate::chat_content::tests::fixture_prompt(),
+                Some(""),
+                None,
+                || Ok(()),
+            )
+        });
+        let queued = queue.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(queued["method"], "session/prompt");
+        route_runtime_message(
+            &core,
+            app.handle(),
+            json!({
+                "jsonrpc":"2.0","method":"session/update","params":{"sessionId":"one","update":{
+                    "sessionUpdate":"config_option_update","configOptions":[{"id":"agent","currentValue":"different"}]
+                }}
+            }),
+        );
+        // A harmless marker follows the queued prompt through the real writer. Only the
+        // marker may reach the owned child's stdin. No live agent or capture is involved.
+        let (writer_tx, writer_rx) = mpsc::sync_channel(2);
+        writer_tx.send(queued).unwrap();
+        writer_tx.send(json!({"marker":true})).unwrap();
+        drop(writer_tx);
+        start_runtime_writer(stdin, writer_rx, weak);
+        let line = BufReader::new(stdout).lines().next().unwrap().unwrap();
+        assert!(serde_json::from_str::<Value>(&line).unwrap()["marker"] == true);
+        assert!(sending.join().unwrap().is_err());
+        assert!(queue.try_recv().is_err()); // rejection must not cancel the session
+
+        // Expiry before the writer starts must retract the queued send, not issue a
+        // session-wide cancel or leave the revoked prompt deliverable later.
+        let sender = runtime.clone();
+        let sending = std::thread::spawn(move || {
+            sender.prompt_blocks(
+                "one".into(),
+                vec![json!({"type":"text","text":"fixture"})],
+                Some("different"),
+                Some("queued-ticket"),
+                || Ok(()),
+            )
+        });
+        let queued = queue.recv_timeout(Duration::from_secs(5)).unwrap();
+        let generation = core.terminals.generation("one");
+        runtime.cancel_controlled("one", "queued-ticket").unwrap();
+        assert!(!core.commit_prompt_write(&queued));
+        assert!(sending.join().unwrap().is_err());
+        assert_eq!(core.terminals.generation("one"), generation);
+        assert!(queue.try_recv().is_err());
+    }
+
+    #[test]
+    fn controlled_cleanup_can_only_cancel_its_own_in_flight_prompt() {
+        let fixture = terminals::test_fixture::Fixture::new();
+        let (core, child, wire) = terminal_wire(&fixture);
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let runtime = Arc::new(CopilotRuntime {
+            child: Mutex::new(child.into_inner()),
+            opening: Mutex::default(),
+            core: core.clone(),
+            capabilities: parse_status(&json!({"protocolVersion":1,"agentCapabilities":{}}))
+                .unwrap()
+                .capabilities,
+        });
+        // A delayed cleanup for the first send arrives during both a manual replacement
+        // and a second controlled turn on exactly the same runtime and session.
+        for ticket in [Some("first"), None, Some("second")] {
+            let sender = runtime.clone();
+            let task = std::thread::spawn(move || {
+                sender.prompt_blocks(
+                    "one".into(),
+                    vec![json!({"type":"text","text":"fixture"})],
+                    Some(""),
+                    ticket,
+                    || Ok(()),
+                )
+            });
+            let request = wire.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert_eq!(request["method"], "session/prompt");
+            let generation = core.terminals.generation("one");
+            if ticket != Some("first") {
+                runtime.cancel_controlled("one", "first").unwrap();
+                assert_eq!(core.terminals.generation("one"), generation);
+            }
+            if ticket == Some("second") {
+                runtime.cancel_controlled("other", "second").unwrap();
+                assert_eq!(core.terminals.generation("one"), generation);
+                runtime.cancel_controlled("one", "second").unwrap();
+                assert_eq!(
+                    wire.recv_timeout(Duration::from_secs(5)).unwrap()["method"],
+                    "session/cancel"
+                );
+                let cancelled = core.terminals.generation("one");
+                assert_ne!(cancelled, generation);
+                runtime.cancel_controlled("one", "second").unwrap();
+                assert_eq!(core.terminals.generation("one"), cancelled);
+            }
+            route_runtime_message(
+                &core,
+                app.handle(),
+                json!({"jsonrpc":"2.0","id":request["id"],"result":{"stopReason":"end_turn"}}),
+            );
+            let generation = core.terminals.generation("one");
+            runtime
+                .cancel_controlled("one", ticket.unwrap_or("first"))
+                .unwrap();
+            assert_eq!(core.terminals.generation("one"), generation);
+            assert!(task.join().unwrap().is_ok());
+        }
+        assert!(wire.try_recv().is_err());
     }
 
     #[test]
@@ -7124,7 +7847,13 @@ mod tests {
                 .unwrap();
         }
         let (sender, received) = mpsc::channel();
-        core.pending.lock().unwrap().insert("99".into(), sender);
+        core.pending.lock().unwrap().insert(
+            "99".into(),
+            PendingRpc {
+                sender,
+                effect: ReplyEffect::None,
+            },
+        );
         route_runtime_message(
             &core,
             app.handle(),
@@ -7558,7 +8287,7 @@ mod tests {
         let good = "https://example.crm.dynamics.com/api/data/v9.2/bots?$skiptoken=cursor";
         let url = studio_catalog::next_link(&source, good).unwrap();
         assert!(url.query_pairs().any(|(key, value)| key == "$select"
-            && value == "botid,name,schemaname,modifiedon,statecode,description"));
+            && value == "botid,name,schemaname,modifiedon,statecode"));
         assert!(url
             .query_pairs()
             .any(|(key, value)| key == "$orderby" && value == "botid"));
@@ -7840,13 +8569,13 @@ mod tests {
 
     #[test]
     fn agent_card_projects_only_public_metadata() {
-        let text = "---\nname: 'Display name'\nid: dayour-example\nmodel: example-model\ndescription: >-\n  Declared\n  description\nmcps: [calendar, 'command --token PRIVATE']\ntools:\n  required: [search]\n  mcp:\n    files:\n      optional: [list]\n      env: {SECRET: PRIVATE}\ninstructions: PRIVATE\n---\nPRIVATE BODY";
+        let text = "---\nname: 'Display name'\nid: local-example\nmodel: example-model\ndescription: >-\n  Declared\n  description\nmcps: [calendar, 'command --token PRIVATE']\ntools:\n  required: [search]\n  mcp:\n    files:\n      optional: [list]\n      env: {SECRET: PRIVATE}\ninstructions: PRIVATE\n---\nPRIVATE BODY";
         let agent = parse_agent_definition(text, "example.md").unwrap();
         assert_eq!(agent.name, "Display name");
         assert_eq!(agent.description, "Declared description");
         assert_eq!(agent.model.as_deref(), Some("example-model"));
         let def = agent.definition.as_ref().unwrap();
-        assert_eq!(def.declared_id.as_deref(), Some("dayour-example"));
+        assert_eq!(def.declared_id.as_deref(), Some("local-example"));
         assert_eq!(def.tools.len(), 3);
         assert_eq!(def.tools[2].server.as_deref(), Some("files"));
         assert_eq!(def.omitted_entries, 1);

@@ -126,8 +126,16 @@ export const WORKSPACE_SURFACES = Object.freeze([
   { id: "cli", label: "Your CLI" },
 ] as const);
 
-/** Declarative MCP tool schemas for user-facing desktop actions, not a runnable MCP server. */
+/** Full UI declaration catalog, not runtime authority. app_control.rs advertises only its executed subset. */
 export const DESKTOP_UI_ACTIONS = Object.freeze({
+  settings_app_control: action(
+    "settings_app_control",
+    "settings",
+    "Enable or revoke local app control",
+    "Human-only native owner approval enables the private loopback service. Stopping revokes connections. Never callable through app control.",
+    noArgs,
+    "protected",
+  ),
   history_refresh_sources: action(
     "history_refresh_sources",
     "history",
@@ -645,6 +653,24 @@ export const DESKTOP_UI_ACTIONS = Object.freeze({
     "Change the locally persisted message draft.",
     args({ text: text(MAX_DRAFT_LENGTH, 0) }, ["text"]),
   ),
+  workspace_attachment_menu: action("workspace_attachment_menu", "workspace", "Add context",
+    "Open local attachment choices. Not remotely executable.", noArgs, "protected"),
+  workspace_upload: action("workspace_upload", "workspace", "Upload selected files",
+    "Choose exact PNG or UTF-8 files using the native picker. Human only.", noArgs, "protected"),
+  workspace_select_context: action("workspace_select_context", "workspace", "Select context",
+    "Review selected text or exact files for this conversation. Human only.", noArgs, "protected"),
+  workspace_capture: action("workspace_capture", "workspace", "Capture Screen",
+    "Select and approve one native window snapshot locally; never sends automatically.", noArgs, "protected"),
+  workspace_share_screen: action("workspace_share_screen", "workspace", "Share Screen",
+    "Start a bounded local preview of an explicitly approved window. Not video transmission.", noArgs, "protected"),
+  workspace_capture_source: action("workspace_capture_source", "workspace", "Choose capture source",
+    "Select a live opaque source and approve native window capture. Human only.", noArgs, "protected"),
+  workspace_capture_stop: action("workspace_capture_stop", "workspace", "Stop sharing",
+    "Revoke screen capture and discard staged screen images.", noArgs, "protected"),
+  workspace_attachment_remove: action("workspace_attachment_remove", "workspace", "Remove attachment",
+    "Remove one scoped native attachment and its grant.", noArgs, "protected"),
+  workspace_attachment_cancel: action("workspace_attachment_cancel", "workspace", "Cancel context selection",
+    "Cancel human context selection without sending a turn.", noArgs, "protected"),
   workspace_send_prompt: action(
     "workspace_send_prompt",
     "workspace",
