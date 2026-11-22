@@ -9,6 +9,7 @@ pub mod copilot_extensions;
 pub mod copilot_files;
 pub mod deployment;
 pub mod deployment_release;
+pub mod desktop_updates;
 pub mod engine;
 pub mod env;
 pub mod fleet;

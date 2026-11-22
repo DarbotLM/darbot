@@ -16,6 +16,26 @@ The integration targets:
 
 ACP v2 is currently a draft and is not a release baseline.
 
+### Verified update notices
+
+Desktop update checks are opt-in. The native checker uses the local GitHub CLI
+sign-in to inspect successful manual `desktop-build.yml` runs on
+`DarbotLM/darbot` main. It checks source ancestry, artifact identity, archive digest
+and the `release-manifest.json` installer digest before offering a newer build.
+A missing workflow, denied access or failed check is an error, not evidence that
+the application is up to date. The Actions workflow must be deployed before this
+discovery path can offer builds.
+
+Paired peers exchange update hints only after negotiating update support via TLS
+ALPN. Version-27 peers keep their unchanged task transport without unknown update
+events in the durable queue. Hints never enable polling, override GitHub evidence,
+authorize installation or suppress canonical discovery.
+
+The compact update toast supports dismissal and viewing the verified GitHub build
+page. It does not automatically download, install or restart Darbot. The UI's
+signature label reports the trusted build manifest; it is not an independent
+Authenticode attestation.
+
 ### Native Windows fleet
 
 Settings exposes an opt-in peer network, independent of the loopback app-control

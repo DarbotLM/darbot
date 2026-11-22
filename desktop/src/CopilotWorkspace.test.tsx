@@ -315,6 +315,9 @@ async function standardInvoke(
       return null;
     case "app_control_status":
       return { enabled: false, endpoint: null, discoveryFile: null };
+    case "desktop_update_status":
+      return { enabled: false, currentVersion: "test", phase: "disabled", available: null,
+        signed: null, notify: false, error: null };
     case "chat_content_activate":
     case "chat_capture_stop":
       return { attachments: [], leaseId: null };

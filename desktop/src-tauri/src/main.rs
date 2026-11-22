@@ -3307,12 +3307,20 @@ fn main() {
         .manage(desktop_window::DesktopWindowState::default())
         .manage(darbot_desktop_lib::app_control::AppControl::default())
         .manage(darbot_desktop_lib::fleet::FleetState::default())
+        .manage(Arc::new(
+            darbot_desktop_lib::desktop_updates::UpdateState::default(),
+        ))
         .manage(chat_content::ChatContent::default())
         .manage(darbot_desktop_lib::history_sources::IndexCache::default())
         .manage(Arc::new(copilot::CopilotRuntimeState::default()))
         .manage(Arc::new(copilot_extensions::ExtensionState::default()))
         .invoke_handler(tauri::generate_handler![
             darbot_desktop_lib::fleet::runtime::fleet_dispatch,
+            darbot_desktop_lib::desktop_updates::desktop_update_status,
+            darbot_desktop_lib::desktop_updates::desktop_update_check,
+            darbot_desktop_lib::desktop_updates::desktop_update_enable,
+            darbot_desktop_lib::desktop_updates::desktop_update_dismiss,
+            darbot_desktop_lib::desktop_updates::desktop_update_view,
             darbot_desktop_lib::app_control::app_control_start,
             darbot_desktop_lib::app_control::app_control_stop,
             darbot_desktop_lib::app_control::app_control_status,
@@ -3409,6 +3417,8 @@ fn main() {
             }
         })
         .setup(|app| {
+            app.state::<Arc<darbot_desktop_lib::desktop_updates::UpdateState>>()
+                .initialize(app.handle().clone());
             let fleet_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(error) = fleet_app
@@ -3489,6 +3499,8 @@ fn main() {
                     show_whichever_applies(app);
                 }
                 tauri::RunEvent::ExitRequested { api, code, .. } => {
+                    app.state::<Arc<darbot_desktop_lib::desktop_updates::UpdateState>>()
+                        .shutdown();
                     app.state::<darbot_desktop_lib::fleet::FleetState>()
                         .shutdown();
                     app.state::<darbot_desktop_lib::app_control::AppControl>()

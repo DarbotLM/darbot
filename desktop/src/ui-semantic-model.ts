@@ -128,6 +128,11 @@ export const WORKSPACE_SURFACES = Object.freeze([
 
 /** Full UI declaration catalog, not runtime authority. app_control.rs advertises only its executed subset. */
 export const DESKTOP_UI_ACTIONS = Object.freeze({
+  settings_desktop_updates: action(
+    "settings_desktop_updates", "settings", "Manage verified update notices",
+    "Check authenticated GitHub build metadata, enable periodic checks, dismiss a notice or view the verified build. Does not install or grant remote update authority.",
+    noArgs, "protected",
+  ),
   settings_app_control: action(
     "settings_app_control",
     "settings",

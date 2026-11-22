@@ -121,6 +121,7 @@ import { redactControlText, useAppControl, type ControlLease } from "./app-contr
 import { CopilotComposer, type ComposerContentHandle, type DarbotAttachment } from "./CopilotComposer";
 import { BrandLockup } from "./Welcome";
 import { FleetPanel } from "./FleetPanel";
+import { DesktopUpdates } from "./DesktopUpdates";
 
 type Message = {
   id: number;
@@ -3116,6 +3117,8 @@ export function CopilotWorkspace({
     <main
       className={`copilot-main copilot-flip-stage${desktopWindow.front ? " is-front" : ""}`}
     >
+      <DesktopUpdates mode="toast" visible={!desktopWindow.front && openDialog === null &&
+        permissions.length === 0 && elicitations.length === 0} />
       {desktopWindow.widget && (
         <section
           className="copilot-live-tile"
@@ -4117,6 +4120,7 @@ export function CopilotWorkspace({
         </div>
         <div className="copilot-dialog-body">
           {agentManagement}
+          <DesktopUpdates mode="settings" />
           <section>
             <h3>Local app control</h3>
             <FleetPanel visible={openDialog === "settings"} cwd={location?.cwd ?? ""} agents={inventory?.agents ?? []} />

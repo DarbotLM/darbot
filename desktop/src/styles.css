@@ -2584,6 +2584,28 @@ html[data-copilot-theme="dark"] .fleet-face {
   padding-top: 0.4rem;
 }
 
+.desktop-update-toast {
+  position: fixed;
+  z-index: 40;
+  right: 1rem;
+  bottom: 1rem;
+  width: min(28rem, calc(100vw - 2rem));
+  box-sizing: border-box;
+  padding: 0.85rem;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  border: 1px solid var(--focus);
+  border-radius: 0.7rem;
+  background: var(--raised);
+  color: var(--ink);
+  box-shadow: 0 4px 18px #0004;
+}
+.desktop-update-toast > div { flex: 1 1 100%; }
+.desktop-update-toast p { margin: 0.25rem 0 0; font-size: 0.8rem; }
+.desktop-widget .desktop-update-toast { right: 0.4rem; bottom: 0.4rem; width: calc(100vw - 0.8rem); }
+
 .fleet-panel { margin-block: 0.75rem; padding: 0.65rem; border: 1px solid var(--hair); border-radius: 0.6rem; }
 .fleet-panel summary { cursor: pointer; font-weight: 600; }
 .fleet-panel details, .fleet-task { margin-block: 0.65rem; }

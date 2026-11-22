@@ -58,8 +58,6 @@ const PERSONAL_AGENT_IDENTITIES: Readonly<Record<string, string>> = {
 };
 
 const defaultIcon = new URL("./marks/copilot.svg", import.meta.url).href;
-const genericIcon = new URL("../src-tauri/icons/128x128.png", import.meta.url)
-  .href;
 
 const claudeIcon = new URL("./marks/claude-agent-sdk.svg", import.meta.url)
   .href;
@@ -72,6 +70,48 @@ function labelKey(name: string) {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, " ")
     .trim();
+}
+
+export function agentArtworkSeed(id: string): string {
+  const alias = labelKey(id).replaceAll(" ", "-");
+  const mapped = (key: string) => Object.hasOwn(PERSONAL_AGENT_IDENTITIES, key)
+    ? PERSONAL_AGENT_IDENTITIES[key] : undefined;
+  return mapped(alias) ??
+    (alias.startsWith("darbot-")
+      ? mapped(`dayour-${alias.slice("darbot-".length)}`)
+      : undefined) ?? id;
+}
+
+function AgentImage({
+  src, label, className, identityCode, color = "#217346", style,
+}: {
+  src?: string;
+  label: string;
+  className?: string;
+  identityCode?: string;
+  color?: string;
+  style?: CSSProperties;
+}) {
+  const [failedSource, setFailedSource] = useState<string | null>(null);
+  const words = label.replace(/^(?:darbot|dayour)[-_ ]+/i, "").trim().split(/[\s_-]+/);
+  const glyph = (identityCode?.split("-").at(-1) ??
+    words.slice(0, 2).map((word) => Array.from(word)[0] ?? "").join("").toUpperCase()) || "D";
+  if (!src || failedSource === src) {
+    return <svg className={className} data-swarm-identity={identityCode}
+      data-agent-artwork="glyph" viewBox="0 0 32 32" style={style}
+      aria-hidden="true" focusable="false">
+      <rect x="1" y="1" width="30" height="30" rx="6" fill="#101820" stroke={color} strokeWidth="2" />
+      <path d="M3 23h26v3a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3z" fill={color} />
+      <text x="16" y="20" fill="#f2f5f4" textAnchor="middle" fontSize="13"
+        fontWeight="700" fontFamily="system-ui, sans-serif">{glyph}</text>
+    </svg>;
+  }
+  return <img className={className} data-swarm-identity={identityCode} src={src}
+    alt="" aria-hidden="true" style={style}
+    onError={() => {
+      console.warn("Darbot agent artwork could not be loaded; displaying its local identity glyph.");
+      setFailedSource(src);
+    }} />;
 }
 
 function nameBadge(name: string) {
@@ -157,7 +197,7 @@ export function AgentAttributeIcon({
       }}
     >
       {src ? (
-        <img src={src} alt="" style={{ width: "1.15em", height: "1.15em" }} />
+        <AgentImage src={src} label={label} style={{ width: "1.15em", height: "1.15em" }} />
       ) : (
         glyph
       )}
@@ -166,31 +206,28 @@ export function AgentAttributeIcon({
 }
 
 export function CopilotAgentIcon({ agent }: { agent: CopilotAgentSummary }) {
-  const alias = labelKey(agent.id).replaceAll(" ", "-");
   const identity = resolveAgentIdentity({
     id: agent.id,
     name: agent.name,
-    avatarSeed: Object.hasOwn(PERSONAL_AGENT_IDENTITIES, alias)
-      ? PERSONAL_AGENT_IDENTITIES[alias]
-      : agent.id,
+    avatarSeed: agentArtworkSeed(agent.id),
   });
   const badge =
     nameBadge(agent.name) ??
     nameBadge(agent.id) ??
     (agent.source?.provider === "copilot-studio" ? "Copilot Studio" : null);
   const avatar = (
-    <img
+    <AgentImage
+      label={agent.name || "Copilot"}
       className={`copilot-agent-icon${!identity && agent.id === "" ? " copilot-agent-icon-default" : ""}`}
-      data-swarm-identity={identity?.identityCode}
+      identityCode={identity?.identityCode}
+      color={identity?.fallbackHex}
       src={
         identity
           ? identityImageSource(identity, 32, "avatar")
           : agent.id === ""
             ? defaultIcon
-            : genericIcon
+            : undefined
       }
-      alt=""
-      aria-hidden="true"
     />
   );
   if (!badge) return avatar;
@@ -222,3 +259,4 @@ export function CopilotAgentIcon({ agent }: { agent: CopilotAgentSummary }) {
     </span>
   );
 }
+import { useState, type CSSProperties } from "react";

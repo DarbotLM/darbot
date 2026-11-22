@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+## 0.0.28
+
+- Resolve Darbot role icons through the existing canonical identity artwork and
+  retain a visible local glyph if an image cannot load.
+- Add opt-in verified GitHub Actions update discovery, authenticated peer update
+  hints and a dismissible in-app update notice. Notices never install software.
+- Preserve the compact chat, agent-scoped CLI sessions and authenticated fleet
+  delivery introduced in the preceding desktop releases.
+- Add Windows SDK MSIX packaging to the existing PowerShell production toolbox,
+  with explicit unsigned output or an explicitly supplied signing certificate.
+  Unsigned MSIX packages are not generally install-ready.
+
 ## 0.0.27
 
 - Add opt-in Windows fleet pairing with pinned mutual TLS, protected persistent

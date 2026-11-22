@@ -56,6 +56,30 @@ pub enum FleetAction {
 }
 
 impl FleetState {
+    pub fn advertise_update(&self, notice: crate::desktop_updates::UpdateHint) {
+        if notice.validate().is_err() {
+            return;
+        }
+        let Ok(node) = self.current() else {
+            return;
+        };
+        let result = node.transaction(|r| {
+            if !r.enabled || node.stop.is_cancelled() {
+                return Ok(());
+            }
+            r.advertised_updates
+                .retain(|id, _| r.peers.contains_key(id));
+            for peer in r.peers.keys().cloned().collect::<Vec<_>>() {
+                if r.advertised_updates.get(&peer) != Some(&notice) {
+                    r.advertised_updates.insert(peer, notice.clone());
+                }
+            }
+            Ok(())
+        });
+        if let Err(e) = result {
+            *node.failure.lock().unwrap() = Some(e);
+        }
+    }
     pub async fn initialize(&self, app: &tauri::AppHandle) -> Result<()> {
         let _guard = self.actions.lock().await;
         if self.node.lock().unwrap().is_some() {
@@ -114,6 +138,7 @@ impl FleetState {
                 let r = node.state.lock().unwrap();
                 let presence = node.presence.lock().unwrap();
                 Ok(json!({
+                    "desktopUpdates": app.try_state::<Arc<crate::desktop_updates::UpdateState>>().map(|state| state.status()),
                     "protocol": "darbot-fleet/1", "enabled": r.enabled && !node.stop.is_cancelled(),
                     "card": r.card(), "profiles": r.profiles, "error": node.failure.lock().unwrap().clone(),
                     "peers": r.peers.iter().map(|(id, p)| {
@@ -329,6 +354,15 @@ pub async fn fleet_dispatch(
 fn maintenance(node: Arc<Node>, app: tauri::AppHandle) {
     tauri::async_runtime::spawn(async move {
         loop {
+            if let Some(state) = app.try_state::<Arc<crate::desktop_updates::UpdateState>>() {
+                let hint = node.state.lock().unwrap().update_hint.clone();
+                if let Some(hint) = hint {
+                    state.receive_hint(hint);
+                }
+                if let Some(notice) = state.status().available {
+                    app.state::<FleetState>().advertise_update(notice);
+                }
+            }
             let result = node.maintain();
             if let Err(e) = result {
                 let _ = app.emit("fleet:problem", e);

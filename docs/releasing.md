@@ -19,6 +19,40 @@ Use `.\toolbox.ps1 Launch` from a non-elevated shell. Presence in Doctor is not 
 of provider authentication; use the node user's existing supported sign-in or official
 consent flow, never copied tokens.
 
+### EXE and MSIX production packages
+
+Run the existing PowerShell toolbox from a short local checkout path to stay
+within Windows linker path limits:
+
+```powershell
+.\scripts\toolbox.ps1 Package -Offline -WithMsix -AllowUnsignedMsix
+```
+
+`Package` builds the optimized NSIS EXE installer without running regression
+suites; `Build` includes them. Both require an absent `desktop\dist` and allocate
+a fresh Cargo target. `-Offline` applies to Cargo, not Bun or bundler downloads.
+
+To package an already built executable without rebuilding:
+
+```powershell
+.\scripts\toolbox.ps1 Msix -ApplicationPath $builtExe `
+  -ExpectedVersion $version -ExpectedExeSha256 $trustedRawExeHash `
+  -AllowUnsignedMsix
+```
+
+MSIX packaging uses Windows SDK MakeAppx with validation enabled and leaves the
+input executable unchanged. It requires WebView2 on the destination machine.
+An unsigned MSIX is an artifact for signing, not a generally install-ready
+package. Production signing requires an existing CurrentUser code-signing
+certificate matching `-MsixPublisher`, supplied with
+`-MsixCertificateThumbprint`; the toolbox never creates certificates or changes
+trust stores. `Install` continues to install the verified NSIS EXE, not MSIX.
+
+Publish distinct hashes for the installer, raw executable and MSIX. Tauri's
+installed NSIS executable may differ from the raw executable only by its standard
+bundle marker; verify the installed hash separately. Never overwrite a previously
+published binary with another build carrying the same version.
+
 The toolbox requires prior `desktop\dist` output to be moved aside before a build;
 it preserves Tauri's normal relative embedded-asset configuration. `BuiltExeSHA256`
 identifies the raw build output, not necessarily the installed payload: the NSIS

@@ -257,6 +257,10 @@ struct Record {
     round_robin: usize,
     #[serde(default)]
     published: BTreeMap<String, u64>,
+    #[serde(default)]
+    update_hint: Option<crate::desktop_updates::UpdateHint>,
+    #[serde(default)]
+    advertised_updates: BTreeMap<String, crate::desktop_updates::UpdateHint>,
 }
 impl Record {
     fn new() -> Result<Self> {
@@ -277,9 +281,20 @@ impl Record {
             tasks: BTreeMap::new(),
             round_robin: 0,
             published: BTreeMap::new(),
+            update_hint: None,
+            advertised_updates: BTreeMap::new(),
         })
     }
     fn validate(&self) -> Result<()> {
+        if self.advertised_updates.len() > MAX_PEERS
+            || self
+                .update_hint
+                .iter()
+                .chain(self.advertised_updates.values())
+                .any(|h| h.validate().is_err())
+        {
+            return Err(fail("corrupt_store", "Invalid release hint"));
+        }
         if self.version != VERSION
             || self.node_id != fingerprint(&self.certificate)
             || self.peers.len() > MAX_PEERS

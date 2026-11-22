@@ -16,11 +16,20 @@ Build/Package require desktop\dist to be absent; move prior frontend output asid
 They use the normal relative ../dist and beforeBuildCommand without Tauri overrides.
 BuiltExeSHA256 describes the raw build output, NOT the installed NSIS payload: Tauri
 may restore its UNK bundle marker after packaging an NSS-marked executable.
-Obtain ExpectedExeSha256 independently from the release coordinator's verified payload.
+For Install, obtain ExpectedExeSha256 independently from the release coordinator's verified payload.
 -Offline restricts Cargo dependency resolution; Bun and Tauri's pinned bundler tools
 can still need network access. No publishing, provider setup or live tests are requested.
 Package produces the same optimized installer as Build, without running regression suites.
 It does not mark a release as qualified or publish it.
+Build/Package -WithMsix also package the unchanged raw built executable as a real MSIX.
+Msix packages an existing trusted ApplicationPath after ExpectedVersion/ExpectedExeSha256
+verification. In Msix mode that digest identifies the supplied executable, not an NSIS payload.
+MSIX requires an already installed WebView2 Runtime; it does not provision that runtime.
+Specify -AllowUnsignedMsix for an explicitly unsigned artifact (NOT generally install-ready),
+or -MsixCertificateThumbprint for an existing CurrentUser\My code-signing certificate whose
+subject matches -MsixPublisher. No certificates are created or trusted by this script.
+An optional -MsixTimestampUrl must be an explicitly trusted HTTPS RFC3161 service.
+MsixOutputDirectory is an optional local output parent; each run creates a unique directory.
 Install needs no checkout or build tools. Supply the ORIGINAL darbot_X.Y.Z_x64-setup.exe
 and both installer and installed-executable SHA256 values from a trusted release channel,
 not hashes calculated from the download or the existing installation.
@@ -43,6 +52,10 @@ Exit 0 = success/no action needed, nonzero = invalid input, failed or refused ac
 .EXAMPLE
 .\scripts\toolbox.ps1 Package -Offline
 .EXAMPLE
+.\scripts\toolbox.ps1 Package -Offline -WithMsix -AllowUnsignedMsix
+.EXAMPLE
+.\scripts\toolbox.ps1 Msix -ApplicationPath .\darbot-desktop.exe -ExpectedVersion 0.0.27 -ExpectedExeSha256 $trustedBuildHash -AllowUnsignedMsix
+.EXAMPLE
 .\toolbox.ps1 Install -InstallerPath .\darbot_0.0.27_x64-setup.exe -ExpectedVersion 0.0.27 -ExpectedSha256 $trustedReleaseHash -ExpectedExeSha256 $trustedExeHash
 .EXAMPLE
 .\toolbox.ps1 Launch
@@ -50,7 +63,7 @@ Exit 0 = success/no action needed, nonzero = invalid input, failed or refused ac
 [CmdletBinding(PositionalBinding = $false)]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('Help','Doctor','Prerequisites','Build','Package','Install','Launch')]
+    [ValidateSet('Help','Doctor','Prerequisites','Build','Package','Msix','Install','Launch')]
     [string]$Mode = 'Help',
     [ValidateSet('Runtime','Build')] [string]$For = 'Runtime',
     [switch]$Offline,
@@ -58,7 +71,14 @@ param(
     [string]$ExpectedVersion,
     [string]$ExpectedSha256,
     [string]$ExpectedExeSha256,
-    [switch]$ReplaceSameVersion
+    [switch]$ReplaceSameVersion,
+    [switch]$WithMsix,
+    [string]$ApplicationPath,
+    [string]$MsixOutputDirectory,
+    [string]$MsixPublisher = 'CN=Darbot',
+    [switch]$AllowUnsignedMsix,
+    [string]$MsixCertificateThumbprint,
+    [string]$MsixTimestampUrl
 )
 
 Set-StrictMode -Version 3
@@ -320,7 +340,133 @@ function Assert-NsisBundle([string]$Path) {
     } finally { $r.Dispose() }
 }
 
+function Get-MsixTools {
+    if (!$MsixCertificateThumbprint -and !$AllowUnsignedMsix) {
+        throw 'MSIX requires -MsixCertificateThumbprint or explicit -AllowUnsignedMsix (not install-ready).'
+    }
+    if ($MsixCertificateThumbprint -and $AllowUnsignedMsix) { throw 'Choose signed or unsigned MSIX, not both.' }
+    if ([string]::IsNullOrWhiteSpace($MsixPublisher)) { throw 'MSIX publisher is required.' }
+    $null = [Security.Cryptography.X509Certificates.X500DistinguishedName]::new($MsixPublisher)
+    if ($MsixTimestampUrl) {
+        $uri = $null
+        if (!$MsixCertificateThumbprint -or ![Uri]::TryCreate($MsixTimestampUrl,[UriKind]::Absolute,[ref]$uri) -or
+            $uri.Scheme -ne 'https' -or $uri.UserInfo -or $uri.Fragment) {
+            throw 'Timestamping requires signing and an explicitly trusted HTTPS RFC3161 URL without credentials.'
+        }
+    }
+    if ($MsixCertificateThumbprint) {
+        if ($MsixCertificateThumbprint -notmatch '\A[0-9a-fA-F]{40}\z') { throw 'Invalid signing certificate thumbprint.' }
+        $cert = Get-Item -LiteralPath "Cert:\CurrentUser\My\$MsixCertificateThumbprint"
+        if (!$cert.HasPrivateKey -or $cert.Subject -cne $MsixPublisher -or
+            $cert.NotBefore -gt (Get-Date) -or $cert.NotAfter -le (Get-Date) -or
+            '1.3.6.1.5.5.7.3.3' -notin @($cert.EnhancedKeyUsageList | ForEach-Object { $_.ObjectId.Value })) {
+            throw 'Signing certificate must be current, have a private key and Code Signing EKU, and exactly match MsixPublisher.'
+        }
+    }
+    $kits = [Microsoft.Win32.Registry]::GetValue('HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows Kits\Installed Roots','KitsRoot10',$null)
+    if (!$kits) { $kits = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Windows Kits\10' }
+    $bin = Join-Path $kits 'bin'
+    Assert-LocalPath $bin
+    foreach ($sdk in Get-ChildItem -LiteralPath $bin -Directory -Filter '10.*' | Sort-Object { [version]$_.Name } -Descending) {
+        $make = Join-Path $sdk.FullName 'x64\makeappx.exe'
+        $sign = Join-Path $sdk.FullName 'x64\signtool.exe'
+        if ((Test-Path -LiteralPath $make -PathType Leaf) -and
+            (!$MsixCertificateThumbprint -or (Test-Path -LiteralPath $sign -PathType Leaf))) {
+            Assert-LocalPath $make
+            Assert-LocalPath $sign
+            return @{ MakeAppx = $make; SignTool = $sign }
+        }
+    }
+    throw 'Install the Windows SDK x64 MakeAppx/SignTool tools before packaging MSIX.'
+}
+
+function New-DarbotMsix([string]$Source, [string]$Version, [string]$SourceHash) {
+    $tools = Get-MsixTools
+    if (!$Source -or $Version -notmatch $stableVersion -or $SourceHash -notmatch '\A[0-9a-fA-F]{64}\z') {
+        throw 'Msix requires ApplicationPath, stable ExpectedVersion and an independently trusted ExpectedExeSha256.'
+    }
+    foreach ($part in $Version.Split('.')) {
+        if ([decimal]$part -gt 65535) { throw 'MSIX version components must be at most 65535.' }
+    }
+    $sourcePath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Source)
+    Assert-LocalPath $sourcePath
+    if ([IO.Path]::GetFileName($sourcePath) -ine 'darbot-desktop.exe') { throw 'Expected darbot-desktop.exe, not an installer.' }
+    $root = [IO.Path]::GetDirectoryName($PSScriptRoot)
+    $assets = Join-Path $root 'desktop\src-tauri\icons'
+    $output = $MsixOutputDirectory
+    if (!$output) { $output = Join-Path $root 'desktop\src-tauri\target' }
+    $output = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($output)
+    Assert-LocalPath $output
+    $run = Join-Path $output ('msix-' + [guid]::NewGuid().ToString('N'))
+    Assert-LocalPath $run
+    if (Test-Path -LiteralPath $run) { throw 'MSIX output already exists; refusing reuse.' }
+    # Hold the source read-only through packing; copy only the embedded app and explicit logos.
+    # Never sweep build directories, user profiles or session data into the package.
+    $stream = [IO.File]::Open($sourcePath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+    try {
+        Assert-X64Application $sourcePath
+        if ((Get-ProductVersion $sourcePath) -ne $Version -or
+            (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash -ine $SourceHash) {
+            throw 'MSIX source version or SHA256 differs from the trusted expected executable.'
+        }
+        $stage = Join-Path $run 'staging'
+        $null = New-Item -Path "$stage\Assets" -ItemType Directory
+        Assert-LocalPath $stage
+        $payload = Join-Path $stage 'darbot-desktop.exe'
+        [IO.File]::Copy($sourcePath,$payload,$false)
+        if ((Get-FileHash -LiteralPath $payload -Algorithm SHA256).Hash -ine $SourceHash) { throw 'MSIX payload copy hash mismatch.' }
+        Add-Type -AssemblyName System.Drawing
+        foreach ($logo in @(@('Square44x44Logo.png',44),@('Square150x150Logo.png',150),@('StoreLogo.png',50))) {
+            $path = Join-Path $assets $logo[0]
+            Assert-LocalPath $path
+            [IO.File]::Copy($path,(Join-Path "$stage\Assets" $logo[0]),$false)
+            $image = [Drawing.Image]::FromFile((Join-Path "$stage\Assets" $logo[0]))
+            try {
+                if ($image.Width -ne $logo[1] -or $image.Height -ne $logo[1]) { throw "Unexpected dimensions for $($logo[0])." }
+            } finally { $image.Dispose() }
+        }
+        $publisher = [Security.SecurityElement]::Escape($MsixPublisher)
+        $manifest = @"
+<?xml version="1.0" encoding="utf-8"?>
+<Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+ xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+ xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+ IgnorableNamespaces="uap rescap">
+ <Identity Name="Darbot.Desktop" Publisher="$publisher" Version="$Version.0" ProcessorArchitecture="x64" />
+ <Properties><DisplayName>Darbot</DisplayName><PublisherDisplayName>Darbot</PublisherDisplayName><Logo>Assets\StoreLogo.png</Logo></Properties>
+ <Dependencies><TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26100.0" /></Dependencies>
+ <Resources><Resource Language="en-us" /></Resources>
+ <Applications><Application Id="Darbot" Executable="darbot-desktop.exe" EntryPoint="Windows.FullTrustApplication">
+  <uap:VisualElements DisplayName="Darbot" Description="Darbot desktop" BackgroundColor="transparent"
+   Square150x150Logo="Assets\Square150x150Logo.png" Square44x44Logo="Assets\Square44x44Logo.png" />
+ </Application></Applications>
+ <Capabilities><rescap:Capability Name="runFullTrust" /></Capabilities>
+</Package>
+"@
+        [IO.File]::WriteAllText((Join-Path $stage 'AppxManifest.xml'),$manifest,[Text.UTF8Encoding]::new($false))
+        $label = if ($MsixCertificateThumbprint) { 'signed' } else { 'unsigned' }
+        $package = Join-Path $run "darbot_${Version}_x64_${label}.msix"
+        Assert-PlainTree ([IO.DirectoryInfo]$stage)
+        Invoke-Checked $tools.MakeAppx @('pack','/d',$stage,'/p',$package,'/o','/h','SHA256')
+        if ($MsixCertificateThumbprint) {
+            $args = @('sign','/sha1',$MsixCertificateThumbprint,'/s','My','/fd','SHA256')
+            if ($MsixTimestampUrl) { $args += @('/tr',$MsixTimestampUrl,'/td','SHA256') }
+            Invoke-Checked $tools.SignTool ($args + @($package))
+            Invoke-Checked $tools.SignTool @('verify','/pa','/v',$package)
+        }
+        Assert-LocalPath $package
+        "MsixPath: $package"
+        "MsixVersion: $Version.0"
+        "MsixBytes: $((Get-Item -LiteralPath $package).Length)"
+        "MsixSHA256: $((Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash)"
+        "MsixPayloadSHA256: $SourceHash"
+        "MsixSigningStatus: $(if ($MsixCertificateThumbprint) {'Signed; local Authenticode trust verified; target must trust publisher.'} else {'UNSIGNED - NOT generally install-ready.'})"
+        'MSIX requires an existing WebView2 Runtime. No installation, certificate creation or trust-store changes were performed.'
+    } finally { $stream.Dispose() }
+}
+
 function Invoke-Build([switch]$PackageOnly) {
+    if ($WithMsix) { $null = Get-MsixTools }
     # Never interpret an inherited target as a directory to clean. Reject
     # ambiguous configurations before installing dependencies or creating output.
     foreach ($key in 'CARGO_TARGET_DIR','CARGO_BUILD_TARGET_DIR','CARGO_BUILD_DIR','CARGO_BUILD_BUILD_DIR',
@@ -422,7 +568,8 @@ function Invoke-Build([switch]$PackageOnly) {
         "Bytes: $((Get-Item -LiteralPath $installer).Length)"
         "SHA256: $((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash)"
         "BuiltExeSHA256: $((Get-FileHash -LiteralPath $app -Algorithm SHA256).Hash)"
-        'Installed payload SHA256 is not derived here; obtain a verified NSIS payload digest from the release coordinator. Do not use BuiltExeSHA256 as ExpectedExeSha256.'
+        'Installed payload SHA256 is not derived here; obtain a verified NSIS payload digest from the release coordinator. Do not use BuiltExeSHA256 as ExpectedExeSha256 for Install.'
+        if ($WithMsix) { New-DarbotMsix $app $v (Get-FileHash -LiteralPath $app -Algorithm SHA256).Hash }
     } finally { Pop-Location }
 }
 
@@ -688,12 +835,18 @@ $status = 0
 try {
     $allowed = switch ($Mode) {
         Prerequisites { 'For' }
-        Build { 'Offline' }
-        Package { 'Offline' }
+        Build { 'Offline','WithMsix','MsixOutputDirectory','MsixPublisher','AllowUnsignedMsix','MsixCertificateThumbprint','MsixTimestampUrl' }
+        Package { 'Offline','WithMsix','MsixOutputDirectory','MsixPublisher','AllowUnsignedMsix','MsixCertificateThumbprint','MsixTimestampUrl' }
+        Msix { 'ApplicationPath','ExpectedVersion','ExpectedExeSha256','MsixOutputDirectory','MsixPublisher','AllowUnsignedMsix','MsixCertificateThumbprint','MsixTimestampUrl' }
         Install { 'InstallerPath','ExpectedVersion','ExpectedSha256','ExpectedExeSha256','ReplaceSameVersion' }
     }
-    foreach ($key in 'For','Offline','InstallerPath','ExpectedVersion','ExpectedSha256','ExpectedExeSha256','ReplaceSameVersion') {
+    foreach ($key in 'For','Offline','InstallerPath','ExpectedVersion','ExpectedSha256','ExpectedExeSha256','ReplaceSameVersion',
+        'WithMsix','ApplicationPath','MsixOutputDirectory','MsixPublisher','AllowUnsignedMsix','MsixCertificateThumbprint','MsixTimestampUrl') {
         if ($PSBoundParameters.ContainsKey($key) -and $key -notin $allowed) { throw "-$key is not used by $Mode." }
+        if ($Mode -in 'Build','Package' -and !$WithMsix -and
+            $PSBoundParameters.ContainsKey($key) -and $key -in 'MsixOutputDirectory','MsixPublisher','AllowUnsignedMsix','MsixCertificateThumbprint','MsixTimestampUrl') {
+            throw "-$key requires -WithMsix."
+        }
     }
     if ($Mode -eq 'Help') { Get-Help -Name $PSCommandPath -Full; exit 0 }
     if ([Environment]::OSVersion.Platform -ne 'Win32NT' -or ![Environment]::Is64BitProcess -or
@@ -717,6 +870,7 @@ try {
         Prerequisites { Install-Prerequisites }
         Build { Invoke-Build }
         Package { Invoke-Build -PackageOnly }
+        Msix { New-DarbotMsix $ApplicationPath $ExpectedVersion $ExpectedExeSha256 }
         Install { Install-Darbot }
         Launch { Start-Darbot }
     }
