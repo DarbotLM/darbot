@@ -3287,6 +3287,9 @@ fn quit_menu_accelerator() -> Option<&'static str> {
 }
 
 fn main() {
+    if let Some(code) = darbot_desktop_lib::native_capture::run_worker() {
+        std::process::exit(code);
+    }
     if let Some(code) = copilot_extensions::elicitation::run_pattern_worker() {
         std::process::exit(code);
     }
@@ -3303,11 +3306,13 @@ fn main() {
         .manage(Shell::default())
         .manage(desktop_window::DesktopWindowState::default())
         .manage(darbot_desktop_lib::app_control::AppControl::default())
+        .manage(darbot_desktop_lib::fleet::FleetState::default())
         .manage(chat_content::ChatContent::default())
         .manage(darbot_desktop_lib::history_sources::IndexCache::default())
         .manage(Arc::new(copilot::CopilotRuntimeState::default()))
         .manage(Arc::new(copilot_extensions::ExtensionState::default()))
         .invoke_handler(tauri::generate_handler![
+            darbot_desktop_lib::fleet::runtime::fleet_dispatch,
             darbot_desktop_lib::app_control::app_control_start,
             darbot_desktop_lib::app_control::app_control_stop,
             darbot_desktop_lib::app_control::app_control_status,
@@ -3404,6 +3409,16 @@ fn main() {
             }
         })
         .setup(|app| {
+            let fleet_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = fleet_app
+                    .state::<darbot_desktop_lib::fleet::FleetState>()
+                    .initialize(&fleet_app)
+                    .await
+                {
+                    let _ = fleet_app.emit("fleet:problem", error);
+                }
+            });
             desktop_telemetry::initialize(app.handle());
             // Where the Compose provider darbot installs itself lives, told once so every engine
             // command can put it on the child's PATH. Before anything asks for an engine.
@@ -3474,6 +3489,8 @@ fn main() {
                     show_whichever_applies(app);
                 }
                 tauri::RunEvent::ExitRequested { api, code, .. } => {
+                    app.state::<darbot_desktop_lib::fleet::FleetState>()
+                        .shutdown();
                     app.state::<darbot_desktop_lib::app_control::AppControl>()
                         .shutdown();
                     // Exit runs on the event-loop thread. Waiting there for Windows process

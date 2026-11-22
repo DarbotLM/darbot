@@ -6,10 +6,7 @@ use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
     io::Read,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
@@ -87,6 +84,9 @@ pub struct CaptureSource {
     #[cfg(windows)]
     #[serde(skip)]
     process: u32,
+    #[cfg(windows)]
+    #[serde(skip)]
+    identity: Option<Arc<crate::native_capture::WindowIdentity>>,
 }
 
 struct CaptureLease {
@@ -105,34 +105,108 @@ struct Store {
     lease: Option<CaptureLease>,
     pending_send: Option<(String, String)>,
     bound_session: Option<(String, ContentOwner, String)>,
+    capture: Option<Arc<crate::native_capture::OwnedCapture>>,
 }
 
 #[derive(Default)]
-pub struct ChatContent(Mutex<Store>, Arc<AtomicBool>);
+pub struct ChatContent(Mutex<Store>);
 
-async fn capture_native(state: &ChatContent, source: CaptureSource) -> Result<Vec<u8>, Problem> {
-    if state
-        .1
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return Err(fail(
-            "Windows is still finishing the previous capture. Stop and try again shortly.",
-        ));
+struct CaptureOperation<'a> {
+    state: &'a ChatContent,
+    worker: crate::native_capture::CancelOnDrop,
+    window: String,
+    owner: ContentOwner,
+    epoch: String,
+}
+
+impl<'a> CaptureOperation<'a> {
+    fn begin(
+        state: &'a ChatContent,
+        window: &str,
+        owner: &ContentOwner,
+        epoch: &str,
+    ) -> Result<Self, Problem> {
+        let mut store = state.0.lock().unwrap();
+        store.check(window, owner)?;
+        if store.epoch != epoch {
+            return Err(fail("Capture consent was revoked."));
+        }
+        if store.capture.is_some() {
+            return Err(fail("A selected-window capture is already running."));
+        }
+        // This Arc identifies the entire operation, including approval and post-worker commit.
+        let worker = Arc::new(crate::native_capture::OwnedCapture::default());
+        store.capture = Some(Arc::clone(&worker));
+        Ok(Self {
+            state,
+            worker: crate::native_capture::CancelOnDrop(worker),
+            window: window.into(),
+            owner: owner.clone(),
+            epoch: epoch.into(),
+        })
     }
-    struct Capturing(Arc<AtomicBool>);
-    impl Drop for Capturing {
-        fn drop(&mut self) {
-            self.0.store(false, Ordering::SeqCst);
+
+    fn check(&self, store: &Store) -> Result<(), Problem> {
+        store.check(&self.window, &self.owner)?;
+        if store.epoch != self.epoch
+            || store
+                .capture
+                .as_ref()
+                .is_none_or(|active| !Arc::ptr_eq(active, &self.worker.0))
+        {
+            return Err(fail(
+                "Capture access was revoked before the frame was ready.",
+            ));
+        }
+        Ok(())
+    }
+
+    fn finish<T>(
+        &self,
+        commit: impl FnOnce(&mut Store) -> Result<T, Problem>,
+    ) -> Result<T, Problem> {
+        // Even discard must reap before making a new operation eligible.
+        self.worker.0.cancel()?;
+        let mut store = self.state.0.lock().unwrap();
+        self.check(&store)?;
+        let result = commit(&mut store);
+        if store
+            .capture
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, &self.worker.0))
+        {
+            store.capture = None;
+        }
+        result
+    }
+}
+
+impl Drop for CaptureOperation<'_> {
+    fn drop(&mut self) {
+        if let Err(error) = self.worker.0.cancel() {
+            eprintln!("Darbot capture cleanup failed: {error:?}");
+            return;
+        }
+        let mut store = self.state.0.lock().unwrap();
+        if store
+            .capture
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, &self.worker.0))
+        {
+            store.capture = None;
         }
     }
-    let guard = Capturing(Arc::clone(&state.1));
-    tauri::async_runtime::spawn_blocking(move || {
-        let _guard = guard;
-        platform::capture(&source)
-    })
-    .await
-    .map_err(|_| fail("Windows capture did not finish."))?
+}
+
+async fn capture_native(
+    operation: &CaptureOperation<'_>,
+    source: CaptureSource,
+) -> Result<Vec<u8>, Problem> {
+    operation.check(&operation.state.0.lock().unwrap())?;
+    let worker = Arc::clone(&operation.worker.0);
+    tauri::async_runtime::spawn_blocking(move || platform::capture(&worker, &source))
+        .await
+        .map_err(|_| fail("Windows capture did not finish."))?
 }
 
 #[derive(Serialize)]
@@ -171,10 +245,21 @@ impl Store {
     }
 
     fn stop_screen(&mut self) {
+        self.stop_capture();
         self.epoch = opaque_id();
         self.lease = None;
         self.sources.clear();
         self.entries.retain(|_, entry| !entry.screen);
+    }
+
+    fn stop_capture(&mut self) {
+        if let Some(worker) = &self.capture {
+            if let Err(error) = worker.cancel() {
+                eprintln!("Darbot capture revocation failed: {error:?}");
+            } else {
+                self.capture = None;
+            }
+        }
     }
 
     fn expire(&mut self) {
@@ -246,7 +331,16 @@ impl Store {
 
 impl ChatContent {
     pub fn bind_session(&self, window: &str, owner: ContentOwner, session: &str) {
-        self.0.lock().unwrap().bound_session = Some((window.to_owned(), owner, session.to_owned()));
+        let mut store = self.0.lock().unwrap();
+        let binding = (window.to_owned(), owner, session.to_owned());
+        if store
+            .bound_session
+            .as_ref()
+            .is_some_and(|old| old != &binding)
+        {
+            store.stop_screen();
+        }
+        store.bound_session = Some(binding);
     }
 
     pub fn retire_session(&self, session: &str) {
@@ -256,17 +350,34 @@ impl ChatContent {
             .as_ref()
             .is_some_and(|(_, _, id)| id == session)
         {
+            if store
+                .bound_session
+                .as_ref()
+                .is_some_and(|(window, owner, _)| {
+                    store.active.as_ref() == Some(&(window.clone(), owner.clone()))
+                })
+            {
+                store.stop_screen();
+            }
             store.bound_session = None;
         }
     }
 
     pub fn cancel_session(&self, session_id: &str) -> bool {
         let mut store = self.0.lock().unwrap();
-        if store
+        let pending = store
             .pending_send
             .as_ref()
-            .is_some_and(|(session, _)| session == session_id)
-        {
+            .is_some_and(|(session, _)| session == session_id);
+        let capturing = store
+            .bound_session
+            .as_ref()
+            .is_some_and(|(window, owner, session)| {
+                session == session_id
+                    && store.active.as_ref() == Some(&(window.clone(), owner.clone()))
+                    && (store.capture.is_some() || store.lease.is_some())
+            });
+        if pending || capturing {
             store.stop_screen();
             store.pending_send = None;
             true
@@ -641,6 +752,7 @@ pub fn chat_content_remove(
         .as_ref()
         .is_some_and(|lease| lease.attachment_id == id)
     {
+        store.stop_capture();
         store.lease = None;
     }
     store.snapshot(window.label(), &owner)
@@ -682,6 +794,7 @@ pub async fn chat_capture_start(
             store.epoch.clone(),
         )
     };
+    let operation = CaptureOperation::begin(&state, window.label(), &owner, &epoch)?;
     let confirm_window = window.clone();
     let question = format!("{} \"{}\" for agent \"{}\", conversation \"{}\"?\n\nOnly this window will be captured. Review the preview before sending. {} Nothing is sent automatically.",
         if share { "Share snapshots of" } else { "Capture" }, source.name,
@@ -702,24 +815,27 @@ pub async fn chat_capture_start(
     .await
     .map_err(|_| fail("Capture approval did not finish."))?;
     {
-        let mut store = state.0.lock().unwrap();
-        store.check(window.label(), &owner)?;
-        if epoch != store.epoch {
-            return Err(fail("Capture was cancelled by navigation."));
-        }
-        if !approved {
+        let store = state.0.lock().unwrap();
+        operation.check(&store)?;
+    }
+    if !approved {
+        return operation.finish(|store| {
             store.stop_screen();
-            return store.snapshot(window.label(), &owner);
-        }
+            store.snapshot(window.label(), &owner)
+        });
     }
-    let captured = capture_native(&state, source.clone()).await;
-    let mut store = state.0.lock().unwrap();
-    store.check(window.label(), &owner)?;
-    if epoch != store.epoch {
-        return Err(fail(
-            "Capture access was revoked before the frame was ready.",
-        ));
-    }
+    let captured = capture_native(&operation, source.clone()).await;
+    operation.finish(|store| commit_capture(store, window.label(), &owner, source, share, captured))
+}
+
+fn commit_capture(
+    store: &mut Store,
+    window: &str,
+    owner: &ContentOwner,
+    source: CaptureSource,
+    share: bool,
+    captured: Result<Vec<u8>, Problem>,
+) -> Result<ContentSnapshot, Problem> {
     let bytes = match captured {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -728,8 +844,8 @@ pub async fn chat_capture_start(
         }
     };
     let image = entry(
-        window.label(),
-        &owner,
+        window,
+        owner,
         source.name.clone(),
         "image/png",
         bytes,
@@ -742,7 +858,7 @@ pub async fn chat_capture_start(
     )?;
     let attachment_id = image.attachment.id.clone();
     store.stop_screen();
-    store.insert(window.label(), &owner, image)?;
+    store.insert(window, owner, image)?;
     if share {
         store.lease = Some(CaptureLease {
             id: opaque_id(),
@@ -751,7 +867,7 @@ pub async fn chat_capture_start(
             attachment_id,
         });
     }
-    store.snapshot(window.label(), &owner)
+    store.snapshot(window, owner)
 }
 
 #[tauri::command]
@@ -779,47 +895,47 @@ pub async fn chat_capture_frame(
             store.epoch.clone(),
         )
     };
-    let captured = capture_native(&state, source.clone()).await;
-    let mut store = state.0.lock().unwrap();
-    store.check(window.label(), &owner)?;
-    if epoch != store.epoch
-        || store
+    let operation = CaptureOperation::begin(&state, window.label(), &owner, &epoch)?;
+    let captured = capture_native(&operation, source.clone()).await;
+    operation.finish(|store| {
+        if store
             .lease
             .as_ref()
             .is_none_or(|lease| lease.id != lease_id)
-    {
-        return Err(fail("Screen sharing stopped before the frame was ready."));
-    }
-    let result = (|| {
-        let bytes = captured?;
-        if store
-            .entries
-            .get(&id)
-            .is_some_and(|entry| entry.content == bytes)
         {
-            return Ok(());
+            return Err(fail("Screen sharing stopped before the frame was ready."));
         }
-        let image = entry(
-            window.label(),
-            &owner,
-            source.name,
-            "image/png",
-            bytes,
-            "Shared window snapshot",
-            true,
-        )?;
-        store.entries.remove(&id);
-        let new_id = image.attachment.id.clone();
-        store.insert(window.label(), &owner, image)?;
-        store.lease.as_mut().unwrap().attachment_id = new_id;
-        Ok::<_, Problem>(())
-    })();
-    if let Err(error) = result {
-        store.stop_screen();
-        return Err(error);
-    }
-    store.lease.as_mut().unwrap().last_frame = Instant::now();
-    store.snapshot(window.label(), &owner)
+        let result = (|| {
+            let bytes = captured?;
+            if store
+                .entries
+                .get(&id)
+                .is_some_and(|entry| entry.content == bytes)
+            {
+                return Ok(());
+            }
+            let image = entry(
+                window.label(),
+                &owner,
+                source.name,
+                "image/png",
+                bytes,
+                "Shared window snapshot",
+                true,
+            )?;
+            store.entries.remove(&id);
+            let new_id = image.attachment.id.clone();
+            store.insert(window.label(), &owner, image)?;
+            store.lease.as_mut().unwrap().attachment_id = new_id;
+            Ok::<_, Problem>(())
+        })();
+        if let Err(error) = result {
+            store.stop_screen();
+            return Err(error);
+        }
+        store.lease.as_mut().unwrap().last_frame = Instant::now();
+        store.snapshot(window.label(), &owner)
+    })
 }
 
 #[tauri::command]
@@ -844,6 +960,7 @@ pub fn chat_capture_stop(
             ));
         }
         // Explicit send freezes the reviewed frame. Stop without send revokes all screen grants.
+        store.stop_capture();
         store.lease = None;
         store.sources.clear();
         store.epoch = opaque_id();
@@ -958,11 +1075,19 @@ mod platform {
             "Native window capture is available only on Windows. Upload a PNG instead.",
         ))
     }
-    pub fn capture(_source: &CaptureSource) -> Result<Vec<u8>, Problem> {
+    pub fn capture(
+        _worker: &crate::native_capture::OwnedCapture,
+        _source: &CaptureSource,
+    ) -> Result<Vec<u8>, Problem> {
         Err(fail(
             "Native window capture is unavailable on this platform.",
         ))
     }
+}
+
+#[cfg(windows)]
+pub(crate) fn render_worker(target: &crate::native_capture::Target) -> Result<Vec<u8>, Problem> {
+    platform::render(target)
 }
 
 #[cfg(windows)]
@@ -979,17 +1104,25 @@ mod platform {
         if sources.len() >= 128 || !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
             return windows::core::BOOL(1);
         }
-        let mut title = [0u16; 512];
-        let length = GetWindowTextW(hwnd, &mut title);
-        if length > 0 {
+        let name = crate::native_capture::window_title(hwnd.0 as isize);
+        if !name.is_empty() {
             let mut process = 0;
             GetWindowThreadProcessId(hwnd, Some(&mut process));
-            sources.push(CaptureSource {
-                id: opaque_id(),
-                name: String::from_utf16_lossy(&title[..length as usize]),
-                handle: hwnd.0 as isize,
-                process,
-            });
+            // A destroyed HWND loses this property, even when its numeric value is reused.
+            match crate::native_capture::WindowIdentity::bind(
+                hwnd.0 as isize,
+                name.clone(),
+                crate::native_capture::CaptureKind::SelectedWindow,
+            ) {
+                Ok(identity) => sources.push(CaptureSource {
+                    id: opaque_id(),
+                    name,
+                    handle: hwnd.0 as isize,
+                    process,
+                    identity: Some(identity),
+                }),
+                Err(error) => eprintln!("Darbot capture source unavailable: {error:?}"),
+            }
         }
         windows::core::BOOL(1)
     }
@@ -1006,43 +1139,45 @@ mod platform {
         Ok(sources)
     }
 
-    fn selected_window(source: &CaptureSource) -> Result<HWND, Problem> {
-        let hwnd = HWND(source.handle as *mut std::ffi::c_void);
-        unsafe {
-            let mut process = 0;
-            GetWindowThreadProcessId(hwnd, Some(&mut process));
-            let mut title = [0u16; 512];
-            let length = GetWindowTextW(hwnd, &mut title);
-            if !IsWindow(Some(hwnd)).as_bool()
-                || !IsWindowVisible(hwnd).as_bool()
-                || IsIconic(hwnd).as_bool()
-                || IsHungAppWindow(hwnd).as_bool()
-                || process != source.process
-                || String::from_utf16_lossy(&title[..length.max(0) as usize]) != source.name
-            {
-                return Err(fail(
-                    "The selected window closed, changed, or is minimized. Select it again.",
-                ));
-            }
+    pub fn capture(
+        worker: &crate::native_capture::OwnedCapture,
+        source: &CaptureSource,
+    ) -> Result<Vec<u8>, Problem> {
+        let identity = source
+            .identity
+            .as_ref()
+            .ok_or_else(|| fail("Refresh and choose a bound capture source."))?;
+        if identity.0.handle != source.handle || identity.0.process != source.process {
+            return Err(fail("Capture source identity changed."));
         }
-        Ok(hwnd)
+        let bytes = crate::native_capture::capture(
+            worker,
+            &identity.0,
+            crate::native_capture::CAPTURE_TIMEOUT,
+        )?;
+        validate_png(&bytes)?;
+        Ok(bytes)
     }
 
-    pub fn capture(source: &CaptureSource) -> Result<Vec<u8>, Problem> {
-        let hwnd = selected_window(source)?;
+    pub fn render(target: &crate::native_capture::Target) -> Result<Vec<u8>, Problem> {
+        let hwnd = target.check()?;
         unsafe {
             let mut rect = RECT::default();
             GetWindowRect(hwnd, &mut rect).map_err(|_| fail("Capture bounds are unavailable."))?;
             let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
+            let app_only = target.kind == crate::native_capture::CaptureKind::AppOnly;
+            let dimension_limit = if app_only { 2048 } else { 4096 };
             if width <= 0
                 || height <= 0
-                || width > 4096
-                || height > 4096
+                || width > dimension_limit
+                || height > dimension_limit
                 || i64::from(width) * i64::from(height) > 4_194_304
             {
-                return Err(fail(
-                    "Resize the selected window to at most 4 megapixels before capturing.",
-                ));
+                return Err(fail(if app_only {
+                    "App-only capture is limited to 2048 by 2048 pixels."
+                } else {
+                    "Resize the selected window to at most 4 megapixels before capturing."
+                }));
             }
             let dc = GetDC(Some(hwnd));
             if dc.is_invalid() {
@@ -1062,11 +1197,15 @@ mod platform {
             }
             let previous = SelectObject(memory, bitmap.into());
             let cleared = PatBlt(memory, 0, 0, width, height, BLACKNESS).as_bool();
+            // Win32 does not make this check atomic with PrintWindow; reject changed-instance
+            // pixels again before encoding or returning any image from the disposable worker.
+            let still_selected = target.check().is_ok();
             let rendered = cleared
+                && still_selected
                 && windows::Win32::Storage::Xps::PrintWindow(
                     hwnd,
                     memory,
-                    windows::Win32::Storage::Xps::PRINT_WINDOW_FLAGS(0),
+                    windows::Win32::Storage::Xps::PRINT_WINDOW_FLAGS(if app_only { 2 } else { 0 }),
                 )
                 .as_bool();
             SelectObject(memory, previous);
@@ -1094,8 +1233,13 @@ mod platform {
             let _ = DeleteObject(bitmap.into());
             let _ = DeleteDC(memory);
             ReleaseDC(Some(hwnd), dc);
-            selected_window(source)?;
-            if rows != height || pixels.chunks_exact(4).all(|p| p[..3] == [0, 0, 0]) {
+            target.check()?;
+            let blank = if app_only {
+                pixels.chunks_exact(4).all(|p| p[..3] == pixels[..3])
+            } else {
+                pixels.chunks_exact(4).all(|p| p[..3] == [0, 0, 0])
+            };
+            if rows != height || blank {
                 return Err(fail("This window does not support rendered capture. Choose another window; no desktop fallback was used."));
             }
             for pixel in pixels.chunks_exact_mut(4) {
@@ -1123,6 +1267,17 @@ mod platform {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    pub(crate) fn revoke_owned_capture_fixture(worker: Arc<crate::native_capture::OwnedCapture>) {
+        let state = ChatContent::default();
+        {
+            let mut store = state.0.lock().unwrap();
+            store.active = Some(("main".into(), owner("fixture")));
+            store.capture = Some(worker);
+        }
+        state.revoke_window_content("main");
+        assert!(state.0.lock().unwrap().capture.is_none());
+    }
+
     fn owner(id: &str) -> ContentOwner {
         ContentOwner {
             conversation_id: id.into(),
@@ -1421,6 +1576,8 @@ pub(crate) mod tests {
                 handle: 0,
                 #[cfg(windows)]
                 process: 0,
+                #[cfg(windows)]
+                identity: None,
             },
             last_frame: Instant::now() - LEASE_TIMEOUT - Duration::from_secs(1),
             attachment_id: id.clone(),
@@ -1465,6 +1622,189 @@ pub(crate) mod tests {
         assert!(store.pending_send.is_none());
         assert_eq!(store.entries.len(), 1);
         assert!(store.entries.values().all(|entry| !entry.screen));
+    }
+
+    #[test]
+    fn cancelling_a_bound_capture_without_a_pending_send_is_session_specific() {
+        let state = ChatContent::default();
+        let owner = owner("capture");
+        state.bind_session("main", owner.clone(), "session-capture");
+        {
+            let mut store = state.0.lock().unwrap();
+            store.active = Some(("main".into(), owner));
+            store.capture = Some(Arc::new(crate::native_capture::OwnedCapture::default()));
+        }
+        assert!(!state.cancel_session("another-session"));
+        assert!(state.0.lock().unwrap().capture.is_some());
+        assert!(state.cancel_session("session-capture"));
+        assert!(state.0.lock().unwrap().capture.is_none());
+    }
+
+    #[test]
+    fn capture_requires_the_approved_conversation_and_epoch_before_registration() {
+        let state = ChatContent::default();
+        let approved = owner("approved");
+        {
+            let mut store = state.0.lock().unwrap();
+            store.active = Some(("main".into(), approved.clone()));
+            store.epoch = "approved-epoch".into();
+        }
+        assert!(
+            CaptureOperation::begin(&state, "main", &owner("other"), "approved-epoch").is_err()
+        );
+        assert!(
+            CaptureOperation::begin(&state, "another-window", &approved, "approved-epoch").is_err()
+        );
+        assert!(CaptureOperation::begin(&state, "main", &approved, "revoked-epoch").is_err());
+        assert!(state.0.lock().unwrap().capture.is_none());
+    }
+
+    fn capture_source_fixture() -> CaptureSource {
+        CaptureSource {
+            id: opaque_id(),
+            name: "not a window".into(),
+            #[cfg(windows)]
+            handle: 0,
+            #[cfg(windows)]
+            process: 0,
+            #[cfg(windows)]
+            identity: None,
+        }
+    }
+
+    fn capture_state_fixture() -> (ChatContent, ContentOwner) {
+        let state = ChatContent::default();
+        let owner = owner("capture");
+        state.bind_session("main", owner.clone(), "session-capture");
+        {
+            let mut store = state.0.lock().unwrap();
+            store.active = Some(("main".into(), owner.clone()));
+            store.epoch = opaque_id();
+        }
+        (state, owner)
+    }
+
+    #[test]
+    fn session_cancellation_invalidates_approval_running_and_completed_capture_operations() {
+        for boundary in ["pending-approval", "worker-running", "before-commit"] {
+            for share in [false, true] {
+                let (state, owner) = capture_state_fixture();
+                let epoch = state.0.lock().unwrap().epoch.clone();
+                let operation = CaptureOperation::begin(&state, "main", &owner, &epoch).unwrap();
+                let worker = operation.worker.0.clone();
+                let running = if boundary == "worker-running" {
+                    let running = worker.clone();
+                    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                    let thread = std::thread::spawn(move || {
+                        crate::native_capture::tests::run_fixture(&running, "hang", || {
+                            let _ = tx.try_send(());
+                        })
+                    });
+                    rx.recv_timeout(crate::native_capture::CAPTURE_TIMEOUT)
+                        .unwrap();
+                    Some(thread)
+                } else {
+                    if boundary == "before-commit" {
+                        crate::native_capture::tests::run_fixture(&worker, "finish", || {})
+                            .unwrap();
+                        assert!(crate::native_capture::tests::is_reaped(&worker));
+                    }
+                    None
+                };
+                assert!(!state.cancel_session("another-session"));
+                operation.check(&state.0.lock().unwrap()).unwrap();
+                assert!(state.cancel_session("session-capture"), "{boundary}");
+                if let Some(thread) = running {
+                    assert!(thread.join().unwrap().is_err());
+                }
+                assert!(crate::native_capture::tests::is_reaped(&worker));
+                assert!(
+                    operation
+                        .finish(|store| commit_capture(
+                            store,
+                            "main",
+                            &owner,
+                            capture_source_fixture(),
+                            share,
+                            Ok(png_fixture()),
+                        ))
+                        .is_err(),
+                    "{boundary}"
+                );
+                let store = state.0.lock().unwrap();
+                assert_ne!(store.epoch, epoch);
+                assert!(store.capture.is_none());
+                assert!(store.lease.is_none());
+                assert!(store.entries.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn commit_unregisters_atomically_and_later_cancellation_revokes_only_shared_capture() {
+        for share in [false, true] {
+            let (state, owner) = capture_state_fixture();
+            let epoch = state.0.lock().unwrap().epoch.clone();
+            let operation = CaptureOperation::begin(&state, "main", &owner, &epoch).unwrap();
+            let snapshot = operation
+                .finish(|store| {
+                    commit_capture(
+                        store,
+                        "main",
+                        &owner,
+                        capture_source_fixture(),
+                        share,
+                        Ok(png_fixture()),
+                    )
+                })
+                .unwrap();
+            assert_eq!(snapshot.attachments.len(), 1);
+            assert_eq!(snapshot.lease_id.is_some(), share);
+            assert!(state.0.lock().unwrap().capture.is_none());
+            assert_eq!(state.cancel_session("session-capture"), share);
+            let store = state.0.lock().unwrap();
+            assert!(store.lease.is_none());
+            assert_eq!(store.entries.is_empty(), share);
+        }
+    }
+
+    #[test]
+    fn old_operation_discard_and_drop_cannot_clear_new_capture_registration() {
+        let (state, owner) = capture_state_fixture();
+        let epoch = state.0.lock().unwrap().epoch.clone();
+        let old = CaptureOperation::begin(&state, "main", &owner, &epoch).unwrap();
+        assert!(state.cancel_session("session-capture"));
+        let epoch = state.0.lock().unwrap().epoch.clone();
+        let new = CaptureOperation::begin(&state, "main", &owner, &epoch).unwrap();
+        assert!(old
+            .finish::<()>(|_| panic!("Revoked operation must not commit"))
+            .is_err());
+        drop(old);
+        new.check(&state.0.lock().unwrap()).unwrap();
+        new.finish(|store| {
+            commit_capture(
+                store,
+                "main",
+                &owner,
+                capture_source_fixture(),
+                true,
+                Ok(png_fixture()),
+            )
+        })
+        .unwrap();
+        assert!(state.0.lock().unwrap().capture.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_approval_prevents_a_worker_launch_after_approval() {
+        let (state, owner) = capture_state_fixture();
+        let epoch = state.0.lock().unwrap().epoch.clone();
+        let operation = CaptureOperation::begin(&state, "main", &owner, &epoch).unwrap();
+        assert!(state.cancel_session("session-capture"));
+        assert!(capture_native(&operation, capture_source_fixture())
+            .await
+            .is_err());
+        assert!(crate::native_capture::tests::is_reaped(&operation.worker.0));
     }
 
     #[test]
@@ -1516,6 +1856,8 @@ pub(crate) mod tests {
             handle: 12345,
             #[cfg(windows)]
             process: 55555,
+            #[cfg(windows)]
+            identity: None,
         };
         let value = serde_json::to_value(source).unwrap();
         assert_eq!(value.as_object().unwrap().len(), 2);
@@ -1562,7 +1904,7 @@ pub(crate) mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn native_capture_encodes_only_an_owned_fixture_window_and_rejects_closed_sources() {
+    pub(crate) fn native_capture_encodes_only_an_owned_fixture_window_and_rejects_closed_sources() {
         use windows::{
             core::w,
             Win32::{
@@ -1578,6 +1920,11 @@ pub(crate) mod tests {
             lparam: LPARAM,
         ) -> LRESULT {
             if message == WM_PRINT || message == WM_PRINTCLIENT {
+                if std::env::var("DARBOT_OWNED_CAPTURE_FIXTURE").as_deref() == Ok("hung-render") {
+                    loop {
+                        std::thread::sleep(Duration::from_secs(60));
+                    }
+                }
                 let mut rect = RECT::default();
                 GetClientRect(hwnd, &mut rect).unwrap();
                 let brush = CreateSolidBrush(COLORREF(0x00ff00));
@@ -1630,17 +1977,54 @@ pub(crate) mod tests {
             name: "Darbot owned capture fixture".into(),
             handle: hwnd.0 as isize,
             process: std::process::id(),
+            identity: Some(
+                crate::native_capture::WindowIdentity::bind(
+                    hwnd.0 as isize,
+                    "Darbot owned capture fixture".into(),
+                    crate::native_capture::CaptureKind::SelectedWindow,
+                )
+                .unwrap(),
+            ),
         };
-        let bytes = platform::capture(&source).unwrap();
+        let target = &source.identity.as_ref().unwrap().0;
+        if std::env::var("DARBOT_OWNED_CAPTURE_FIXTURE").as_deref() == Ok("hung-render") {
+            // A compositor can satisfy PrintWindow without WM_PRINT. Drive the owned hung
+            // renderer explicitly so worker-lifetime tests do not depend on that OS choice.
+            unsafe {
+                SendMessageW(hwnd, WM_PRINT, Some(WPARAM(0)), Some(LPARAM(0)));
+            }
+            panic!("The owned WM_PRINT renderer must not return");
+        }
+        let bytes = render_worker(target).unwrap();
         validate_png(&bytes).unwrap();
         let reader = png::Decoder::new(std::io::Cursor::new(bytes))
             .read_info()
             .unwrap();
         assert_eq!((reader.info().width, reader.info().height), (160, 96));
-        let mut impostor = source.clone();
+        let mut impostor = target.clone();
         impostor.process = 0;
-        assert!(platform::capture(&impostor).is_err());
+        assert!(render_worker(&impostor).is_err());
+        let mut reused = target.clone();
+        reused.property = "DarbotCapture-different-instance".into();
+        assert!(render_worker(&reused).is_err());
+        let mut changed_process = target.clone();
+        changed_process.created = changed_process.created.wrapping_add(1);
+        assert!(render_worker(&changed_process).is_err());
+        let property: Vec<u16> = target.property.encode_utf16().chain(Some(0)).collect();
+        unsafe {
+            let _ = RemovePropW(hwnd, windows::core::PCWSTR(property.as_ptr()));
+        }
+        // Same HWND, PID, thread and title are insufficient without the original instance token.
+        let replacement = crate::native_capture::WindowIdentity::bind(
+            hwnd.0 as isize,
+            source.name.clone(),
+            crate::native_capture::CaptureKind::SelectedWindow,
+        )
+        .unwrap();
+        assert!(render_worker(target).is_err());
+        assert!(render_worker(&replacement.0).is_ok());
         drop(owned);
-        assert!(platform::capture(&source).is_err());
+        assert!(render_worker(target).is_err());
+        assert!(render_worker(&replacement.0).is_err());
     }
 }

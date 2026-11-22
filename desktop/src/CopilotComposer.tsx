@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
-  forwardRef, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState,
+  forwardRef, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState, type ReactNode,
 } from "react";
 
 export type ContentOwner = { conversationId: string; agentId: string };
@@ -27,6 +27,9 @@ type Props = {
   visible?: boolean;
   ensureConversation: () => void;
   onState: (count: number, protectedContent: boolean, pending: boolean) => void;
+  editor: ReactNode;
+  controls: ReactNode;
+  primaryAction: ReactNode;
 };
 const empty = (): ContentSnapshot => ({ attachments: [], leaseId: null });
 function problem(error: unknown): string {
@@ -36,7 +39,8 @@ function problem(error: unknown): string {
 
 /** Binary content is memory-only. Neither this component nor the workspace ledger persists it. */
 export const CopilotComposer = forwardRef<ComposerContentHandle, Props>(function CopilotComposer(
-  { conversationId, agentId, agentName, disabled, visible = true, ensureConversation, onState }, ref,
+  { conversationId, agentId, agentName, disabled, visible = true, ensureConversation, onState,
+    editor, controls, primaryAction }, ref,
 ) {
   const [snapshot, setSnapshot] = useState<ContentSnapshot>(empty);
   const [menu, setMenu] = useState(false);
@@ -218,23 +222,13 @@ export const CopilotComposer = forwardRef<ComposerContentHandle, Props>(function
     });
   }
 
-  return <section className="copilot-content" aria-label="Message attachments">
-    <div className="copilot-content-toolbar">
-      <button type="button" className="quiet copilot-composer-add"
-        data-ui-action="workspace_attachment_menu" aria-label="Add attachments or context"
-        aria-expanded={menu} disabled={disabled || pending}
-        onClick={() => {
-          ensureConversation();
-          setMenu(!menu);
-          if (owner && !ready) void run(() => invoke<ContentSnapshot>("chat_content_activate", { owner }),
-            (next) => { apply(next); setReady(true); });
-        }}>+</button>
-      <span className="hint">Attach context · review before sending</span>
+  return <section className="copilot-composer-input" aria-label="Message composer">
+    {editor}
+    <div className="copilot-content" aria-label="Message attachments">
       {snapshot.leaseId && <button type="button" className="quiet capture-stop"
         data-ui-action="workspace_capture_stop" disabled={pending} onClick={() => void stop()}>
         Stop sharing
       </button>}
-    </div>
     {menu && <div className="copilot-content-menu" aria-label="Add to message">
       <button type="button" className="quiet" data-ui-action="workspace_upload"
         disabled={!ready || disabled || pending} onClick={() => void pickFiles()}>Upload</button>
@@ -299,5 +293,19 @@ export const CopilotComposer = forwardRef<ComposerContentHandle, Props>(function
         Screen images are revoked when you leave this conversation or hide its composer.</p>}
     {pending && <p role="status">Waiting for local selection or approval…</p>}
     {error && <p role="alert" className="copilot-content-error">{error}</p>}
+    </div>
+    <div className="copilot-composer-toolbar" role="group" aria-label="Message controls">
+      <button type="button" className="quiet copilot-composer-add"
+        data-ui-action="workspace_attachment_menu" aria-label="Add attachments or context"
+        aria-expanded={menu} disabled={disabled || pending}
+        onClick={() => {
+          ensureConversation();
+          setMenu(!menu);
+          if (owner && !ready) void run(() => invoke<ContentSnapshot>("chat_content_activate", { owner }),
+            (next) => { apply(next); setReady(true); });
+        }}><span aria-hidden="true">+</span> Attach</button>
+      {controls}
+      <div className="copilot-composer-primary">{primaryAction}</div>
+    </div>
   </section>;
 });

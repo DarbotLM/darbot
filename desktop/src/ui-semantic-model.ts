@@ -136,6 +136,11 @@ export const DESKTOP_UI_ACTIONS = Object.freeze({
     noArgs,
     "protected",
   ),
+  settings_fleet: action(
+    "settings_fleet", "workspace", "Manage authenticated fleet",
+    "Review peer fingerprints, approved execution scopes and selected tasks in Settings. Native darbot_fleet_dispatch exposes the closed typed Fleet/1 actions; trust and task mutations require native approval and execution approval is desktop-only.",
+    noArgs, "protected",
+  ),
   history_refresh_sources: action(
     "history_refresh_sources",
     "history",
@@ -588,6 +593,14 @@ export const DESKTOP_UI_ACTIONS = Object.freeze({
     "Open chat",
     "Open a local draft or load its linked Copilot conversation.",
     args({ conversationId: text(128) }, ["conversationId"]),
+    "write",
+  ),
+  workspace_initialize_model: action(
+    "workspace_initialize_model",
+    "workspace",
+    "Discover conversation models",
+    "Open the current local CLI conversation to negotiate its available model choices without sending a prompt or changing global defaults.",
+    noArgs,
     "write",
   ),
   workspace_view_agent_history: action(

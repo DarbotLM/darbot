@@ -31,9 +31,18 @@ struct PendingConsent {
 #[derive(Default)]
 pub struct ClientConsent {
     pending: Mutex<HashMap<String, PendingConsent>>,
+    observer: Option<std::sync::Arc<dyn crate::copilot::RuntimeObserver>>,
 }
 
 impl ClientConsent {
+    pub(crate) fn with_observer(
+        observer: std::sync::Arc<dyn crate::copilot::RuntimeObserver>,
+    ) -> Self {
+        Self {
+            observer: Some(observer),
+            ..Self::default()
+        }
+    }
     pub fn ask<R: Runtime>(
         &self,
         app: &AppHandle<R>,
@@ -66,6 +75,10 @@ impl ClientConsent {
                     return Err(Problem::plain(
                         "The operation was cancelled before approval.",
                     ));
+                }
+                if let Some(observer) = &self.observer {
+                    observer.permission(request.clone());
+                    return Ok(());
                 }
                 app.emit("copilot:permission-request", request)
                     .map_err(|error| {

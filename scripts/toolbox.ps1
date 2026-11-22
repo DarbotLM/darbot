@@ -4,6 +4,7 @@
 .SYNOPSIS
 Build, install or launch the Windows x64 Darbot desktop release. No action by default.
 .DESCRIPTION
+This is the desktop release toolbox, not the repository inventory/SMB toolbox.
 Help and Doctor do not install anything. Doctor reports local presence, not sign-in,
 provider compatibility or live connectivity. Use the provider's official consent flow.
 Prerequisites defaults to Runtime (WebView2). Build tools are an explicit opt-in.
@@ -11,15 +12,21 @@ Prerequisites may download packages, accept their installer agreements and requi
 Build and Package run the checkout's code: use only a trusted, exclusively controlled checkout and
 toolchain. It uses a new target on every run, never cargo clean or recursive deletion.
 Keep the printed installer and remove old toolbox build directories yourself as needed.
+Build/Package require desktop\dist to be absent; move prior frontend output aside first.
+They use the normal relative ../dist and beforeBuildCommand without Tauri overrides.
+BuiltExeSHA256 describes the raw build output, NOT the installed NSIS payload: Tauri
+may restore its UNK bundle marker after packaging an NSS-marked executable.
+Obtain ExpectedExeSha256 independently from the release coordinator's verified payload.
 -Offline restricts Cargo dependency resolution; Bun and Tauri's pinned bundler tools
 can still need network access. No publishing, provider setup or live tests are requested.
 Package produces the same optimized installer as Build, without running regression suites.
 It does not mark a release as qualified or publish it.
 Install needs no checkout or build tools. Supply the ORIGINAL darbot_X.Y.Z_x64-setup.exe
-and the SHA256 from a trusted release channel, not a hash calculated from the download.
+and both installer and installed-executable SHA256 values from a trusted release channel,
+not hashes calculated from the download or the existing installation.
 Close Darbot (including the tray) and keep it closed until installation finishes.
 Install and Launch support the normal, non-elevated, default per-user installation only.
-After verification, Install stores only the installer and installed-exe digests under
+After verification, Install stores the version and installer/installed-exe digests under
 HKCU\Software\darbotlm\Toolbox. -ReplaceSameVersion explicitly permits replacing
 an existing version without a matching receipt. A verified identical pair is skipped.
 Exit 0 = success/no action needed, nonzero = invalid input, failed or refused action.
@@ -36,7 +43,7 @@ Exit 0 = success/no action needed, nonzero = invalid input, failed or refused ac
 .EXAMPLE
 .\scripts\toolbox.ps1 Package -Offline
 .EXAMPLE
-.\toolbox.ps1 Install -InstallerPath .\darbot_0.0.26_x64-setup.exe -ExpectedVersion 0.0.26 -ExpectedSha256 $trustedReleaseHash
+.\toolbox.ps1 Install -InstallerPath .\darbot_0.0.27_x64-setup.exe -ExpectedVersion 0.0.27 -ExpectedSha256 $trustedReleaseHash -ExpectedExeSha256 $trustedExeHash
 .EXAMPLE
 .\toolbox.ps1 Launch
 #>
@@ -50,6 +57,7 @@ param(
     [string]$InstallerPath,
     [string]$ExpectedVersion,
     [string]$ExpectedSha256,
+    [string]$ExpectedExeSha256,
     [switch]$ReplaceSameVersion
 )
 
@@ -70,9 +78,14 @@ function Find-Tool([string[]]$Names) {
 
 function Invoke-Checked([string]$Program, [string[]]$Arguments) {
     & $Program @Arguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "$([IO.Path]::GetFileName($Program)) $($Arguments[0]) failed (exit $LASTEXITCODE)."
-    }
+    Assert-ExitCode "$([IO.Path]::GetFileName($Program)) $($Arguments[0])" $LASTEXITCODE
+}
+
+function Assert-ExitCode([string]$Action, [int]$Code) {
+    if ($Code -eq 0) { return }
+    $exception = [InvalidOperationException]::new("$Action failed (exit $Code).")
+    $exception.Data['ExitCode'] = $Code
+    throw $exception
 }
 
 function Update-ProcessPath {
@@ -126,7 +139,7 @@ function Get-VSPath([switch]$RequireCompiler) {
         $components = @()
         if ($RequireCompiler) { $components = @('-requires','Microsoft.VisualStudio.Component.VC.Tools.x86.x64') }
         $path = & $where -latest -products '*' -version '[17.0,)' @components -property installationPath
-        if ($LASTEXITCODE -ne 0) { throw 'Visual Studio inventory failed.' }
+        Assert-ExitCode 'Visual Studio inventory' $LASTEXITCODE
         if ($path) { return $path }
     }
 }
@@ -231,7 +244,8 @@ function Install-Prerequisites {
                 $setup = Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Microsoft Visual Studio\Installer\setup.exe'
                 $proc = Start-Process -FilePath $setup -ArgumentList "modify --installPath `"$vs`" $components --passive --norestart" `
                     -WorkingDirectory ([Environment]::SystemDirectory) -Wait -PassThru
-                if ($proc.ExitCode -ne 0) { throw "VS Installer returned $($proc.ExitCode); finish setup/reboot if required." }
+                try { Assert-ExitCode 'VS Installer (finish setup/reboot if required)' $proc.ExitCode }
+                finally { $proc.Dispose() }
             } else {
                 Install-PackageId 'Microsoft.VisualStudio.2022.BuildTools' @('--override',"--quiet --wait --norestart $components")
             }
@@ -252,6 +266,26 @@ function Get-ProductVersion([string]$Path) {
     return $v
 }
 
+function Assert-X64Application([string]$Path) {
+    $r = [IO.BinaryReader]::new([IO.File]::OpenRead($Path))
+    try {
+        if ($r.ReadUInt16() -ne 0x5A4D) { throw 'Missing application DOS signature.' }
+        $r.BaseStream.Position = 60
+        $pe = $r.ReadInt32()
+        if ($pe -lt 64 -or $pe -gt $r.BaseStream.Length - 26) { throw 'Invalid application PE offset.' }
+        $r.BaseStream.Position = $pe
+        if ($r.ReadUInt32() -ne 0x4550 -or $r.ReadUInt16() -ne 0x8664) {
+            throw 'Expected a Windows x64 application PE.'
+        }
+        $r.BaseStream.Position = $pe + 22
+        $characteristics = $r.ReadUInt16()
+        if (!($characteristics -band 2) -or ($characteristics -band 0x2000)) {
+            throw 'Expected an executable application, not a DLL.'
+        }
+        if ($r.ReadUInt16() -ne 0x20B) { throw 'Expected a PE32+ application.' }
+    } finally { $r.Dispose() }
+}
+
 # Darbot's app and setup have the same VERSIONINFO. Distinguish the actual
 # Tauri/NSIS self-extractor by its archive header just after the PE sections.
 # This is a format check, not a substitute for an independently trusted hash.
@@ -259,19 +293,25 @@ function Assert-NsisBundle([string]$Path) {
     $r = [IO.BinaryReader]::new([IO.File]::OpenRead($Path))
     try {
         $s = $r.BaseStream
+        if ($r.ReadUInt16() -ne 0x5A4D) { throw 'Missing setup DOS signature.' }
         $s.Position = 60
         $pe = $r.ReadInt32()
+        if ($pe -lt 64 -or $pe -gt $s.Length - 24) { throw 'Invalid setup PE offset.' }
         $s.Position = $pe
         if ($r.ReadUInt32() -ne 0x4550) { throw 'Missing PE signature.' }
         $s.Position = $pe + 6
         $count = $r.ReadUInt16()
         $s.Position = $pe + 20
         $sections = $pe + 24 + $r.ReadUInt16()
+        if (!$count -or $sections + 40L * $count -gt $s.Length) { throw 'Invalid setup PE sections.' }
         $end = 0L
         for ($i = 0; $i -lt $count; $i++) {
             $s.Position = $sections + 40 * $i + 16
             $length = $r.ReadUInt32()
             $end = [Math]::Max($end, ([long]$r.ReadUInt32() + $length))
+        }
+        if ($end -lt $sections + 40L * $count -or $end -gt $s.Length - 28) {
+            throw 'Invalid NSIS archive offset.'
         }
         $s.Position = $end + 4
         if ($r.ReadUInt32() -ne 0xDEADBEEFL -or [Text.Encoding]::ASCII.GetString($r.ReadBytes(12)) -cne 'NullsoftInst') {
@@ -285,7 +325,8 @@ function Invoke-Build([switch]$PackageOnly) {
     # ambiguous configurations before installing dependencies or creating output.
     foreach ($key in 'CARGO_TARGET_DIR','CARGO_BUILD_TARGET_DIR','CARGO_BUILD_DIR','CARGO_BUILD_BUILD_DIR',
         'CARGO_BUILD_TARGET','TAURI_CONFIG','RUSTFLAGS','CARGO_ENCODED_RUSTFLAGS','CARGO_BUILD_RUSTFLAGS',
-        'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS') {
+        'CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS','RUSTC_WRAPPER','RUSTC_WORKSPACE_WRAPPER',
+        'CARGO_BUILD_RUSTC_WRAPPER','CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER') {
         if ([Environment]::GetEnvironmentVariable($key)) { throw "Unset $key in the build shell; no output was cleaned." }
     }
     if (Test-Path Env:\DARBOT_LIVE_*) { throw 'Unset Darbot live-test opt-ins before running release regressions.' }
@@ -309,24 +350,36 @@ function Invoke-Build([switch]$PackageOnly) {
         $cargoPackage -notmatch ('(?m)^version\s*=\s*"' + [regex]::Escape($v) + '"\s*$')) {
         throw 'Darbot identity or desktop package/Tauri/Cargo release versions disagree; reconcile the manifests first.'
     }
+    if ($conf.build.frontendDist -cne '../dist' -or $conf.build.beforeBuildCommand -cne 'bun run build') {
+        throw 'Build requires the normal relative ../dist and bun run build Tauri configuration.'
+    }
     $dist = Join-Path $desktop 'dist'
     Assert-LocalPath $dist
-    if ([IO.Directory]::Exists($dist)) { Assert-PlainTree ([IO.DirectoryInfo]$dist) }
+    if (Test-Path -LiteralPath $dist) { throw 'Move existing desktop\dist aside before building; refusing to overwrite prior frontend output.' }
     Assert-LocalPath "$desktop\node_modules"
-    $target = Join-Path $native ('target\tb-' + [guid]::NewGuid().ToString('N').Substring(0,12))
+    $target = Join-Path $native ('target\tb-' + [guid]::NewGuid().ToString('N'))
     Assert-LocalPath $target
+    if (Test-Path -LiteralPath $target) { throw 'Build target already exists; refusing reuse.' }
+    if ($target -match '[%!\^&|<>]') { throw 'Build checkout path contains command-shell metacharacters.' }
     Update-ProcessPath
     Assert-BuildTools
     $bun = Find-Tool @('bun.exe','bun.cmd')
     $cargo = Find-Tool 'cargo.exe'
     $null = New-Item -Path $target -ItemType Directory -ErrorAction Stop
+    Assert-LocalPath $target
     # This target is new even if an earlier build of this exact version failed.
     $env:CARGO_TARGET_DIR = $target
     $env:CARGO_BUILD_BUILD_DIR = $target
-    $cargoArgs = @('--locked')
+    $cargoConfig = Join-Path $target 'toolbox.cargo.toml'
+    $targetValue = ConvertTo-Json -InputObject $target -Compress
+    $cargoSettings = @('[build]', "target-dir = $targetValue", "build-dir = $targetValue",
+        'rustc-wrapper = ""', 'rustc-workspace-wrapper = ""', 'incremental = false') -join "`n"
+    [IO.File]::WriteAllText($cargoConfig, $cargoSettings, [Text.UTF8Encoding]::new($false))
+    $cargoArgs = @('--locked','--config',$cargoConfig)
     if ($Offline) { $cargoArgs += '--offline'; $env:CARGO_NET_OFFLINE = 'true' }
     $env:COPILOT_SKIP_CLI_DOWNLOAD = '1'
     $installer = Join-Path $target "$triple\release\bundle\nsis\darbot_${v}_x64-setup.exe"
+    $app = Join-Path $target "$triple\release\darbot-desktop.exe"
     Push-Location -LiteralPath $desktop
     try {
         Invoke-Checked $bun @('install','--frozen-lockfile')
@@ -335,9 +388,23 @@ function Invoke-Build([switch]$PackageOnly) {
                 !(Test-Path -LiteralPath "node_modules\.bin\$bin.cmd") -and
                 !(Test-Path -LiteralPath "node_modules\.bin\$bin")) { throw "Missing locked desktop binary: $bin." }
         }
+        $tauri = Join-Path $desktop 'node_modules\.bin\tauri.exe'
+        if (!(Test-Path -LiteralPath $tauri -PathType Leaf)) {
+            $tauri = Join-Path $desktop 'node_modules\.bin\tauri.cmd'
+        }
+        Assert-LocalPath $tauri
+        if (!(Test-Path -LiteralPath $tauri -PathType Leaf)) { throw 'Missing installed local Windows Tauri CLI launcher.' }
         Invoke-Checked $bun @('run','--bun','--no-install','typecheck')
         if (!$PackageOnly) { Invoke-Checked $bun @('test','./src') }
-        Invoke-Checked $bun (@('run','--bun','--no-install','tauri','build','--target',$triple,'--bundles','nsis','--ci','--') + $cargoArgs)
+        Assert-LocalPath $dist
+        if (Test-Path -LiteralPath $dist) { throw 'desktop\dist appeared before the build; refusing to overwrite it.' }
+        Invoke-Checked $tauri (@('build','--target',$triple,'--bundles','nsis','--ci','--') + $cargoArgs)
+        Assert-LocalPath $dist
+        if (!(Test-Path -LiteralPath "$dist\index.html" -PathType Leaf) -or
+            !(Test-Path -LiteralPath "$dist\assets" -PathType Container)) {
+            throw 'Normal frontend build did not produce dist\index.html and dist\assets.'
+        }
+        Assert-PlainTree ([IO.DirectoryInfo]$dist)
         Set-Location -LiteralPath $native
         # Candidate build.rs embeds the Common Controls manifest for MSVC.
         # Do not inject test-only linker flags into the release environment.
@@ -347,10 +414,15 @@ function Invoke-Build([switch]$PackageOnly) {
             throw 'Expected new version-matched x64 NSIS bundle was not produced.'
         }
         Assert-NsisBundle $installer
+        Assert-LocalPath $app
+        Assert-X64Application $app
+        if ((Get-ProductVersion $app) -ne $v) { throw 'Built application and installer versions disagree.' }
         "InstallerPath: $installer"
         "Version: $v"
         "Bytes: $((Get-Item -LiteralPath $installer).Length)"
         "SHA256: $((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash)"
+        "BuiltExeSHA256: $((Get-FileHash -LiteralPath $app -Algorithm SHA256).Hash)"
+        'Installed payload SHA256 is not derived here; obtain a verified NSIS payload digest from the release coordinator. Do not use BuiltExeSHA256 as ExpectedExeSha256.'
     } finally { Pop-Location }
 }
 
@@ -371,6 +443,7 @@ function Get-InstalledVersion {
         $reg.GetValue('MainBinaryName') -ine 'darbot-desktop.exe' -or
         ([string]$reg.GetValue('InstallLocation')).Trim('"') -ine $installDir -or
         !(Test-Path -LiteralPath $installedExe -PathType Leaf)) { throw 'Unexpected or incomplete per-user Darbot installation.' }
+    Assert-X64Application $installedExe
     $v = Get-ProductVersion $installedExe
     if ($v -ne $reg.GetValue('DisplayVersion')) { throw 'Installed PE and uninstall registration disagree.' }
     return $v
@@ -388,9 +461,18 @@ function Get-InstallAction([string]$Old, [string]$New, [bool]$SamePayload, [swit
     return 'Update'
 }
 
+function Get-ToolboxReceipt {
+    return [pscustomobject]@{
+        Payload = [string][Microsoft.Win32.Registry]::GetValue($receipt,'VerifiedPayload','')
+        Version = [string][Microsoft.Win32.Registry]::GetValue($receipt,'VerifiedVersion','')
+    }
+}
+
 function Install-Darbot {
-    if ($ExpectedVersion -notmatch $stableVersion -or $ExpectedSha256 -notmatch '\A[0-9a-f]{64}\z' -or !$InstallerPath) {
-        throw 'Install requires -InstallerPath, -ExpectedVersion X.Y.Z and a trusted 64-digit -ExpectedSha256.'
+    Assert-StandardUser
+    if ($ExpectedVersion -notmatch $stableVersion -or $ExpectedSha256 -notmatch '\A[0-9a-f]{64}\z' -or
+        $ExpectedExeSha256 -notmatch '\A[0-9a-f]{64}\z' -or !$InstallerPath) {
+        throw 'Install requires -InstallerPath, -ExpectedVersion X.Y.Z and trusted 64-digit -ExpectedSha256 and -ExpectedExeSha256.'
     }
     $null = [version]$ExpectedVersion
     $leaf = "darbot_${ExpectedVersion}_x64-setup.exe"
@@ -413,12 +495,12 @@ function Install-Darbot {
         $same = $false
         if ($old -eq $ExpectedVersion) {
             $appHash = (Get-FileHash -LiteralPath $installedExe -Algorithm SHA256).Hash
-            $known = [Microsoft.Win32.Registry]::GetValue($receipt,'VerifiedPayload','')
-            $same = $known -eq "${digest}:$appHash"
+            $known = Get-ToolboxReceipt
+            $same = $known.Payload -eq "${digest}:$appHash" -and $appHash -eq $ExpectedExeSha256 -and
+                (!$known.Version -or $known.Version -eq $ExpectedVersion)
         }
         $action = Get-InstallAction $old $ExpectedVersion $same -Replace:$ReplaceSameVersion
         if ($action -eq 'Skip') { Write-Host "Already installed: verified $old payload."; return }
-        Assert-StandardUser
         if (!(Test-WebView)) { throw 'WebView2 missing. Run Prerequisites -For Runtime before Install.' }
         if (Test-Path -LiteralPath $installDir) {
             Assert-PlainTree ([IO.DirectoryInfo]$installDir)
@@ -432,10 +514,16 @@ function Install-Darbot {
         }
         Write-Host "Installing Darbot $ExpectedVersion ($flags). Keep Darbot closed."
         $proc = Start-Process -FilePath $file -ArgumentList $flags -WorkingDirectory ([Environment]::SystemDirectory) -PassThru -Wait
-        if ($proc.ExitCode -ne 0) { throw "NSIS failed (exit $($proc.ExitCode))." }
+        try { Assert-ExitCode 'NSIS' $proc.ExitCode }
+        finally { $proc.Dispose() }
         if ((Get-InstalledVersion) -ne $ExpectedVersion) { throw 'Installation did not produce the expected registered Darbot PE.' }
-        $appHash = (Get-FileHash -LiteralPath $installedExe -Algorithm SHA256).Hash
-        [Microsoft.Win32.Registry]::SetValue($receipt,'VerifiedPayload',"${digest}:$appHash")
+        $appStream = [IO.File]::Open($installedExe,'Open','Read','Read')
+        try {
+            $appHash = (Get-FileHash -InputStream $appStream -Algorithm SHA256).Hash
+            if ($appHash -ne $ExpectedExeSha256) { throw 'Installed executable SHA256 differs from the trusted release payload; no receipt recorded.' }
+            [Microsoft.Win32.Registry]::SetValue($receipt,'VerifiedVersion',$ExpectedVersion)
+            [Microsoft.Win32.Registry]::SetValue($receipt,'VerifiedPayload',"${digest}:$appHash")
+        } finally { $appStream.Dispose() }
         Write-Host "Installed and verified Darbot $ExpectedVersion."
     } finally { $stream.Dispose() }
 }
@@ -447,39 +535,150 @@ function Assert-StandardUser {
     }
 }
 
+function Initialize-DesktopInterop {
+    if ('DarbotDesktopToolbox.Native' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+using System.Text;
+
+namespace DarbotDesktopToolbox {
+    public static class Native {
+        [DllImport("advapi32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool CloseHandle(IntPtr handle);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool QueryFullProcessImageName(IntPtr process, uint flags, StringBuilder name, ref uint size);
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool IsWindowVisible(IntPtr window);
+        [DllImport("user32.dll")]
+        public static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+
+        public static string OwnerSid(IntPtr process) {
+            IntPtr token;
+            if (!OpenProcessToken(process, 8, out token))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            try {
+                using (var identity = new WindowsIdentity(token)) { return identity.User.Value; }
+            } finally { CloseHandle(token); }
+        }
+
+        public static string ImagePath(IntPtr process) {
+            uint size = 32768;
+            var name = new StringBuilder((int)size);
+            if (!QueryFullProcessImageName(process, 0, name, ref size))
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            return name.ToString();
+        }
+    }
+}
+'@
+}
+
+function Assert-OwnedDarbot([Diagnostics.Process]$Process, [long]$StartTicks = 0) {
+    # Retain the kernel process handle before querying identity. A recycled PID
+    # must never redirect activation or window verification to a replacement.
+    $handle = $Process.Handle
+    if ($Process.HasExited) {
+        Assert-ExitCode 'Darbot' $Process.ExitCode
+        throw 'The owned Darbot instance exited; no replacement instance accepted.'
+    }
+    $ticks = $Process.StartTime.ToUniversalTime().Ticks
+    $current = [Diagnostics.Process]::GetCurrentProcess()
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    try {
+        if (($StartTicks -and $ticks -ne $StartTicks) -or $Process.SessionId -ne $current.SessionId -or
+            [DarbotDesktopToolbox.Native]::ImagePath($handle) -ine $installedExe -or
+            [DarbotDesktopToolbox.Native]::OwnerSid($handle) -ne $identity.User.Value) {
+            throw 'Darbot process identity is not the installed executable owned by this user in this session.'
+        }
+    } finally {
+        $identity.Dispose()
+        $current.Dispose()
+    }
+    if ($Process.HasExited) {
+        Assert-ExitCode 'Darbot' $Process.ExitCode
+        throw 'The owned Darbot instance exited during identity verification.'
+    }
+    return $ticks
+}
+
+function Test-VisibleDarbotWindow([Diagnostics.Process]$Process) {
+    $window = $Process.MainWindowHandle
+    if ($window -eq [IntPtr]::Zero -or ![DarbotDesktopToolbox.Native]::IsWindowVisible($window)) { return $false }
+    $windowProcessId = [uint32]0
+    $thread = [DarbotDesktopToolbox.Native]::GetWindowThreadProcessId($window, [ref]$windowProcessId)
+    return ($thread -ne 0 -and $windowProcessId -eq $Process.Id -and !$Process.HasExited)
+}
+
+function Assert-LaunchReceipt([string]$Version, [string]$AppHash) {
+    $known = Get-ToolboxReceipt
+    if ($known.Payload -notmatch '\A[0-9a-f]{64}:([0-9a-f]{64})\z' -or $Matches[1] -ne $AppHash -or
+        ($known.Version -and $known.Version -ne $Version)) {
+        throw 'Installed executable has no matching verified installer/payload receipt. Reverify with Install and trusted release hashes.'
+    }
+}
+
 function Start-Darbot {
     Assert-StandardUser
     $v = Get-InstalledVersion
     if (!$v) { throw 'No default per-user Darbot installation found.' }
     if (!(Test-WebView)) { throw 'WebView2 missing. Run Prerequisites -For Runtime first.' }
-    $apps = @([Diagnostics.Process]::GetProcessesByName('darbot-desktop'))
-    if ($apps.Count) {
-        if ($apps.Count -ne 1 -or $apps[0].SessionId -ne [Diagnostics.Process]::GetCurrentProcess().SessionId -or
-            $apps[0].MainModule.FileName -ine $installedExe) { throw 'Another Darbot instance exists; no second instance started.' }
-        $proc = $apps[0]
-        $outcome = 'Already running'
-        if ($proc.MainWindowHandle -eq [IntPtr]::Zero) {
-            # Darbot handles a second launch by revealing its existing tray window.
-            $activation = Start-Process -FilePath $installedExe -WorkingDirectory $installDir -PassThru
-            $activation.Dispose()
-            $outcome = 'Requested existing window'
-        }
-    } else {
-        $proc = Start-Process -FilePath $installedExe -WorkingDirectory $installDir -PassThru
-        $outcome = 'Started'
-    }
+    $stream = [IO.File]::Open($installedExe,'Open','Read','Read')
+    $apps = @()
+    $proc = $null
+    $activation = $null
     try {
+        Assert-LaunchReceipt $v (Get-FileHash -InputStream $stream -Algorithm SHA256).Hash
+        Initialize-DesktopInterop
+        $apps = @([Diagnostics.Process]::GetProcessesByName('darbot-desktop'))
+        if ($apps.Count) {
+            if ($apps.Count -ne 1) { throw 'Multiple Darbot instances exist; no second instance started.' }
+            $proc = $apps[0]
+            $startTicks = Assert-OwnedDarbot $proc
+            $outcome = 'Already running'
+            $proc.Refresh()
+            if (!(Test-VisibleDarbotWindow $proc)) {
+                $null = Assert-OwnedDarbot $proc $startTicks
+                # Only the verified installed executable may request the existing
+                # single-instance callback; never substitute a newly discovered PID.
+                $activation = Start-Process -FilePath $installedExe -WorkingDirectory $installDir -PassThru
+                $outcome = 'Activated existing window'
+            }
+        } else {
+            $proc = Start-Process -FilePath $installedExe -WorkingDirectory $installDir -PassThru
+            $startTicks = Assert-OwnedDarbot $proc
+            $outcome = 'Started'
+        }
         $timer = [Diagnostics.Stopwatch]::StartNew()
         do {
             $proc.Refresh()
-            if ($proc.HasExited) { throw "Darbot exited before becoming responsive (exit $($proc.ExitCode))." }
-            if ($proc.MainWindowHandle -ne [IntPtr]::Zero -and $proc.Responding) {
-                Write-Host "${outcome}: Darbot $v has a responsive window."; return
+            $null = Assert-OwnedDarbot $proc $startTicks
+            $activationComplete = !$activation
+            if ($activation -and $activation.HasExited) {
+                Assert-ExitCode 'Darbot single-instance activation' $activation.ExitCode
+                $activationComplete = $true
+            }
+            if ($activationComplete -and (Test-VisibleDarbotWindow $proc) -and $proc.Responding) {
+                $null = Assert-OwnedDarbot $proc $startTicks
+                Write-Host "${outcome}: Darbot $v has a responsive visible window (PID $($proc.Id))."; return
             }
             Start-Sleep -Milliseconds 250
         } while ($timer.Elapsed.TotalSeconds -lt 20)
-        throw 'No responsive Darbot window confirmed within 20s. Check the tray; no process was closed or restarted.'
-    } finally { $proc.Dispose() }
+        throw 'No responsive visible window on the original owned Darbot instance and completed activation confirmed within 20s. No process was closed or restarted.'
+    } finally {
+        if ($activation) { $activation.Dispose() }
+        foreach ($app in $apps) { $app.Dispose() }
+        if (!$apps.Count -and $proc) { $proc.Dispose() }
+        $stream.Dispose()
+    }
 }
 
 $savedEnv = @{}
@@ -491,9 +690,9 @@ try {
         Prerequisites { 'For' }
         Build { 'Offline' }
         Package { 'Offline' }
-        Install { 'InstallerPath','ExpectedVersion','ExpectedSha256','ReplaceSameVersion' }
+        Install { 'InstallerPath','ExpectedVersion','ExpectedSha256','ExpectedExeSha256','ReplaceSameVersion' }
     }
-    foreach ($key in 'For','Offline','InstallerPath','ExpectedVersion','ExpectedSha256','ReplaceSameVersion') {
+    foreach ($key in 'For','Offline','InstallerPath','ExpectedVersion','ExpectedSha256','ExpectedExeSha256','ReplaceSameVersion') {
         if ($PSBoundParameters.ContainsKey($key) -and $key -notin $allowed) { throw "-$key is not used by $Mode." }
     }
     if ($Mode -eq 'Help') { Get-Help -Name $PSCommandPath -Full; exit 0 }
@@ -501,7 +700,7 @@ try {
         [Microsoft.Win32.Registry]::GetValue('HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\Session Manager\Environment',
             'PROCESSOR_ARCHITECTURE','') -ine 'AMD64') { throw 'Use 64-bit PowerShell on native Windows x64.' }
     if ($Mode -in 'Build','Package','Prerequisites') {
-        foreach ($key in 'Path','CARGO_TARGET_DIR','CARGO_BUILD_BUILD_DIR','CARGO_NET_OFFLINE','COPILOT_SKIP_CLI_DOWNLOAD',
+        foreach ($key in 'Path','CARGO_TARGET_DIR','CARGO_BUILD_BUILD_DIR','CARGO_NET_OFFLINE','COPILOT_SKIP_CLI_DOWNLOAD','TAURI_CONFIG',
             'RUSTUP_TOOLCHAIN','RUSTUP_AUTO_INSTALL') {
             $savedEnv[$key] = [Environment]::GetEnvironmentVariable($key)
         }
@@ -524,6 +723,7 @@ try {
 } catch {
     [Console]::Error.WriteLine("Darbot ${Mode}: $($_.Exception.Message)")
     $status = 1
+    if ($_.Exception.Data.Contains('ExitCode')) { $status = [int]$_.Exception.Data['ExitCode'] }
 } finally {
     if ($held) { $lock.ReleaseMutex() }
     if ($lock) { $lock.Dispose() }

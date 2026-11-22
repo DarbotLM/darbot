@@ -119,7 +119,10 @@ pub(super) fn write_discovery(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-pub(super) fn app_window(_window: &tauri::WebviewWindow) -> Result<serde_json::Value> {
+pub(super) fn app_window(
+    _worker: &crate::native_capture::OwnedCapture,
+    _window: &tauri::WebviewWindow,
+) -> Result<serde_json::Value> {
     Err(error(
         "unavailable",
         "App-only native capture is currently supported on Windows",
@@ -127,114 +130,55 @@ pub(super) fn app_window(_window: &tauri::WebviewWindow) -> Result<serde_json::V
 }
 
 #[cfg(windows)]
-pub(super) fn app_window(window: &tauri::WebviewWindow) -> Result<serde_json::Value> {
-    use base64::Engine;
-    use windows::Win32::{
-        Foundation::{HWND, RECT},
-        Graphics::Gdi::*,
-        UI::WindowsAndMessaging::{GetWindowRect, IsIconic, IsWindowVisible},
-    };
+pub(super) fn app_window(
+    worker: &crate::native_capture::OwnedCapture,
+    window: &tauri::WebviewWindow,
+) -> Result<serde_json::Value> {
     let handle = window
         .hwnd()
         .map_err(|_| error("unavailable", "App window handle unavailable"))?;
-    let hwnd = HWND(handle.0);
-    // PrintWindow renders this process's known HWND into an off-screen bitmap. It never samples
-    // the desktop DC, other windows, or the user's monitor. No image is written to disk.
-    unsafe {
-        if IsIconic(hwnd).as_bool() || !IsWindowVisible(hwnd).as_bool() {
-            return Err(error(
-                "unavailable",
-                "Capture requires a visible, non-minimized app window",
-            ));
-        }
-        let mut rect = RECT::default();
-        GetWindowRect(hwnd, &mut rect)
-            .map_err(|_| error("unavailable", "App window bounds unavailable"))?;
-        let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
-        if width <= 0 || height <= 0 || width > 2048 || height > 2048 {
-            return Err(error(
-                "unavailable",
-                "Capture is limited to 2048 × 2048 app pixels",
-            ));
-        }
-        let dc = GetDC(Some(hwnd));
-        if dc.is_invalid() {
-            return Err(error("unavailable", "App render context unavailable"));
-        }
-        let memory = CreateCompatibleDC(Some(dc));
-        let bitmap = CreateCompatibleBitmap(dc, width, height);
-        if memory.is_invalid() || bitmap.is_invalid() {
-            if !bitmap.is_invalid() {
-                let _ = DeleteObject(bitmap.into());
-            }
-            if !memory.is_invalid() {
-                let _ = DeleteDC(memory);
-            }
-            ReleaseDC(Some(hwnd), dc);
-            return Err(error("unavailable", "App capture allocation failed"));
-        }
-        let previous = SelectObject(memory, bitmap.into());
-        let rendered = windows::Win32::Storage::Xps::PrintWindow(
-            hwnd,
-            memory,
-            windows::Win32::Storage::Xps::PRINT_WINDOW_FLAGS(2),
+    let identity = crate::native_capture::WindowIdentity::bind(
+        handle.0 as isize,
+        crate::native_capture::window_title(handle.0 as isize),
+        crate::native_capture::CaptureKind::AppOnly,
+    )
+    .map_err(|_| {
+        error(
+            "unavailable",
+            "Cannot bind Darbot's current window instance",
         )
-        .as_bool();
-        SelectObject(memory, previous);
-        let mut info = BITMAPINFO::default();
-        info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-        info.bmiHeader.biWidth = width;
-        info.bmiHeader.biHeight = -height;
-        info.bmiHeader.biPlanes = 1;
-        info.bmiHeader.biBitCount = 32;
-        info.bmiHeader.biCompression = BI_RGB.0;
-        let mut pixels = vec![0u8; width as usize * height as usize * 4];
-        let rows = if rendered {
-            GetDIBits(
-                dc,
-                bitmap,
-                0,
-                height as u32,
-                Some(pixels.as_mut_ptr().cast()),
-                &mut info,
-                DIB_RGB_COLORS,
-            )
-        } else {
-            0
-        };
-        let _ = DeleteObject(bitmap.into());
-        let _ = DeleteDC(memory);
-        ReleaseDC(Some(hwnd), dc);
-        if rows != height || pixels.chunks_exact(4).all(|p| p[0..3] == pixels[0..3]) {
-            return Err(error(
-                "unavailable",
-                "App did not provide a current rendered image",
-            ));
-        }
-        for pixel in pixels.chunks_exact_mut(4) {
-            pixel.swap(0, 2);
-            pixel[3] = 255;
-        }
-        let mut encoded = Vec::new();
-        {
-            let mut encoder = png::Encoder::new(&mut encoded, width as u32, height as u32);
-            encoder.set_color(png::ColorType::Rgba);
-            encoder.set_depth(png::BitDepth::Eight);
-            let mut writer = encoder
-                .write_header()
-                .map_err(|_| error("unavailable", "PNG encoder failed"))?;
-            writer
-                .write_image_data(&pixels)
-                .map_err(|_| error("unavailable", "PNG encoding failed"))?;
-        }
-        if encoded.len() > 2 * 1024 * 1024 {
-            return Err(error("unavailable", "App image exceeds 2 MiB limit"));
-        }
-        Ok(
-            serde_json::json!({"mimeType":"image/png","width":width,"height":height,
-            "capturedAt":super::now_ms(),"data":base64::engine::general_purpose::STANDARD.encode(encoded)}),
-        )
+    })?;
+    app_target(worker, &identity.0)
+}
+
+#[cfg(windows)]
+fn app_target(
+    worker: &crate::native_capture::OwnedCapture,
+    target: &crate::native_capture::Target,
+) -> Result<serde_json::Value> {
+    use base64::Engine;
+    if target.kind != crate::native_capture::CaptureKind::AppOnly
+        || target.process != std::process::id()
+    {
+        return Err(error(
+            "forbidden",
+            "Capture requires Darbot's app-only identity",
+        ));
     }
+    let encoded =
+        crate::native_capture::capture(worker, target, crate::native_capture::CAPTURE_TIMEOUT)
+            .map_err(|problem| error("unavailable", &problem.said))?;
+    let reader = png::Decoder::new(std::io::Cursor::new(&encoded))
+        .read_info()
+        .map_err(|_| error("unavailable", "Capture worker returned an invalid PNG"))?;
+    let (width, height) = (reader.info().width, reader.info().height);
+    if width == 0 || height == 0 || width > 2048 || height > 2048 {
+        return Err(error("unavailable", "App capture exceeds its pixel limit"));
+    }
+    Ok(
+        serde_json::json!({"mimeType":"image/png","width":width,"height":height,
+        "capturedAt":super::now_ms(),"data":base64::engine::general_purpose::STANDARD.encode(encoded)}),
+    )
 }
 
 #[cfg(test)]

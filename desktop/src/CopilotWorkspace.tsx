@@ -120,6 +120,7 @@ import { DESKTOP_SEMANTIC_MODEL } from "./ui-semantic-model";
 import { redactControlText, useAppControl, type ControlLease } from "./app-control";
 import { CopilotComposer, type ComposerContentHandle, type DarbotAttachment } from "./CopilotComposer";
 import { BrandLockup } from "./Welcome";
+import { FleetPanel } from "./FleetPanel";
 
 type Message = {
   id: number;
@@ -2031,20 +2032,54 @@ export function CopilotWorkspace({
   }
 
   async function configureSession(configId: string, value: string) {
-    if (!session) return;
+    if (!session || busy || operationRef.current || cancellingRef.current > 0) return;
+    const option = findConfigOption(configOptions, configId);
+    if (!option?.options.some((item) => item.value === value && !isConfigValueDisabled(item))) return;
+    const targetSessionId = session.sessionId;
+    const targetConversationId = conversationIdRef.current;
+    const isCurrent = () => mountedRef.current && sessionIdRef.current === targetSessionId &&
+      conversationIdRef.current === targetConversationId;
+    operationRef.current = true;
     setBusy(true);
     setFailure(null);
     try {
       const result = await invoke<{ configOptions: ConfigOption[] }>(
         "copilot_session_configure",
-        { sessionId: session.sessionId, configId, value },
+        { sessionId: targetSessionId, configId, value },
       );
-      if (!mountedRef.current) return;
+      if (!isCurrent()) return;
       applySessionConfig(result.configOptions ?? []);
+    } catch (error) {
+      if (isCurrent()) setFailure(asProblem(error));
+    } finally {
+      operationRef.current = false;
+      if (mountedRef.current) setBusy(false);
+    }
+  }
+
+  /** Negotiate this conversation's real choices without submitting its draft. */
+  async function initializeComposerModel() {
+    if (session || !location || busy || operationRef.current || !eventsReady ||
+      !savedWorkspace.ok || dashboardId !== null || attachmentPending ||
+      cancellingRef.current > 0 || localBlock(selectedAgentId)) return;
+    operationRef.current = true;
+    const chat = activeConversation ?? {
+      ...createConversationDraft(location.cwd, selectedAgentId,
+        inventory?.agents.find((agent) => agent.id === selectedAgentId)?.name ??
+          (selectedAgentId || "Copilot CLI")),
+      draft: prompt,
+    };
+    if (!activeConversation) selectConversation(chat);
+    try {
+      const next = chat.sessionId ? await loadSession(chat, true) : await startSession(chat);
+      if (next && mountedRef.current) {
+        const problem = await rememberChat(next, chat.agentId, chat.conversationId, chat.title);
+        if (problem) setFailure(problem);
+      }
     } catch (error) {
       if (mountedRef.current) setFailure(asProblem(error));
     } finally {
-      if (mountedRef.current) setBusy(false);
+      operationRef.current = false;
     }
   }
 
@@ -3294,7 +3329,7 @@ export function CopilotWorkspace({
                                     : null
                                 }
                                 type="button"
-                                className="quiet"
+                                className="quiet copilot-open-conversation"
                                 data-ui-action="workspace_open_chat"
                                 aria-current={
                                   chat.conversationId === activeConversationId
@@ -3477,7 +3512,7 @@ export function CopilotWorkspace({
                   disabled={!eventsReady || !!localBlock(activeChat.agentId)}
                   onClick={() => void loadSession(activeChat)}
                 >
-                  Open selected session: {activeChat.title}
+                  Continue conversation
                 </button>
               )}
               <div className="copilot-messages-wrap">
@@ -3493,8 +3528,7 @@ export function CopilotWorkspace({
                   data-ui-action="workspace_scroll_messages"
                   onScroll={handleMessagesScroll}
                 >
-                  {dashboardId !== null ||
-                  (activeChat?.sessionId && !session && !busy) ? (
+                  {dashboardId !== null ? (
                     <>
                       {dashboardId !== null && dashboardProblem && (
                         <InlineFailure problem={dashboardProblem} />
@@ -3839,7 +3873,7 @@ export function CopilotWorkspace({
               </CliFlipCard>
             </div>
             <div className="copilot-composer" hidden={dashboardId !== null}>
-              <label htmlFor="copilot-prompt">
+              <label className="copilot-prompt-label" htmlFor="copilot-prompt">
                 Message{" "}
                 {currentAgent.name.replace(/^./, (letter) =>
                   letter.toUpperCase(),
@@ -3850,11 +3884,12 @@ export function CopilotWorkspace({
                 visible={!desktopWindow.front && surface === "workspace" && dashboardId === null && openDialog === null}
                 disabled={busy || !eventsReady || dashboardId !== null}
                 ensureConversation={() => { if (!activeConversation) updateDraft(prompt); }}
-                onState={contentStateChanged} />
-              <div className="copilot-composer-input">
+                onState={contentStateChanged}
+                editor={
                 <textarea
                   ref={promptRef}
                   id="copilot-prompt"
+                  rows={2}
                   data-ui-action="workspace_edit_draft"
                   value={prompt}
                   onChange={(event) => updateDraft(event.target.value)}
@@ -3871,64 +3906,63 @@ export function CopilotWorkspace({
                   }}
                   disabled={busy || !eventsReady}
                   placeholder="Describe what you want to do"
-                />
-              </div>
-              <div className="row">
-                <button
-                  type="button"
-                  className="quiet"
-                  data-ui-action="workspace_open_dialog"
-                  onClick={() => openDialogFrom("settings")}
-                >
-                  Settings
-                </button>
-                <span className="copilot-composer-hint">
-                  Enter to send, Shift+Enter for a new line
-                </span>
-                <button
+                />}
+                controls={<>
+                  <select className="copilot-composer-agent" aria-label="Personality"
+                    title={`${currentAgent.name} · switch personality in a new chat; this draft is kept`}
+                    data-ui-action="workspace_new_chat" value={effectiveAgentId}
+                    disabled={busy || !eventsReady || attachmentPending}
+                    onChange={(event) => { if (event.target.value !== effectiveAgentId) void startDraft(event.target.value); }}>
+                    {!agentChoices.some((agent) => agent.id === effectiveAgentId) &&
+                      <option value={effectiveAgentId}>{currentAgent.name}</option>}
+                    {agentChoices.filter((agent) => !isStudioAgentId(agent.id)).map((agent) =>
+                      <option key={agent.id} value={agent.id} disabled={!!localBlock(agent.id)}>
+                        {agent.id === effectiveAgentId ? currentAgent.name : agent.name}
+                      </option>)}
+                  </select>
+                  {session ? <select className="copilot-composer-model" aria-label="Model"
+                    title={modelOption ? "Model for this conversation · reported by Copilot CLI" : "This session does not advertise model choices"}
+                    data-ui-action="settings_configure_session"
+                    value={modelOption?.currentValue ?? ""}
+                    disabled={busy || !eventsReady || !modelOption?.options.length}
+                    onChange={(event) => void configureSession("model", event.target.value)}>
+                    {(!modelOption || !modelOption.options.some((item) => item.value === modelOption.currentValue)) &&
+                      <option value={modelOption?.currentValue ?? ""}>{modelOption?.currentValue || "Model not reported"}</option>}
+                    {modelOption?.options.map((item) =>
+                      <option key={item.value} value={item.value} disabled={isConfigValueDisabled(item)}>{item.name}</option>)}
+                  </select> : <button type="button" className="quiet copilot-composer-model"
+                    aria-label="Choose model"
+                    title={currentAgent.model
+                      ? `Declared agent default: ${currentAgent.model}. Open this conversation to discover available models; no message is sent.`
+                      : "Open this conversation to discover available models; no message is sent."}
+                    data-ui-action="workspace_initialize_model"
+                    disabled={busy || !eventsReady || attachmentPending || !!localBlock(effectiveAgentId)}
+                    onClick={() => void initializeComposerModel()}>
+                    {currentAgent.model ? `${currentAgent.model} (default)` : "Choose model…"}
+                  </button>}
+                </>}
+                primaryAction={activeTurnId && session ? (
+                  <button type="button" className="quiet"
+                    data-ui-action="workspace_cancel_prompt" disabled={cancelling}
+                    onClick={() => void cancelPrompt()}>Stop</button>
+                ) : <button
                   type="button"
                   data-ui-action="workspace_send_prompt"
                   onClick={() => void sendPrompt()}
                   disabled={busy || !eventsReady || attachmentPending || (!prompt.trim() && attachmentCount === 0)}
                 >
                   Send
-                </button>
-                {busy && session && (
-                  <button
-                    type="button"
-                    className="quiet"
-                    data-ui-action="workspace_cancel_prompt"
-                    onClick={() => void cancelPrompt()}
-                  >
-                    Stop
-                  </button>
-                )}
-              </div>
+                </button>}
+              />
             </div>
-            {dashboardId === null &&
-              inventory &&
-              inventory.warnings.length > 0 && (
-                <details className="copilot-runtime-warnings">
-                  <summary data-ui-action="inspect_details">
-                    Copilot resource warnings
-                  </summary>
-                  <ul>
-                    {[...new Set(inventory.warnings)].map((warning) => (
-                      <li key={warning}>{warning}</li>
-                    ))}
-                  </ul>
-                </details>
-              )}
             {dashboardId === null && failure && (
-              <>
-                <Failure problem={failure} />
-                {activeChat && !session && !busy && (
-                  <p className="hint">
-                    Check that the folder exists and Copilot CLI supports this
-                    agent. Your draft is still saved locally.
-                  </p>
-                )}
-              </>
+              <div className="copilot-chat-error" role="alert">
+                <span>{failure.said}</span>
+                {failure.detail && <details>
+                  <summary data-ui-action="inspect_details">Details</summary>
+                  <pre>{failure.detail}</pre>
+                </details>}
+              </div>
             )}
             {failure && activeChat?.sessionId && !session && !busy && (
               <button
@@ -4085,6 +4119,7 @@ export function CopilotWorkspace({
           {agentManagement}
           <section>
             <h3>Local app control</h3>
+            <FleetPanel visible={openDialog === "settings"} cwd={location?.cwd ?? ""} agents={inventory?.agents ?? []} />
             <p>MCP and REST access is off by default. Native owner approval is required to enable and connect. Stop revokes every connection.</p>
             <button type="button" className="quiet" data-ui-action="settings_app_control"
               disabled={appControl.changing} onClick={() => void appControl.toggle()}>

@@ -16,6 +16,63 @@ The integration targets:
 
 ACP v2 is currently a draft and is not a release baseline.
 
+### Native Windows fleet
+
+Settings exposes an opt-in peer network, independent of the loopback app-control
+endpoint. Each enabled desktop has a persistent node identity and pinned mutual
+TLS certificates. Windows DPAPI protects the durable store; an exclusive writer
+lock prevents two processes from owning it. Bilateral pairing requires native
+approval and fingerprint comparison. Enabled peers reconnect while the application
+runs; revocation removes trust. No firewall rule or public relay is created.
+
+Only explicitly shared tasks, task notes and generated text results synchronize.
+Private conversation history, screen images and credentials are not automatically
+replicated. Delivery is persisted before acknowledgement and deduplicated on replay.
+Bounded queues, expiry, offline state and reconnect errors are explicit.
+
+Round-robin scheduling persists its selection cursor, skips ineligible or busy
+targets and allows one active task per node. Approved execution profiles bind an
+agent, exact model, canonical local directory and tool-approval policy. The
+executor uses Copilot CLI, checks the actual session settings before dispatch,
+and requires native task and tool approvals. A recorded dispatch with uncertain
+completion becomes reconciliation-required, not an automatically retried prompt.
+Task notes synchronize text but do not start additional model turns.
+
+The peer listener implements a defined **A2A 0.3 text-task profile**:
+authenticated `/.well-known/agent-card.json`, JSON-RPC `/a2a`, `message/send`,
+`message/stream`, `tasks/get`, `tasks/cancel`, and `tasks/resubscribe`, with text
+artifacts and SSE. Clients must negotiate `A2A-Extensions: urn:darbot:fleet:1`
+and use the pinned certificates and per-peer TLS name `darbot-fleet`.
+Every status update supplies current extension metadata, including
+`outcomeUnknown`; clients replace that extension entry rather than retaining
+stale values from the initial task. Push notifications, file/data parts, shared
+contexts, continuation and extended cards are not part of this profile.
+
+The local MCP tool `darbot_fleet_dispatch` and REST `/v1/fleet` use the same native
+fleet dispatcher. Pairing/configuration/task mutations remain owner-reviewed;
+remote tools cannot approve their own execution or credential requests.
+
+### Compact chat and bounded capture
+
+The composer places Attach, personality, model and Send/Stop inside the input
+container. Model discovery opens the selected CLI session without sending the
+draft. Custom agents are selected at CLI launch when the runtime does not offer
+an `agent` configuration option; Darbot never substitutes the default agent while
+displaying a different recipient.
+
+Windows window capture runs in a disposable same-binary worker, not the UI
+process. Cancellation and the bounded capture budget terminate and reap the
+owned child. Capture-operation ownership lasts from approval through frame
+commit, so a cancelled operation cannot start sharing after cancellation.
+App-control screenshots use the same mechanism and preserve cancellation across
+both renderer acknowledgements. Expired native dialogs do not authorize work
+and continue to exclude capture until actually dismissed.
+
+Window identity is checked before and after rendering; this is not an atomic
+Windows window pin. Unconfirmed child cleanup is surfaced and keeps protection
+closed. Only selected Windows windows, bounded PNG and UTF-8 content are supported;
+this is not monitor capture or video streaming.
+
 ### Protocol implementation requirements
 
 ACP is the desktop conversation protocol, not an optional substitute for an SDK.

@@ -94,6 +94,7 @@ mock.module("@tauri-apps/api/window", () => ({
 
 const { CopilotWorkspace } = await import("./CopilotWorkspace");
 const { DesktopWindow } = await import("./DesktopWindow");
+const { FleetPanel } = await import("./FleetPanel");
 const { CopilotExtensionsPanel, ElicitationReview } = await import(
   "./CopilotExtensionsPanel"
 );
@@ -106,6 +107,43 @@ function argument(args: unknown, key: string): string | null {
   const value = Object.entries(args).find(([name]) => name === key)?.[1];
   return typeof value === "string" ? value : null;
 }
+
+test("fleet is read-only until an explicit native-reviewed action and does not claim queued work completed", async () => {
+  const local = "fixture-local";
+  const row = { id: "task-fixture", origin: "fixture-peer", executor: local,
+    status: "input-required", revision: 1, sessionId: null, cancelRequested: false, profileId: "review" };
+  let deny: ((error: unknown) => void) | undefined;
+  invokeHandler = async (name, args) => {
+    if (name !== "fleet_dispatch") throw new Error("Fleet must use the native dispatcher");
+    const action = (args as { action: { action: string } }).action;
+    if (action.action === "status") return {
+      enabled: true, card: { nodeId: local, endpoint: "127.0.0.1:1234", version: 1, certificate: [], label: "Fixture" },
+      peers: [], profiles: [],
+    };
+    if (action.action === "list_tasks") return [row];
+    if (action.action === "approve_task") return new Promise((_, reject) => { deny = reject; });
+    throw new Error("Unexpected fleet mutation");
+  };
+  const view = render(<FleetPanel visible cwd="C:\\fixture" agents={[]} />);
+  view.container.querySelector("details")!.open = true;
+  await waitFor(() => expect(view.getByRole("button", { name: "Review execution" })).toBeTruthy());
+  expect(calls.every((call) => ["status", "list_tasks"].includes(
+    (call.args as { action: { action: string } }).action.action))).toBe(true);
+  fireEvent.click(view.getByRole("button", { name: "Review execution" }));
+  await waitFor(() => expect(view.getByRole("status").textContent).toContain("Waiting for native approval"));
+  expect(view.getByRole("button", { name: "Review execution" }).hasAttribute("disabled")).toBe(true);
+  expect(view.queryByText("completed", { exact: true })).toBeNull();
+  await act(async () => deny?.({ message: "Local owner denied the request" }));
+  await waitFor(() => expect(view.getByRole("alert").textContent).toContain("Local owner denied"));
+  expect(calls.filter((call) =>
+    (call.args as { action: { action: string } }).action.action === "approve_task")).toHaveLength(1);
+});
+
+test("a hidden fleet panel does not poll or approve tasks", async () => {
+  render(<FleetPanel visible={false} cwd="C:\\fixture" agents={[]} />);
+  await act(async () => {});
+  expect(calls).toHaveLength(0);
+});
 
 function emit(name: string, payload: unknown) {
   for (const listener of listeners.get(name) ?? []) listener({ payload });
@@ -402,6 +440,48 @@ async function addFixtureImage(view: Awaited<ReturnType<typeof workspace>>, shar
   await view.findByRole("img", { name: "Preview of Darbot fixture window" });
   await act(async () => {});
 }
+
+test("compact composer contains editing, attachment, personality, model and send controls", async () => {
+  const view = await workspace();
+  const composer = view.getByRole("region", { name: "Message composer" });
+  const scope = within(composer);
+  expect(scope.getByRole("textbox", { name: "Message Copilot CLI" })).toBeTruthy();
+  expect(scope.getByRole("button", { name: "Add attachments or context" })).toBeTruthy();
+  expect(scope.getByRole("combobox", { name: "Personality" })).toBeTruthy();
+  expect(scope.getByRole("button", { name: "Choose model" })).toBeTruthy();
+  expect(scope.getByRole("button", { name: "Send" })).toBeTruthy();
+  expect(scope.queryByRole("button", { name: "Settings" })).toBeNull();
+  expect(view.container.querySelector(".copilot-conversation > .copilot-runtime-warnings")).toBeNull();
+});
+
+test("composer model discovery opens without sending, and selection uses the real session command", async () => {
+  const model = {
+    id: "model", name: "Model", currentValue: "model-one",
+    options: [{ value: "model-one", name: "Model One" }, { value: "model-two", name: "Model Two" }],
+  };
+  invokeHandler = async (command, args) => {
+    if (command === "copilot_session_new") {
+      const next = session("model-session", argument(args, "agent") ?? "");
+      return { ...next, configOptions: [...(next.configOptions ?? []), model] };
+    }
+    if (command === "copilot_session_configure") {
+      return { configOptions: [ { ...model, currentValue: argument(args, "value") } ] };
+    }
+    return standardInvoke(command, args);
+  };
+  const view = await workspace();
+  await userEvent.type(draftInput(view), "Keep this draft");
+  fireEvent.click(view.getByRole("button", { name: "Choose model" }));
+  const select = await view.findByRole("combobox", { name: "Model" });
+  if (!(select instanceof HTMLSelectElement)) throw new Error("Model selector must be a select");
+  fireEvent.change(select, { target: { value: "model-two" } });
+  await waitFor(() => expect(select.value).toBe("model-two"));
+  expect(calls.some((call) => call.command === "copilot_session_configure" &&
+    argument(call.args, "sessionId") === "model-session" &&
+    argument(call.args, "value") === "model-two")).toBe(true);
+  expect(calls.some((call) => call.command === "copilot_session_prompt")).toBe(false);
+  expect(draftInput(view).value).toBe("Keep this draft");
+});
 
 test("composer offers real local entry points and capture cancellation never sends", async () => {
   contentFixture();
@@ -1311,7 +1391,7 @@ test("configured cloud agents stay distinct and never enter a local CLI session"
 
 test("canvas pages and searches unimported definitions; chat actions live on the sessions face", async () => {
   const agents = Array.from({ length: 54 }, (_, i) => {
-    const id = `${i % 2 ? "darbot" : "example"}-desk-${i}`;
+    const id = `${i % 2 ? "darbot" : "dayour"}-desk-${i}`;
     return {
       id,
       name: `Desk ${i}`,

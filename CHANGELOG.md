@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## 0.0.27
+
+- Add opt-in Windows fleet pairing with pinned mutual TLS, protected persistent
+  state, reconnect, durable task delivery and round-robin scheduling.
+- Add an authenticated A2A 0.3 text-task profile with streaming results,
+  cancellation and explicit reconciliation for unknown execution outcomes.
+- Keep attachment, personality, model and send controls inside a compact composer;
+  launch custom Copilot agents through the CLI's supported agent argument.
+- Isolate Windows captures in bounded, terminable workers. Preserve cancellation
+  through approval, capture and frame commit, including MCP screenshot requests.
+- Identify requesting clients in native consent and preserve exact-turn cleanup.
+- Improve receipt-verified desktop activation and installer/executable digest checks.
+- Repository inventory-toolbox execution, cloud sharing, taskbar update and native
+  notification features are not included in this release.
+
 ## 0.0.26
 
 - Add a Windows x64 PowerShell toolbox for production packaging, prerequisite

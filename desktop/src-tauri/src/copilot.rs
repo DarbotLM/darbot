@@ -489,18 +489,47 @@ pub struct CopilotRuntimeState {
     connection_generation: AtomicU64,
     history_agents: Mutex<HashMap<PathBuf, CachedHistoryAgent>>,
     pub consent: Arc<ClientConsent>,
+    observer: Option<Arc<dyn RuntimeObserver>>,
+}
+
+pub trait RuntimeObserver: Send + Sync {
+    fn update(&self, session: &str, update: &Value);
+    fn permission(&self, request: CopilotPermissionRequest);
 }
 
 impl CopilotRuntimeState {
+    pub fn with_observer(observer: Arc<dyn RuntimeObserver>) -> Self {
+        Self {
+            consent: Arc::new(ClientConsent::with_observer(observer.clone())),
+            observer: Some(observer),
+            ..Self::default()
+        }
+    }
     fn connected<R: Runtime>(&self, app: &AppHandle<R>) -> Result<Arc<CopilotRuntime>, Problem> {
         let _connecting = self.connecting.lock().unwrap();
+        self.connected_for(app, None)
+    }
+
+    // Hold connecting through session registration, including selection changes.
+    fn connected_for<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        selection: Option<(Option<&str>, &str)>,
+    ) -> Result<Arc<CopilotRuntime>, Problem> {
         let generation = self.connection_generation.load(Ordering::SeqCst);
         let mut runtime = self.runtime.lock().unwrap();
-        if runtime
-            .as_ref()
-            .is_some_and(|connection| connection.is_alive())
-        {
-            return Ok(Arc::clone(runtime.as_ref().unwrap()));
+        if let Some(connection) = runtime.as_ref().filter(|connection| connection.is_alive()) {
+            if selection.is_none_or(|(agent, cwd)| {
+                connection.agent.as_deref() == agent
+                    && connection.launch_cwd.as_deref() == Some(cwd)
+            }) {
+                return Ok(Arc::clone(connection));
+            }
+            if !connection.core.sessions.lock().unwrap().is_empty() {
+                return Err(Problem::plain(
+                    "Close active conversations before switching Copilot agent or workspace.",
+                ));
+            }
         }
 
         let previous = runtime.take();
@@ -508,7 +537,13 @@ impl CopilotRuntimeState {
         if let Some(previous) = previous {
             previous.stop();
         }
-        let connection = Arc::new(CopilotRuntime::start(app, Arc::clone(&self.consent))?);
+        let connection = Arc::new(CopilotRuntime::start(
+            app,
+            Arc::clone(&self.consent),
+            selection.and_then(|(agent, _)| agent.map(str::to_owned)),
+            selection.map(|(_, cwd)| cwd.to_owned()),
+            self.observer.clone(),
+        )?);
         let mut runtime = self.runtime.lock().unwrap();
         if self.connection_generation.load(Ordering::SeqCst) != generation {
             drop(runtime);
@@ -756,7 +791,10 @@ impl CopilotRuntimeState {
     ) -> Result<CopilotSession, Problem> {
         require_local_agent(agent.as_deref())?;
         let cwd = session_root(&cwd)?;
-        self.connected(app)?.new_session(cwd, nonempty(agent))
+        let agent = nonempty(agent);
+        let _connecting = self.connecting.lock().unwrap();
+        self.connected_for(app, Some((agent.as_deref(), &cwd)))?
+            .new_session(cwd, agent)
     }
 
     pub fn load_session<R: Runtime>(
@@ -768,7 +806,10 @@ impl CopilotRuntimeState {
     ) -> Result<CopilotSession, Problem> {
         require_local_agent(agent.as_deref())?;
         let cwd = session_root(&cwd)?;
-        self.connected(app)?.load_session(session_id, cwd, agent)
+        let agent = nonempty(agent);
+        let _connecting = self.connecting.lock().unwrap();
+        self.connected_for(app, Some((agent.as_deref(), &cwd)))?
+            .load_session(session_id, cwd, agent)
     }
 
     pub fn resume_session<R: Runtime>(
@@ -780,7 +821,10 @@ impl CopilotRuntimeState {
     ) -> Result<CopilotSession, Problem> {
         require_local_agent(agent.as_deref())?;
         let cwd = session_root(&cwd)?;
-        self.connected(app)?.resume_session(session_id, cwd, agent)
+        let agent = nonempty(agent);
+        let _connecting = self.connecting.lock().unwrap();
+        self.connected_for(app, Some((agent.as_deref(), &cwd)))?
+            .resume_session(session_id, cwd, agent)
     }
 
     pub fn prompt<R: Runtime>(
@@ -850,6 +894,28 @@ impl CopilotRuntimeState {
         Ok(())
     }
 
+    pub(crate) fn fleet_prompt(
+        &self,
+        agent: &str,
+        model: &str,
+        root: &str,
+        session_id: String,
+        prompt: String,
+    ) -> Result<CopilotPromptResult, Problem> {
+        require_local_agent(Some(agent))?;
+        let root = session_root(root)?;
+        self.current()?
+            .prompt_blocks_scoped(
+                session_id,
+                vec![json!({"type":"text","text":prompt})],
+                Some(agent),
+                None,
+                Some((model.to_owned(), root)),
+                || Ok(()),
+            )
+            .map_err(|e| Problem::plain(e.said))
+    }
+
     pub fn cancel<R: Runtime>(
         &self,
         _app: &AppHandle<R>,
@@ -894,7 +960,9 @@ impl CopilotRuntimeState {
         config_id: String,
         value: String,
     ) -> Result<CopilotSessionConfig, Problem> {
-        require_local_agent(Some(&value))?;
+        if config_id == "agent" {
+            require_local_agent(Some(&value))?;
+        }
         self.current()?.configure(session_id, config_id, value)
     }
 
@@ -1970,6 +2038,7 @@ struct ActiveTurn {
     request: u64,
     ticket: Option<String>,
     recipient: Option<String>,
+    selection: Option<(String, String)>,
     dispatched: bool,
 }
 
@@ -1997,6 +2066,7 @@ enum ReplyEffect {
     Open {
         cwd: String,
         restored: Option<String>,
+        launched_agent: Option<String>,
     },
     Config {
         session: String,
@@ -2009,7 +2079,11 @@ impl ReplyEffect {
     fn apply(self, core: &RuntimeCore, result: &Result<Value, Problem>) -> Result<(), Problem> {
         match self {
             Self::None => {}
-            Self::Open { cwd, restored } => {
+            Self::Open {
+                cwd,
+                restored,
+                launched_agent,
+            } => {
                 if let Ok(value) = result {
                     let id = restored
                         .as_deref()
@@ -2022,7 +2096,9 @@ impl ReplyEffect {
                         cwd,
                         // A fresh default CLI session needs no selector. A restored session
                         // can already have a custom recipient; don't guess from its caller.
-                        agent: restored.is_none().then(String::new),
+                        agent: restored
+                            .is_none()
+                            .then(|| launched_agent.unwrap_or_default()),
                         changing_agent: None,
                         turn: None,
                         lifetime: Arc::default(),
@@ -2079,6 +2155,7 @@ struct InFlight {
 }
 
 struct RuntimeCore {
+    observer: Option<Arc<dyn RuntimeObserver>>,
     identity: String,
     audit_root: Option<PathBuf>,
     elicitation: Option<Arc<elicitation::Controller>>,
@@ -2102,12 +2179,20 @@ struct RuntimeCore {
 struct CopilotRuntime {
     child: Mutex<Child>,
     opening: Mutex<()>,
+    agent: Option<String>,
+    launch_cwd: Option<String>,
     core: Arc<RuntimeCore>,
     capabilities: CopilotCapabilities,
 }
 
 impl CopilotRuntime {
-    fn start<R: Runtime>(app: &AppHandle<R>, consent: Arc<ClientConsent>) -> Result<Self, Problem> {
+    fn start<R: Runtime>(
+        app: &AppHandle<R>,
+        consent: Arc<ClientConsent>,
+        agent: Option<String>,
+        launch_cwd: Option<String>,
+        observer: Option<Arc<dyn RuntimeObserver>>,
+    ) -> Result<Self, Problem> {
         let client_home = copilot_home()?;
         let audit_root = app.path().app_local_data_dir().map_err(|error| {
             Problem::with("Native audit storage is unavailable.", error.to_string())
@@ -2120,7 +2205,7 @@ impl CopilotRuntime {
             ProtocolOperation::Lifecycle,
             AuditOutcome::Requested,
         )?;
-        let mut child = spawn_acp_child()?;
+        let mut child = spawn_acp_child(agent.as_deref(), launch_cwd.as_deref(), &client_home)?;
         let stdin = take_child_stdin(&mut child)?;
         let stdout = child.stdout.take().ok_or_else(|| {
             let _ = child.kill();
@@ -2132,6 +2217,7 @@ impl CopilotRuntime {
         })?;
         let (outgoing, messages) = mpsc::sync_channel(64);
         let core = Arc::new(RuntimeCore {
+            observer,
             identity,
             audit_root: Some(audit_root),
             elicitation: Some(elicitation::Controller::new(
@@ -2183,6 +2269,8 @@ impl CopilotRuntime {
         Ok(Self {
             child: Mutex::new(child),
             opening: Mutex::new(()),
+            agent,
+            launch_cwd,
             core,
             capabilities,
         })
@@ -2258,6 +2346,7 @@ impl CopilotRuntime {
         let effect = ReplyEffect::Open {
             cwd: params["cwd"].as_str().unwrap_or_default().into(),
             restored: params["sessionId"].as_str().map(str::to_owned),
+            launched_agent: self.agent.clone(),
         };
         let call = self.core.begin_request(method, params, effect)?;
         self.core
@@ -2377,7 +2466,13 @@ impl CopilotRuntime {
                 .to_string();
             session.modes = Some(self.set_mode(session.session_id.clone(), safe_mode)?);
         }
-        if let Some(agent) = agent {
+        if let Some(agent) = agent.filter(|_| {
+            session
+                .config_options
+                .as_ref()
+                .and_then(Value::as_array)
+                .is_some_and(|options| options.iter().any(|o| o["id"] == "agent"))
+        }) {
             session.config_options = Some(
                 self.configure(session.session_id.clone(), "agent".into(), agent)?
                     .config_options,
@@ -2512,6 +2607,19 @@ impl CopilotRuntime {
         ticket: Option<&str>,
         authorize: impl FnOnce() -> Result<(), Problem>,
     ) -> Result<CopilotPromptResult, Problem> {
+        self.prompt_blocks_scoped(session_id, blocks, recipient, ticket, None, authorize)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prompt_blocks_scoped(
+        &self,
+        session_id: String,
+        blocks: Vec<Value>,
+        recipient: Option<&str>,
+        ticket: Option<&str>,
+        selection: Option<(String, String)>,
+        authorize: impl FnOnce() -> Result<(), Problem>,
+    ) -> Result<CopilotPromptResult, Problem> {
         let params = json!({"sessionId":session_id,"prompt":blocks});
         // Check, consume the exact authorization, enqueue, and publish ownership under the
         // same lock as config updates and cleanup. Never hold it waiting for the ACP reply.
@@ -2538,6 +2646,7 @@ impl CopilotRuntime {
                 request: call.id,
                 ticket: ticket.map(str::to_owned),
                 recipient: recipient.map(str::to_owned),
+                selection,
                 dispatched: false,
             });
             call
@@ -2701,6 +2810,25 @@ impl RuntimeCore {
             if let Some(turn) = session.turn.as_mut().filter(|turn| turn.request == id) {
                 if turn.recipient.as_deref().is_none_or(|agent| {
                     session.changing_agent.is_none() && session.agent.as_deref() == Some(agent)
+                }) && turn.selection.as_ref().is_none_or(|(model, root)| {
+                    &session.cwd == root
+                        && session.config_options.as_array().is_some_and(|options| {
+                            let models: Vec<_> =
+                                options.iter().filter(|o| o["id"] == "model").collect();
+                            let permissions: Vec<_> =
+                                options.iter().filter(|o| o["id"] == "allow_all").collect();
+                            models.len() == 1
+                                && models[0]["currentValue"].as_str() == Some(model)
+                                && permissions.len() == 1
+                                && permissions[0]["currentValue"] == "off"
+                                && !options.iter().any(|o| {
+                                    o["id"] == "mode"
+                                        && o["currentValue"].as_str().is_some_and(unattended_mode)
+                                })
+                        })
+                        && !session.modes["currentModeId"]
+                            .as_str()
+                            .is_some_and(unattended_mode)
                 }) && self.pending.lock().unwrap().contains_key(&id.to_string())
                 {
                     turn.dispatched = true;
@@ -2985,13 +3113,41 @@ fn validate_mode(modes: &Value, id: &str) -> Result<(), Problem> {
 fn copilot_command() -> Result<std::process::Command, Problem> {
     let mut command = quiet::command("copilot");
     command.args(crate::copilot_extensions::agent_plugin_launch_args()?);
+    command.env("COPILOT_HOME", copilot_home()?);
     Ok(command)
 }
 
-fn spawn_acp_child() -> Result<Child, Problem> {
-    copilot_command()?
-        .args(["--acp", "--stdio", "--no-auto-update"])
-        .current_dir(user_home()?)
+fn acp_command(
+    agent: Option<&str>,
+    cwd: Option<&str>,
+    client_home: &Path,
+) -> Result<std::process::Command, Problem> {
+    require_local_agent(agent)?;
+    let mut command = copilot_command()?;
+    command.args(["--acp", "--stdio", "--no-auto-update"]);
+    if let Some(id) = agent.filter(|id| !id.is_empty()) {
+        if id.len() > 128
+            || !id.as_bytes()[0].is_ascii_alphanumeric()
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b))
+        {
+            return Err(Problem::plain("Invalid local Copilot agent ID."));
+        }
+        command.args(["--agent", id]);
+    }
+    command
+        .env("COPILOT_HOME", client_home)
+        .current_dir(cwd.map(PathBuf::from).unwrap_or(user_home()?));
+    Ok(command)
+}
+
+fn spawn_acp_child(
+    agent: Option<&str>,
+    cwd: Option<&str>,
+    client_home: &Path,
+) -> Result<Child, Problem> {
+    acp_command(agent, cwd, client_home)?
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -3245,7 +3401,14 @@ fn route_runtime_message<R: Runtime>(core: &Arc<RuntimeCore>, app: &AppHandle<R>
                         }
                     }
                 }
-                let _ = app.emit("copilot:session-update", params);
+                if let (Some(observer), Some(session)) =
+                    (&core.observer, params["sessionId"].as_str())
+                {
+                    observer.update(session, &params["update"]);
+                }
+                if core.observer.is_none() {
+                    let _ = app.emit("copilot:session-update", params);
+                }
             }
         }
         Some("elicitation/create") => route_elicitation_request(core, &message),
@@ -3315,6 +3478,13 @@ fn route_runtime_message<R: Runtime>(core: &Arc<RuntimeCore>, app: &AppHandle<R>
 }
 
 fn route_elicitation_request(core: &Arc<RuntimeCore>, message: &Value) {
+    if core.observer.is_some() {
+        if let Some(id) = message.get("id") {
+            write_client_error(core, id.clone(), -32601,
+                "Fleet tasks cannot initiate credential elicitation; sign in locally outside the task.");
+        }
+        return;
+    }
     let Some(id) = message
         .get("id")
         .filter(|id| json_id_key(id).is_some())
@@ -3548,6 +3718,16 @@ fn route_permission_request<R: Runtime>(
                 expires: Instant::now() + Duration::from_secs(300),
             },
         );
+    }
+    if let Some(observer) = &core.observer {
+        observer.permission(CopilotPermissionRequest {
+            request_id,
+            session_id: params.session_id,
+            origin: CopilotPermissionOrigin::Conversation,
+            tool_call: params.tool_call,
+            options,
+        });
+        return;
     }
     if app
         .emit(
@@ -4091,7 +4271,7 @@ pub fn workspace(cwd: Option<String>) -> Result<CopilotWorkspace, Problem> {
     })
 }
 
-fn session_root(cwd: &str) -> Result<String, Problem> {
+pub(crate) fn session_root(cwd: &str) -> Result<String, Problem> {
     let cwd = required_text(cwd.to_string(), "working directory")?;
     let path = Path::new(&cwd);
     require_absolute(path, "working directory")?;
@@ -4208,7 +4388,7 @@ struct AcpConnection {
 
 impl AcpConnection {
     fn start() -> Result<Self, Problem> {
-        let mut child = spawn_acp_child()?;
+        let mut child = spawn_acp_child(None, None, &copilot_home()?)?;
 
         let stdin = match child.stdin.take() {
             Some(stdin) => stdin,
@@ -4711,7 +4891,9 @@ fn is_companion_document(path: &Path, header: &str) -> bool {
 }
 
 fn copilot_home() -> Result<PathBuf, Problem> {
-    if let Some(home) = std::env::var_os("COPILOT_HOME").filter(|home| !home.is_empty()) {
+    // A launcher (including another agent host) can have its own COPILOT_HOME.
+    // Darbot uses the person's profile unless they explicitly select a Darbot-specific home.
+    if let Some(home) = std::env::var_os("DARBOT_COPILOT_HOME").filter(|home| !home.is_empty()) {
         let home = PathBuf::from(home);
         require_absolute(&home, "configuration directory")?;
         return Ok(home);
@@ -7014,6 +7196,7 @@ mod tests {
         let stdin = child.stdin.take().unwrap();
         let core = Arc::new(RuntimeCore {
             identity: format!("wire-{:032x}", rand::random::<u128>()),
+            observer: None,
             audit_root: Some(fixture.root.join("audit-app")),
             elicitation: Some(elicitation::Controller::with_hooks(
                 Arc::new(|_, _| Ok(())),
@@ -7093,6 +7276,8 @@ mod tests {
         let runtime = Arc::new(CopilotRuntime {
             child: Mutex::new(child.into_inner()),
             opening: Mutex::new(()),
+            agent: None,
+            launch_cwd: None,
             core: Arc::clone(&core),
             capabilities,
         });
@@ -7194,6 +7379,8 @@ mod tests {
         let runtime = Arc::new(CopilotRuntime {
             child: Mutex::new(child.into_inner()),
             opening: Mutex::default(),
+            agent: None,
+            launch_cwd: None,
             core: core.clone(),
             capabilities: parse_status(&json!({"protocolVersion":1,"agentCapabilities":{}}))
                 .unwrap()
@@ -7263,6 +7450,8 @@ mod tests {
         let runtime = Arc::new(CopilotRuntime {
             child: Mutex::new(child.into_inner()),
             opening: Mutex::default(),
+            agent: None,
+            launch_cwd: None,
             core: core.clone(),
             capabilities: parse_status(&json!({"protocolVersion":1,"agentCapabilities":{}}))
                 .unwrap()
@@ -7314,6 +7503,133 @@ mod tests {
             assert!(task.join().unwrap().is_ok());
         }
         assert!(wire.try_recv().is_err());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn fleet_profile_root_reaches_writer_with_the_same_session_path() {
+        let fixture = terminals::test_fixture::Fixture::new();
+        let approved_root = std::fs::canonicalize(&fixture.root)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(approved_root.starts_with(r"\\?\"));
+        let normalized = session_root(&approved_root).unwrap();
+        let mut writer = None;
+        let (core, child, _stdout) = terminal_wire_with_writer(&fixture, |stdin, queue, weak| {
+            writer = Some((stdin, queue, weak));
+        });
+        let (_stdin, queue, _weak) = writer.unwrap();
+        let runtime = Arc::new(CopilotRuntime {
+            child: Mutex::new(child.into_inner()),
+            opening: Mutex::default(),
+            agent: None,
+            launch_cwd: None,
+            core: core.clone(),
+            capabilities: parse_status(&json!({"protocolVersion":1,"agentCapabilities":{}}))
+                .unwrap()
+                .capabilities,
+        });
+        {
+            let mut sessions = core.sessions.lock().unwrap();
+            let session = sessions.get_mut("one").unwrap();
+            session.cwd = normalized;
+            session.agent = Some(String::new());
+            session.modes = Value::Null;
+            session.config_options = json!([
+                {"id":"model","currentValue":"approved-model"},
+                {"id":"allow_all","currentValue":"off"}
+            ]);
+        }
+        let state = Arc::new(CopilotRuntimeState::default());
+        *state.runtime.lock().unwrap() = Some(runtime.clone());
+        let caller = state.clone();
+        let sending = std::thread::spawn(move || {
+            caller.fleet_prompt(
+                "",
+                "approved-model",
+                &approved_root,
+                "one".into(),
+                "Owned path fixture".into(),
+            )
+        });
+        let queued = queue.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(core.commit_prompt_write(&queued));
+        let request_id = queued["id"].as_u64().unwrap().to_string();
+        core.pending
+            .lock()
+            .unwrap()
+            .remove(&request_id)
+            .unwrap()
+            .sender
+            .send(Ok(json!({"stopReason":"end_turn"})))
+            .unwrap();
+        assert!(sending.join().unwrap().is_ok());
+        runtime.stop();
+    }
+
+    #[test]
+    fn fleet_writer_rechecks_exact_model_root_recipient_and_approval_mode() {
+        let fixture = terminals::test_fixture::Fixture::new();
+        let mut writer = None;
+        let (core, child, _stdout) = terminal_wire_with_writer(&fixture, |stdin, queue, weak| {
+            writer = Some((stdin, queue, weak));
+        });
+        let (_stdin, queue, _weak) = writer.unwrap();
+        let runtime = Arc::new(CopilotRuntime {
+            child: Mutex::new(child.into_inner()),
+            opening: Mutex::default(),
+            agent: None,
+            launch_cwd: None,
+            core: core.clone(),
+            capabilities: parse_status(&json!({"protocolVersion":1,"agentCapabilities":{}}))
+                .unwrap()
+                .capabilities,
+        });
+        for changed in ["model", "root", "recipient", "permissions", "mode"] {
+            let root = fixture.root.to_string_lossy().into_owned();
+            {
+                let mut sessions = core.sessions.lock().unwrap();
+                let session = sessions.get_mut("one").unwrap();
+                session.cwd = root.clone();
+                session.agent = Some(String::new());
+                session.modes = Value::Null;
+                session.config_options = json!([
+                    {"id":"model","currentValue":"approved-model"},
+                    {"id":"allow_all","currentValue":"off"}
+                ]);
+            }
+            let sender = runtime.clone();
+            let sending = std::thread::spawn(move || {
+                sender.prompt_blocks_scoped(
+                    "one".into(),
+                    vec![json!({"type":"text","text":"known fixture"})],
+                    Some(""),
+                    None,
+                    Some(("approved-model".into(), root)),
+                    || Ok(()),
+                )
+            });
+            let queued = queue.recv_timeout(Duration::from_secs(5)).unwrap();
+            {
+                let mut sessions = core.sessions.lock().unwrap();
+                let session = sessions.get_mut("one").unwrap();
+                match changed {
+                    "model" => {
+                        session.config_options[0]["currentValue"] = json!("unapproved-model")
+                    }
+                    "root" => session.cwd = "different-root".into(),
+                    "recipient" => session.agent = Some("different-agent".into()),
+                    "permissions" => session.config_options[1]["currentValue"] = json!("on"),
+                    "mode" => session.modes = json!({"currentModeId":"autopilot"}),
+                    _ => unreachable!(),
+                }
+            }
+            assert!(!core.commit_prompt_write(&queued), "{changed}");
+            assert!(sending.join().unwrap().is_err());
+            assert!(queue.try_recv().is_err());
+        }
+        runtime.stop();
     }
 
     #[test]
@@ -7974,6 +8290,8 @@ mod tests {
         let runtime = Arc::new(CopilotRuntime {
             child: Mutex::new(child.into_inner()),
             opening: Mutex::new(()),
+            agent: None,
+            launch_cwd: None,
             core: Arc::clone(&core),
             capabilities,
         });

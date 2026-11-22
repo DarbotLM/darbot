@@ -14,10 +14,49 @@ suites; neither mode installs, signs, tags or publishes the package.
 
 On a new Windows x64 node, use the toolbox and installer from the *same trusted
 release*. Run `.\toolbox.ps1 Doctor`, then `.\toolbox.ps1 Prerequisites -For Runtime`.
-Exit Darbot before using `.\toolbox.ps1 Install -InstallerPath <local-installer> -ExpectedVersion <version> -ExpectedSha256 <trusted-release-digest>`.
+Exit Darbot before using `.\toolbox.ps1 Install -InstallerPath <local-installer> -ExpectedVersion <version> -ExpectedSha256 <trusted-installer-digest> -ExpectedExeSha256 <trusted-installed-executable-digest>`.
 Use `.\toolbox.ps1 Launch` from a non-elevated shell. Presence in Doctor is not proof
 of provider authentication; use the node user's existing supported sign-in or official
 consent flow, never copied tokens.
+
+The toolbox requires prior `desktop\dist` output to be moved aside before a build;
+it preserves Tauri's normal relative embedded-asset configuration. `BuiltExeSHA256`
+identifies the raw build output, not necessarily the installed payload: the NSIS
+bundle marker can differ. The release owner must independently verify and publish
+both the installer digest and the installed executable digest. A local unsigned
+installer is not a signed or attested release.
+
+### Windows fleet rollout and post-install review
+
+Use the same versioned installer and verified digests on every node. Install as
+the node's existing non-elevated Windows user, then launch in that user's
+interactive desktop session; an SSH session alone is not a visible desktop.
+`Launch` activates a receipt-verified, same-user/session tray-hidden instance
+rather than starting an unrelated replacement.
+
+After installation:
+
+1. Confirm the compact composer renders and the CLI loads the intended personal
+   profile. Do not inherit another application's process-local `COPILOT_HOME`.
+2. Open Settings, expand Fleet, and configure a reachable interface IP and fixed
+   port. Darbot does not create firewall rules or expose local app-control MCP.
+3. Enable the fleet through native consent. Exchange public pairing cards on both
+   desktops and compare their certificate fingerprints using a trusted channel.
+   Matching hostnames or usernames are not authentication.
+4. Approve an existing local repository root, agent and exact available model on
+   each executor. Approve a harmless shared task before trying code-changing jobs.
+5. Exercise two-way task status/results, round-robin selection, offline recovery,
+   restart, cancellation and peer revocation. A reconciliation-required outcome
+   must never automatically repeat a potentially side-effecting prompt.
+6. Inspect each installed UI and startup logs. Confirm screenshot cancellation
+   releases its owned worker, and that an expired native approval cannot permit
+   capture. Keep screenshots and task contents out of public release evidence.
+
+Local app control (`darbot_ui_dispatch` / `darbot_fleet_dispatch`) and the
+authenticated peer A2A listener are separate services. Installing the release
+does not silently approve peers, execution profiles, tasks or credentials.
+The separate repository inventory/SMB `repo_toolbox.ps1` is not this desktop
+installer; its actions are not automatically run during rollout.
 
 1. Check `## Unreleased` in [CHANGELOG.md](../CHANGELOG.md) reads the way you want it to. It is the
    release notes. Nothing is generated from commit subjects, because a commit subject is written for
