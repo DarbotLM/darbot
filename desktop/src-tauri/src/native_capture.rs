@@ -10,7 +10,7 @@ use std::{
 const WORKER: &str = "--darbot-native-capture";
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
 const OUTPUT_LIMIT: usize = 2 * 1024 * 1024;
-#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+#[cfg(windows)]
 const REQUEST_LIMIT: usize = 8192;
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
 pub(crate) const CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
