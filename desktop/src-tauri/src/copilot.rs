@@ -6131,6 +6131,7 @@ mod studio_catalog {
         }
     }
 
+    #[cfg(any(windows, test))]
     pub(super) fn token_args(command: &mut std::process::Command, config: &SourceConfig) {
         command.args([
             "account",

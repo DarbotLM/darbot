@@ -151,7 +151,7 @@ jobs:
           foreach ($deliverable in $deliverables) {
             $signature = Get-AuthenticodeSignature $deliverable
             if ($signature.Status -ne "Valid") {
-              throw "Post-package Authenticode verification failed for $deliverable: $($signature.Status)"
+              throw "Post-package Authenticode verification failed for ${deliverable}: $($signature.Status)"
             }
           }
       - name: Record Windows package checksums

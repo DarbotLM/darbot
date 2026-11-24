@@ -74,16 +74,26 @@ function labelKey(name: string) {
 
 export function agentArtworkSeed(id: string): string {
   const alias = labelKey(id).replaceAll(" ", "-");
-  const mapped = (key: string) => Object.hasOwn(PERSONAL_AGENT_IDENTITIES, key)
-    ? PERSONAL_AGENT_IDENTITIES[key] : undefined;
-  return mapped(alias) ??
+  const mapped = (key: string) =>
+    Object.hasOwn(PERSONAL_AGENT_IDENTITIES, key)
+      ? PERSONAL_AGENT_IDENTITIES[key]
+      : undefined;
+  return (
+    mapped(alias) ??
     (alias.startsWith("darbot-")
       ? mapped(`dayour-${alias.slice("darbot-".length)}`)
-      : undefined) ?? id;
+      : undefined) ??
+    id
+  );
 }
 
 function AgentImage({
-  src, label, className, identityCode, color = "#217346", style,
+  src,
+  label,
+  className,
+  identityCode,
+  color = "#217346",
+  style,
 }: {
   src?: string;
   label: string;
@@ -93,25 +103,70 @@ function AgentImage({
   style?: CSSProperties;
 }) {
   const [failedSource, setFailedSource] = useState<string | null>(null);
-  const words = label.replace(/^(?:darbot|dayour)[-_ ]+/i, "").trim().split(/[\s_-]+/);
-  const glyph = (identityCode?.split("-").at(-1) ??
-    words.slice(0, 2).map((word) => Array.from(word)[0] ?? "").join("").toUpperCase()) || "D";
+  const words = label
+    .replace(/^(?:darbot|dayour)[-_ ]+/i, "")
+    .trim()
+    .split(/[\s_-]+/);
+  const glyph =
+    (identityCode?.split("-").at(-1) ??
+      words
+        .slice(0, 2)
+        .map((word) => Array.from(word)[0] ?? "")
+        .join("")
+        .toUpperCase()) ||
+    "D";
   if (!src || failedSource === src) {
-    return <svg className={className} data-swarm-identity={identityCode}
-      data-agent-artwork="glyph" viewBox="0 0 32 32" style={style}
-      aria-hidden="true" focusable="false">
-      <rect x="1" y="1" width="30" height="30" rx="6" fill="#101820" stroke={color} strokeWidth="2" />
-      <path d="M3 23h26v3a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3z" fill={color} />
-      <text x="16" y="20" fill="#f2f5f4" textAnchor="middle" fontSize="13"
-        fontWeight="700" fontFamily="system-ui, sans-serif">{glyph}</text>
-    </svg>;
+    return (
+      <svg
+        className={className}
+        data-swarm-identity={identityCode}
+        data-agent-artwork="glyph"
+        viewBox="0 0 32 32"
+        style={style}
+        aria-hidden="true"
+        focusable="false"
+      >
+        <rect
+          x="1"
+          y="1"
+          width="30"
+          height="30"
+          rx="6"
+          fill="#101820"
+          stroke={color}
+          strokeWidth="2"
+        />
+        <path d="M3 23h26v3a3 3 0 0 1-3 3H6a3 3 0 0 1-3-3z" fill={color} />
+        <text
+          x="16"
+          y="20"
+          fill="#f2f5f4"
+          textAnchor="middle"
+          fontSize="13"
+          fontWeight="700"
+          fontFamily="system-ui, sans-serif"
+        >
+          {glyph}
+        </text>
+      </svg>
+    );
   }
-  return <img className={className} data-swarm-identity={identityCode} src={src}
-    alt="" aria-hidden="true" style={style}
-    onError={() => {
-      console.warn("Darbot agent artwork could not be loaded; displaying its local identity glyph.");
-      setFailedSource(src);
-    }} />;
+  return (
+    <img
+      className={className}
+      data-swarm-identity={identityCode}
+      src={src}
+      alt=""
+      aria-hidden="true"
+      style={style}
+      onError={() => {
+        console.warn(
+          "Darbot agent artwork could not be loaded; displaying its local identity glyph.",
+        );
+        setFailedSource(src);
+      }}
+    />
+  );
 }
 
 function nameBadge(name: string) {
@@ -197,7 +252,11 @@ export function AgentAttributeIcon({
       }}
     >
       {src ? (
-        <AgentImage src={src} label={label} style={{ width: "1.15em", height: "1.15em" }} />
+        <AgentImage
+          src={src}
+          label={label}
+          style={{ width: "1.15em", height: "1.15em" }}
+        />
       ) : (
         glyph
       )}

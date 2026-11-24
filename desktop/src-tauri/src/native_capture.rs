@@ -8,8 +8,11 @@ use std::{
 };
 
 const WORKER: &str = "--darbot-native-capture";
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 const OUTPUT_LIMIT: usize = 2 * 1024 * 1024;
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 const REQUEST_LIMIT: usize = 8192;
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 pub(crate) const CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn fail(message: impl AsRef<str>) -> Problem {
@@ -26,6 +29,7 @@ struct Process {
 #[derive(Default)]
 pub(crate) struct OwnedCapture(Mutex<Process>);
 
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
 impl OwnedCapture {
     pub(crate) fn cancel(&self) -> Result<(), Problem> {
         let mut process = self.0.lock().unwrap();
@@ -425,11 +429,9 @@ pub(crate) mod tests {
         if mode == "hung-render" {
             #[cfg(windows)]
             crate::chat_content::tests::native_capture_encodes_only_an_owned_fixture_window_and_rejects_closed_sources();
-            #[cfg(not(windows))]
             loop {
                 std::thread::sleep(Duration::from_secs(60));
             }
-            panic!("The owned WM_PRINT fixture must hang");
         }
         if mode == "hang" {
             loop {

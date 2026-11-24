@@ -63,7 +63,9 @@ function sink(): IngressSink {
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => { resolve = done; });
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
   return { promise, resolve };
 }
 
@@ -81,11 +83,13 @@ function deferredAttachment() {
     started: started.promise,
     finish: () => read.resolve(new TextEncoder().encode("stale file").buffer),
     fetch,
-    attachments: [{
-      contentType: "text/plain",
-      contentUrl: "https://files.example.invalid/file.txt",
-      name: "file.txt",
-    }],
+    attachments: [
+      {
+        contentType: "text/plain",
+        contentUrl: "https://files.example.invalid/file.txt",
+        name: "file.txt",
+      },
+    ],
   };
 }
 
@@ -277,7 +281,9 @@ describe("Teams Activity ingress", () => {
     vi.spyOn(console, "error").mockImplementation(() => {});
     const { cloud, ingress, dispatch } = fixture();
     ingress.onInteraction = vi.fn(async () => {
-      throw Object.assign(new Error("expired"), { code: "channel_action_expired" });
+      throw Object.assign(new Error("expired"), {
+        code: "channel_action_expired",
+      });
     });
     const { context, completion } = dispatch(execute());
     await completion;
@@ -349,8 +355,12 @@ describe("Teams Activity ingress", () => {
       dispatch(activity(ActivityTypes.MessageDelete)).completion,
     ).rejects.toThrow("sink unavailable");
     await expect(
-      dispatch(activity(ActivityTypes.MessageUpdate, { id: "another-id", text: "edited" }))
-        .completion,
+      dispatch(
+        activity(ActivityTypes.MessageUpdate, {
+          id: "another-id",
+          text: "edited",
+        }),
+      ).completion,
     ).rejects.toThrow("sink unavailable");
   });
 
@@ -409,9 +419,11 @@ describe("Teams Activity ingress", () => {
         // even start another attachment download before core deduplication.
         await dispatch(original).completion;
         expect(file.fetch).toHaveBeenCalledOnce();
-        expect(await adapter.getMessages({
-          conversationKey: conversationKeyOf(original),
-        })).toEqual([{ text: "new", isBot: false }]);
+        expect(
+          await adapter.getMessages({
+            conversationKey: conversationKeyOf(original),
+          }),
+        ).toEqual([{ text: "new", isBot: false }]);
       } finally {
         file.finish();
         await pending.completion;
@@ -420,9 +432,11 @@ describe("Teams Activity ingress", () => {
       await dispatch(newer).completion;
       expect(ingress.onTurn).toHaveBeenCalledOnce();
       expect(vi.mocked(ingress.onTurn).mock.lastCall?.[0].userText).toBe("new");
-      expect(await adapter.getMessages({
-        conversationKey: conversationKeyOf(original),
-      })).toEqual([{ text: "new", isBot: false }]);
+      expect(
+        await adapter.getMessages({
+          conversationKey: conversationKeyOf(original),
+        }),
+      ).toEqual([{ text: "new", isBot: false }]);
     },
   );
 
@@ -431,15 +445,21 @@ describe("Teams Activity ingress", () => {
     async (type) => {
       const { adapter, ingress, dispatch } = fixture();
       const file = deferredAttachment();
-      const original = activity(type, { text: "old", attachments: file.attachments });
+      const original = activity(type, {
+        text: "old",
+        attachments: file.attachments,
+      });
       const pending = dispatch(original);
       await file.started;
       const deletion = activity(ActivityTypes.MessageDelete);
       try {
         await dispatch(deletion).completion;
         await dispatch(original).completion;
-        await dispatch(activity(ActivityTypes.MessageUpdate, { text: "late edit" })).completion;
-        await dispatch(activity(ActivityTypes.Message, { text: "late create" })).completion;
+        await dispatch(
+          activity(ActivityTypes.MessageUpdate, { text: "late edit" }),
+        ).completion;
+        await dispatch(activity(ActivityTypes.Message, { text: "late create" }))
+          .completion;
         await dispatch(deletion).completion;
         expect(file.fetch).toHaveBeenCalledOnce();
       } finally {
@@ -448,10 +468,14 @@ describe("Teams Activity ingress", () => {
       }
       await dispatch(original).completion;
       expect(ingress.onTurn).toHaveBeenCalledOnce();
-      expect(vi.mocked(ingress.onTurn).mock.lastCall?.[0].operation?.kind).toBe("deleted");
-      expect(await adapter.getMessages({
-        conversationKey: conversationKeyOf(original),
-      })).toEqual([]);
+      expect(vi.mocked(ingress.onTurn).mock.lastCall?.[0].operation?.kind).toBe(
+        "deleted",
+      );
+      expect(
+        await adapter.getMessages({
+          conversationKey: conversationKeyOf(original),
+        }),
+      ).toEqual([]);
     },
   );
 
@@ -463,42 +487,65 @@ describe("Teams Activity ingress", () => {
     });
     await dispatch(edit).completion;
     // This offset timestamp sorts later lexically, but is one second older.
-    await dispatch(activity(ActivityTypes.MessageUpdate, {
-      text: "older", timestamp: "2026-01-02T04:04:05+01:00",
-    })).completion;
-    await dispatch(activity(ActivityTypes.MessageDelete, {
-      timestamp: "2026-01-02T03:04:05Z",
-    })).completion;
-    await dispatch(activity(ActivityTypes.Message, { text: "late original" })).completion;
+    await dispatch(
+      activity(ActivityTypes.MessageUpdate, {
+        text: "older",
+        timestamp: "2026-01-02T04:04:05+01:00",
+      }),
+    ).completion;
+    await dispatch(
+      activity(ActivityTypes.MessageDelete, {
+        timestamp: "2026-01-02T03:04:05Z",
+      }),
+    ).completion;
+    await dispatch(activity(ActivityTypes.Message, { text: "late original" }))
+      .completion;
     expect(ingress.onTurn).toHaveBeenCalledOnce();
-    expect(await adapter.getMessages({ conversationKey: conversationKeyOf(edit) }))
-      .toEqual([{ text: "latest", isBot: false }]);
+    expect(
+      await adapter.getMessages({ conversationKey: conversationKeyOf(edit) }),
+    ).toEqual([{ text: "latest", isBot: false }]);
 
-    await dispatch(activity(ActivityTypes.MessageDelete, {
-      timestamp: "2026-01-02T03:04:06Z",
-    })).completion;
-    await dispatch(activity(ActivityTypes.MessageUpdate, { text: "undated" })).completion;
-    await dispatch(activity(ActivityTypes.MessageUpdate, {
-      text: "equal time", timestamp: "2026-01-02T04:04:06+01:00",
-    })).completion;
-    await dispatch(activity(ActivityTypes.Message, {
-      text: "create cannot restore", timestamp: "2026-01-02T03:04:07Z",
-    })).completion;
+    await dispatch(
+      activity(ActivityTypes.MessageDelete, {
+        timestamp: "2026-01-02T03:04:06Z",
+      }),
+    ).completion;
+    await dispatch(activity(ActivityTypes.MessageUpdate, { text: "undated" }))
+      .completion;
+    await dispatch(
+      activity(ActivityTypes.MessageUpdate, {
+        text: "equal time",
+        timestamp: "2026-01-02T04:04:06+01:00",
+      }),
+    ).completion;
+    await dispatch(
+      activity(ActivityTypes.Message, {
+        text: "create cannot restore",
+        timestamp: "2026-01-02T03:04:07Z",
+      }),
+    ).completion;
     expect(ingress.onTurn).toHaveBeenCalledTimes(2);
-    expect(await adapter.getMessages({ conversationKey: conversationKeyOf(edit) })).toEqual([]);
-    await dispatch(activity(ActivityTypes.MessageUpdate, {
-      text: "restored", timestamp: "2026-01-02T03:04:07Z",
-    })).completion;
+    expect(
+      await adapter.getMessages({ conversationKey: conversationKeyOf(edit) }),
+    ).toEqual([]);
+    await dispatch(
+      activity(ActivityTypes.MessageUpdate, {
+        text: "restored",
+        timestamp: "2026-01-02T03:04:07Z",
+      }),
+    ).completion;
     expect(ingress.onTurn).toHaveBeenCalledTimes(3);
-    expect(await adapter.getMessages({ conversationKey: conversationKeyOf(edit) }))
-      .toEqual([{ text: "restored", isBot: false }]);
+    expect(
+      await adapter.getMessages({ conversationKey: conversationKeyOf(edit) }),
+    ).toEqual([{ text: "restored", isBot: false }]);
   });
 
   it("does not invalidate an accepted pending edit when the same delivery is retried", async () => {
     const { adapter, ingress, dispatch } = fixture();
     const file = deferredAttachment();
     const edit = activity(ActivityTypes.MessageUpdate, {
-      text: "accepted", attachments: file.attachments,
+      text: "accepted",
+      attachments: file.attachments,
     });
     const pending = dispatch(edit);
     await file.started;
@@ -511,8 +558,9 @@ describe("Teams Activity ingress", () => {
       await pending.completion;
     }
     expect(ingress.onTurn).toHaveBeenCalledOnce();
-    expect(await adapter.getMessages({ conversationKey: conversationKeyOf(edit) }))
-      .toEqual([{ text: expect.stringContaining("stale file"), isBot: false }]);
+    expect(
+      await adapter.getMessages({ conversationKey: conversationKeyOf(edit) }),
+    ).toEqual([{ text: expect.stringContaining("stale file"), isBot: false }]);
   });
 
   it("uses arrival order for distinct undated edits and deduplicates old fingerprints", async () => {
@@ -523,31 +571,46 @@ describe("Teams Activity ingress", () => {
     await dispatch(second).completion;
     await dispatch(first).completion;
     expect(ingress.onTurn).toHaveBeenCalledTimes(2);
-    expect(await adapter.getMessages({ conversationKey: conversationKeyOf(first) }))
-      .toEqual([{ text: "second", isBot: false }]);
+    expect(
+      await adapter.getMessages({ conversationKey: conversationKeyOf(first) }),
+    ).toEqual([{ text: "second", isBot: false }]);
     await dispatch(activity(ActivityTypes.MessageDelete)).completion;
     // No timestamp can establish that an edit is newer than an undated delete.
-    await dispatch(activity(ActivityTypes.MessageUpdate, {
-      text: "cannot prove restore", timestamp: "2026-01-02T03:04:07Z",
-    })).completion;
+    await dispatch(
+      activity(ActivityTypes.MessageUpdate, {
+        text: "cannot prove restore",
+        timestamp: "2026-01-02T03:04:07Z",
+      }),
+    ).completion;
     expect(ingress.onTurn).toHaveBeenCalledTimes(3);
-    expect(await adapter.getMessages({ conversationKey: conversationKeyOf(first) })).toEqual([]);
+    expect(
+      await adapter.getMessages({ conversationKey: conversationKeyOf(first) }),
+    ).toEqual([]);
   });
 
   it("acks a credentialed edit before file/handler completion on the native tracked proactive path", async () => {
-    const { adapter, cloud, ingress, dispatch } = fixture({ clientId: "credentialed-app" });
+    const { adapter, cloud, ingress, dispatch } = fixture({
+      clientId: "credentialed-app",
+    });
     const file = deferredAttachment();
     const finishHandler = deferred<void>();
     const handlerStarted = deferred<void>();
-    const proactive = new TurnContext(cloud, activity(ActivityTypes.Event), { aud: "credentialed-app" });
-    const continuation = vi.spyOn(cloud, "continueConversation")
-      .mockImplementation(async (_appId, _reference, callback) => { await callback(proactive); });
+    const proactive = new TurnContext(cloud, activity(ActivityTypes.Event), {
+      aud: "credentialed-app",
+    });
+    const continuation = vi
+      .spyOn(cloud, "continueConversation")
+      .mockImplementation(async (_appId, _reference, callback) => {
+        await callback(proactive);
+      });
     ingress.onTurn = vi.fn(async () => {
       handlerStarted.resolve();
       await finishHandler.promise;
     });
     const edit = activity(ActivityTypes.MessageUpdate, {
-      text: "edit", timestamp: "2026-01-02T03:04:06Z", attachments: file.attachments,
+      text: "edit",
+      timestamp: "2026-01-02T03:04:06Z",
+      attachments: file.attachments,
     });
     try {
       await dispatch(edit).completion;
@@ -563,7 +626,9 @@ describe("Teams Activity ingress", () => {
         replyTarget: { context: proactive },
       });
       let stopped = false;
-      const stopping = adapter.stop().then(() => { stopped = true; });
+      const stopping = adapter.stop().then(() => {
+        stopped = true;
+      });
       await Promise.resolve();
       expect(stopped).toBe(false);
       finishHandler.resolve();
@@ -577,14 +642,19 @@ describe("Teams Activity ingress", () => {
   });
 
   it("keeps a credentialed edit token across proactive context creation and suppresses a deleted pending run", async () => {
-    const { adapter, cloud, ingress, dispatch } = fixture({ clientId: "credentialed-app" });
+    const { adapter, cloud, ingress, dispatch } = fixture({
+      clientId: "credentialed-app",
+    });
     const ready = deferred<void>();
-    const proactive = new TurnContext(cloud, activity(ActivityTypes.Event), { aud: "credentialed-app" });
-    vi.spyOn(cloud, "continueConversation")
-      .mockImplementation(async (_appId, _reference, callback) => {
+    const proactive = new TurnContext(cloud, activity(ActivityTypes.Event), {
+      aud: "credentialed-app",
+    });
+    vi.spyOn(cloud, "continueConversation").mockImplementation(
+      async (_appId, _reference, callback) => {
         await ready.promise;
         await callback(proactive);
-      });
+      },
+    );
     const edit = activity(ActivityTypes.MessageUpdate, { text: "edit" });
     try {
       await dispatch(edit).completion;
@@ -594,40 +664,63 @@ describe("Teams Activity ingress", () => {
       await adapter.stop();
     }
     expect(ingress.onTurn).toHaveBeenCalledOnce();
-    expect(vi.mocked(ingress.onTurn).mock.lastCall?.[0].operation?.kind).toBe("deleted");
-    expect(await adapter.getMessages({ conversationKey: conversationKeyOf(edit) })).toEqual([]);
+    expect(vi.mocked(ingress.onTurn).mock.lastCall?.[0].operation?.kind).toBe(
+      "deleted",
+    );
+    expect(
+      await adapter.getMessages({ conversationKey: conversationKeyOf(edit) }),
+    ).toEqual([]);
   });
 
   it.each([ActivityTypes.MessageUpdate, ActivityTypes.MessageDelete])(
     "suppresses a credentialed edit during its attachment read after %s and redelivery",
     async (type) => {
-      const { adapter, cloud, ingress, dispatch } = fixture({ clientId: "credentialed-app" });
+      const { adapter, cloud, ingress, dispatch } = fixture({
+        clientId: "credentialed-app",
+      });
       const file = deferredAttachment();
-      const proactive = new TurnContext(cloud, activity(ActivityTypes.Event), { aud: "credentialed-app" });
-      const continuation = vi.spyOn(cloud, "continueConversation")
-        .mockImplementation(async (_appId, _reference, callback) => { await callback(proactive); });
+      const proactive = new TurnContext(cloud, activity(ActivityTypes.Event), {
+        aud: "credentialed-app",
+      });
+      const continuation = vi
+        .spyOn(cloud, "continueConversation")
+        .mockImplementation(async (_appId, _reference, callback) => {
+          await callback(proactive);
+        });
       const edit = activity(ActivityTypes.MessageUpdate, {
-        text: "stale edit", timestamp: "2026-01-02T03:04:05Z",
+        text: "stale edit",
+        timestamp: "2026-01-02T03:04:05Z",
         attachments: file.attachments,
       });
       try {
         await dispatch(edit).completion;
         await file.started;
-        await dispatch(activity(type, {
-          text: "replacement", timestamp: "2026-01-02T03:04:06Z",
-        })).completion;
+        await dispatch(
+          activity(type, {
+            text: "replacement",
+            timestamp: "2026-01-02T03:04:06Z",
+          }),
+        ).completion;
         await dispatch(edit).completion;
       } finally {
         file.finish();
         await adapter.stop();
       }
       expect(file.fetch).toHaveBeenCalledOnce();
-      expect(continuation).toHaveBeenCalledTimes(type === ActivityTypes.MessageUpdate ? 2 : 1);
+      expect(continuation).toHaveBeenCalledTimes(
+        type === ActivityTypes.MessageUpdate ? 2 : 1,
+      );
       expect(ingress.onTurn).toHaveBeenCalledOnce();
-      expect(vi.mocked(ingress.onTurn).mock.lastCall?.[0].operation?.kind)
-        .toBe(type === ActivityTypes.MessageUpdate ? "updated" : "deleted");
-      expect(await adapter.getMessages({ conversationKey: conversationKeyOf(edit) }))
-        .toEqual(type === ActivityTypes.MessageUpdate ? [{ text: "replacement", isBot: false }] : []);
+      expect(vi.mocked(ingress.onTurn).mock.lastCall?.[0].operation?.kind).toBe(
+        type === ActivityTypes.MessageUpdate ? "updated" : "deleted",
+      );
+      expect(
+        await adapter.getMessages({ conversationKey: conversationKeyOf(edit) }),
+      ).toEqual(
+        type === ActivityTypes.MessageUpdate
+          ? [{ text: "replacement", isBot: false }]
+          : [],
+      );
     },
   );
 
@@ -749,19 +842,25 @@ describe("Teams Activity ingress", () => {
   it("prevents late downloads from undoing edits, deletions or uninstall", () => {
     const store = new TeamsConversationStore();
     const original = store.beginUserRevision("conversation", "id", "old", {
-      kind: "created", revisionId: "z-random",
+      kind: "created",
+      revisionId: "z-random",
     })!;
     const edited = store.beginUserRevision("conversation", "id", "new", {
-      kind: "updated", revisionId: "a-random",
+      kind: "updated",
+      revisionId: "a-random",
     })!;
     expect(original.isCurrent()).toBe(false);
     expect(original.commit("stale file")).toBe(false);
     expect(store.getTranscript("conversation")[0]?.text).toBe("new");
-    store.deleteUser("conversation", "id", { kind: "deleted", revisionId: "delete" });
+    store.deleteUser("conversation", "id", {
+      kind: "deleted",
+      revisionId: "delete",
+    });
     expect(edited.commit("deleted file")).toBe(false);
     expect(store.getTranscript("conversation")).toEqual([]);
     const late = store.beginUserRevision("conversation", "other-id", "again", {
-      kind: "created", revisionId: "again",
+      kind: "created",
+      revisionId: "again",
     })!;
     store.clear("conversation");
     expect(late.commit("uninstalled file")).toBe(false);

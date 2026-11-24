@@ -107,19 +107,11 @@ fn newer(candidate: &str, current: &str) -> bool {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct Preferences {
     enabled: bool,
     seen: Vec<String>,
-}
-impl Default for Preferences {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            seen: vec![],
-        }
-    }
 }
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]

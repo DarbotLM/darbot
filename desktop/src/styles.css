@@ -2082,7 +2082,9 @@ html[data-copilot-theme="dark"] .fleet-face {
   font-size: 0.8rem;
   overflow-wrap: anywhere;
 }
-.copilot-chat-error pre { white-space: pre-wrap; }
+.copilot-chat-error pre {
+  white-space: pre-wrap;
+}
 
 .copilot-messages-wrap {
   position: relative;
@@ -2602,19 +2604,59 @@ html[data-copilot-theme="dark"] .fleet-face {
   color: var(--ink);
   box-shadow: 0 4px 18px #0004;
 }
-.desktop-update-toast > div { flex: 1 1 100%; }
-.desktop-update-toast p { margin: 0.25rem 0 0; font-size: 0.8rem; }
-.desktop-widget .desktop-update-toast { right: 0.4rem; bottom: 0.4rem; width: calc(100vw - 0.8rem); }
+.desktop-update-toast > div {
+  flex: 1 1 100%;
+}
+.desktop-update-toast p {
+  margin: 0.25rem 0 0;
+  font-size: 0.8rem;
+}
+.desktop-widget .desktop-update-toast {
+  right: 0.4rem;
+  bottom: 0.4rem;
+  width: calc(100vw - 0.8rem);
+}
 
-.fleet-panel { margin-block: 0.75rem; padding: 0.65rem; border: 1px solid var(--hair); border-radius: 0.6rem; }
-.fleet-panel summary { cursor: pointer; font-weight: 600; }
-.fleet-panel details, .fleet-task { margin-block: 0.65rem; }
-.fleet-panel label { display: block; margin-block: 0.5rem; }
-.fleet-panel input:not([type="checkbox"]), .fleet-panel textarea, .fleet-panel select { width: 100%; }
-.fleet-panel input[type="checkbox"] { width: auto; margin-right: 0.5rem; }
-.fleet-panel pre { max-height: 18rem; overflow: auto; white-space: pre-wrap; }
-.fleet-panel small { display: block; overflow-wrap: anywhere; }
-.fleet-fingerprint { overflow-wrap: anywhere; font-family: monospace; }
+.fleet-panel {
+  margin-block: 0.75rem;
+  padding: 0.65rem;
+  border: 1px solid var(--hair);
+  border-radius: 0.6rem;
+}
+.fleet-panel summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+.fleet-panel details,
+.fleet-task {
+  margin-block: 0.65rem;
+}
+.fleet-panel label {
+  display: block;
+  margin-block: 0.5rem;
+}
+.fleet-panel input:not([type="checkbox"]),
+.fleet-panel textarea,
+.fleet-panel select {
+  width: 100%;
+}
+.fleet-panel input[type="checkbox"] {
+  width: auto;
+  margin-right: 0.5rem;
+}
+.fleet-panel pre {
+  max-height: 18rem;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+.fleet-panel small {
+  display: block;
+  overflow-wrap: anywhere;
+}
+.fleet-fingerprint {
+  overflow-wrap: anywhere;
+  font-family: monospace;
+}
 
 .copilot-composer-input {
   display: flex;
@@ -2665,7 +2707,9 @@ html[data-copilot-theme="dark"] .fleet-face {
   margin-left: auto;
 }
 
-.copilot-composer-add span { font-size: 1.1em; }
+.copilot-composer-add span {
+  font-size: 1.1em;
+}
 
 .copilot-composer label {
   display: block;
@@ -2727,23 +2771,37 @@ html[data-copilot-theme="dark"] .fleet-face {
   overflow: auto;
   scrollbar-gutter: stable;
 }
-.copilot-content:empty { display: none; }
+.copilot-content:empty {
+  display: none;
+}
 .copilot-content-menu {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: 0.35rem;
 }
-.copilot-content-menu, .copilot-content-selection {
+.copilot-content-menu,
+.copilot-content-selection {
   padding: 0.6rem;
   border: 1px solid var(--hair);
   border-radius: 0.65rem;
   background: var(--raised);
 }
-.copilot-content-selection p { margin-block: 0.3rem; overflow-wrap: anywhere; }
-.copilot-content-selection select { max-width: 100%; width: 100%; }
-.copilot-content-selection textarea:focus-visible { outline: 2px solid var(--focus); }
-.copilot-sharing-status { color: var(--ink); font-size: 0.8rem; }
+.copilot-content-selection p {
+  margin-block: 0.3rem;
+  overflow-wrap: anywhere;
+}
+.copilot-content-selection select {
+  max-width: 100%;
+  width: 100%;
+}
+.copilot-content-selection textarea:focus-visible {
+  outline: 2px solid var(--focus);
+}
+.copilot-sharing-status {
+  color: var(--ink);
+  font-size: 0.8rem;
+}
 .copilot-attachments {
   list-style: none;
   margin: 0.4rem 0;
@@ -2761,7 +2819,8 @@ html[data-copilot-theme="dark"] .fleet-face {
   background: var(--raised);
   min-width: 0;
 }
-.copilot-attachments img, .copilot-attachments pre {
+.copilot-attachments img,
+.copilot-attachments pre {
   width: 7rem;
   height: 4.5rem;
   object-fit: contain;
@@ -2772,13 +2831,35 @@ html[data-copilot-theme="dark"] .fleet-face {
   overflow-wrap: anywhere;
   font-size: 0.7rem;
 }
-.copilot-attachment-label { display: grid; min-width: 0; gap: 0.25rem; flex: 1; }
-.copilot-attachment-label strong { overflow-wrap: anywhere; font-size: 0.8rem; }
-.copilot-attachment-label span, .copilot-content > .hint { color: var(--ink-soft); font-size: 0.72rem; }
-.copilot-content-error { color: var(--ink); border-left: 3px solid var(--focus); padding-left: 0.5rem; }
-.desktop-widget .copilot-content { max-height: 28vh; }
-.desktop-widget .copilot-composer .copilot-content-selection label { display: block; }
-.desktop-widget .copilot-content-menu button { flex: 1 1 40%; }
+.copilot-attachment-label {
+  display: grid;
+  min-width: 0;
+  gap: 0.25rem;
+  flex: 1;
+}
+.copilot-attachment-label strong {
+  overflow-wrap: anywhere;
+  font-size: 0.8rem;
+}
+.copilot-attachment-label span,
+.copilot-content > .hint {
+  color: var(--ink-soft);
+  font-size: 0.72rem;
+}
+.copilot-content-error {
+  color: var(--ink);
+  border-left: 3px solid var(--focus);
+  padding-left: 0.5rem;
+}
+.desktop-widget .copilot-content {
+  max-height: 28vh;
+}
+.desktop-widget .copilot-composer .copilot-content-selection label {
+  display: block;
+}
+.desktop-widget .copilot-content-menu button {
+  flex: 1 1 40%;
+}
 .desktop-widget .copilot-composer .copilot-content button,
 .desktop-widget .copilot-composer .row button,
 .desktop-widget .copilot-composer .copilot-composer-input textarea,
@@ -2787,15 +2868,23 @@ html[data-copilot-theme="dark"] .fleet-face {
   font-size: max(0.9rem, 11px);
   min-height: 26px;
 }
-.desktop-widget .copilot-composer .copilot-content button { min-width: 26px; }
+.desktop-widget .copilot-composer .copilot-content button {
+  min-width: 26px;
+}
 .desktop-widget .copilot-content p,
 .desktop-widget .copilot-content label,
 .desktop-widget .copilot-attachment-label strong,
 .desktop-widget .copilot-attachment-label span,
-.desktop-widget .copilot-attachments pre { font-size: max(0.8rem, 10px); }
-.desktop-widget .copilot-message p { font-size: max(1rem, 11px); }
-.desktop-widget .copilot-attachments img, .desktop-widget .copilot-attachments pre {
-  width: 5rem; height: 3.5rem;
+.desktop-widget .copilot-attachments pre {
+  font-size: max(0.8rem, 10px);
+}
+.desktop-widget .copilot-message p {
+  font-size: max(1rem, 11px);
+}
+.desktop-widget .copilot-attachments img,
+.desktop-widget .copilot-attachments pre {
+  width: 5rem;
+  height: 3.5rem;
 }
 
 .provider-actions {

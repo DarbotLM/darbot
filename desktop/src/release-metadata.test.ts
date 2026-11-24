@@ -108,16 +108,18 @@ test("Windows release packaging signs and verifies both deliverables", () => {
     true,
   );
   expect(isSeq(verificationNeeds)).toBe(true);
-  if (!isSeq(verificationNeeds)) throw new Error("Windows verification needs are missing.");
-  expect(verificationNeeds.items.some((item) => String(item) === "desktop")).toBe(
-    true,
-  );
+  if (!isSeq(verificationNeeds))
+    throw new Error("Windows verification needs are missing.");
+  expect(
+    verificationNeeds.items.some((item) => String(item) === "desktop"),
+  ).toBe(true);
   expect(release.getIn(["jobs", "windows-verify", "runs-on"])).toBe(
     "windows-latest",
   );
   const releaseNeeds = release.getIn(["jobs", "github-release", "needs"], true);
   expect(isSeq(releaseNeeds)).toBe(true);
-  if (!isSeq(releaseNeeds)) throw new Error("GitHub release needs are missing.");
+  if (!isSeq(releaseNeeds))
+    throw new Error("GitHub release needs are missing.");
   expect(
     releaseNeeds.items.some((item) => String(item) === "windows-verify"),
   ).toBe(true);
