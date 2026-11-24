@@ -42,7 +42,12 @@ import {
 import { writeImportedAgentIds } from "./copilot-preferences";
 import type { HistoryIndex } from "./history-sources";
 import type { HarvestMutation } from "./session-harvest";
-import type { ControlAction, ControlIdentity, ControlEnvelope, ControlState } from "./app-control";
+import type {
+  ControlAction,
+  ControlIdentity,
+  ControlEnvelope,
+  ControlState,
+} from "./app-control";
 import type { ContentSnapshot, DarbotAttachment } from "./CopilotComposer";
 
 type Invocation = { command: string; args?: unknown };
@@ -110,33 +115,76 @@ function argument(args: unknown, key: string): string | null {
 
 test("fleet is read-only until an explicit native-reviewed action and does not claim queued work completed", async () => {
   const local = "fixture-local";
-  const row = { id: "task-fixture", origin: "fixture-peer", executor: local,
-    status: "input-required", revision: 1, sessionId: null, cancelRequested: false, profileId: "review" };
+  const row = {
+    id: "task-fixture",
+    origin: "fixture-peer",
+    executor: local,
+    status: "input-required",
+    revision: 1,
+    sessionId: null,
+    cancelRequested: false,
+    profileId: "review",
+  };
   let deny: ((error: unknown) => void) | undefined;
   invokeHandler = async (name, args) => {
-    if (name !== "fleet_dispatch") throw new Error("Fleet must use the native dispatcher");
+    if (name !== "fleet_dispatch")
+      throw new Error("Fleet must use the native dispatcher");
     const action = (args as { action: { action: string } }).action;
-    if (action.action === "status") return {
-      enabled: true, card: { nodeId: local, endpoint: "127.0.0.1:1234", version: 1, certificate: [], label: "Fixture" },
-      peers: [], profiles: [],
-    };
+    if (action.action === "status")
+      return {
+        enabled: true,
+        card: {
+          nodeId: local,
+          endpoint: "127.0.0.1:1234",
+          version: 1,
+          certificate: [],
+          label: "Fixture",
+        },
+        peers: [],
+        profiles: [],
+      };
     if (action.action === "list_tasks") return [row];
-    if (action.action === "approve_task") return new Promise((_, reject) => { deny = reject; });
+    if (action.action === "approve_task")
+      return new Promise((_, reject) => {
+        deny = reject;
+      });
     throw new Error("Unexpected fleet mutation");
   };
   const view = render(<FleetPanel visible cwd="C:\\fixture" agents={[]} />);
   view.container.querySelector("details")!.open = true;
-  await waitFor(() => expect(view.getByRole("button", { name: "Review execution" })).toBeTruthy());
-  expect(calls.every((call) => ["status", "list_tasks"].includes(
-    (call.args as { action: { action: string } }).action.action))).toBe(true);
+  await waitFor(() =>
+    expect(view.getByRole("button", { name: "Review execution" })).toBeTruthy(),
+  );
+  expect(
+    calls.every((call) =>
+      ["status", "list_tasks"].includes(
+        (call.args as { action: { action: string } }).action.action,
+      ),
+    ),
+  ).toBe(true);
   fireEvent.click(view.getByRole("button", { name: "Review execution" }));
-  await waitFor(() => expect(view.getByRole("status").textContent).toContain("Waiting for native approval"));
-  expect(view.getByRole("button", { name: "Review execution" }).hasAttribute("disabled")).toBe(true);
+  await waitFor(() =>
+    expect(view.getByRole("status").textContent).toContain(
+      "Waiting for native approval",
+    ),
+  );
+  expect(
+    view
+      .getByRole("button", { name: "Review execution" })
+      .hasAttribute("disabled"),
+  ).toBe(true);
   expect(view.queryByText("completed", { exact: true })).toBeNull();
   await act(async () => deny?.({ message: "Local owner denied the request" }));
-  await waitFor(() => expect(view.getByRole("alert").textContent).toContain("Local owner denied"));
-  expect(calls.filter((call) =>
-    (call.args as { action: { action: string } }).action.action === "approve_task")).toHaveLength(1);
+  await waitFor(() =>
+    expect(view.getByRole("alert").textContent).toContain("Local owner denied"),
+  );
+  expect(
+    calls.filter(
+      (call) =>
+        (call.args as { action: { action: string } }).action.action ===
+        "approve_task",
+    ),
+  ).toHaveLength(1);
 });
 
 test("a hidden fleet panel does not poll or approve tasks", async () => {
@@ -316,8 +364,15 @@ async function standardInvoke(
     case "app_control_status":
       return { enabled: false, endpoint: null, discoveryFile: null };
     case "desktop_update_status":
-      return { enabled: false, currentVersion: "test", phase: "disabled", available: null,
-        signed: null, notify: false, error: null };
+      return {
+        enabled: false,
+        currentVersion: "test",
+        phase: "disabled",
+        available: null,
+        signed: null,
+        notify: false,
+        error: null,
+      };
     case "chat_content_activate":
     case "chat_capture_stop":
       return { attachments: [], leaseId: null };
@@ -381,14 +436,21 @@ function draftInput(view: ReturnType<typeof render>, agent = "Copilot CLI") {
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (reason: unknown) => void;
-  const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
+  const promise = new Promise<T>((yes, no) => {
+    resolve = yes;
+    reject = no;
+  });
   return { promise, resolve, reject };
 }
 
 const imageAttachment = (): DarbotAttachment => ({
-  id: "owned-image", name: "Darbot fixture window", mimeType: "image/png", bytes: 80,
+  id: "owned-image",
+  name: "Darbot fixture window",
+  mimeType: "image/png",
+  bytes: 80,
   provenance: "Captured window",
-  preview: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=",
+  preview:
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=",
 });
 
 function contentFixture() {
@@ -397,49 +459,103 @@ function contentFixture() {
     const values = args as Record<string, unknown> | undefined;
     const key = JSON.stringify(values?.owner);
     const current = drafts.get(key) ?? { attachments: [], leaseId: null };
-    const save = (next: ContentSnapshot) => { drafts.set(key, next); return next; };
+    const save = (next: ContentSnapshot) => {
+      drafts.set(key, next);
+      return next;
+    };
     switch (command) {
       case "chat_content_activate":
         if (!values?.owner) {
-          for (const [id, snapshot] of drafts) drafts.set(id, {
-            attachments: snapshot.attachments.filter((item) => !item.provenance.includes("window")), leaseId: null,
-          });
+          for (const [id, snapshot] of drafts)
+            drafts.set(id, {
+              attachments: snapshot.attachments.filter(
+                (item) => !item.provenance.includes("window"),
+              ),
+              leaseId: null,
+            });
         }
         return current;
       case "chat_content_pick":
-        return save({ attachments: [{ ...imageAttachment(), provenance: "Selected file" }], leaseId: null });
+        return save({
+          attachments: [{ ...imageAttachment(), provenance: "Selected file" }],
+          leaseId: null,
+        });
       case "chat_content_text":
-        return save({ attachments: [{ id: "owned-context", name: "Selected text", mimeType: "text/plain", bytes: 13,
-          provenance: "Text explicitly selected by you", preview: String(values?.text) }], leaseId: null });
+        return save({
+          attachments: [
+            {
+              id: "owned-context",
+              name: "Selected text",
+              mimeType: "text/plain",
+              bytes: 13,
+              provenance: "Text explicitly selected by you",
+              preview: String(values?.text),
+            },
+          ],
+          leaseId: null,
+        });
       case "chat_content_remove":
-        return save({ ...current, attachments: current.attachments.filter((item) => item.id !== values?.id) });
+        return save({
+          ...current,
+          attachments: current.attachments.filter(
+            (item) => item.id !== values?.id,
+          ),
+        });
       case "chat_capture_sources":
         return [{ id: "opaque-owned-source", name: "Darbot fixture window" }];
       case "chat_capture_start":
-        return save({ attachments: [{ ...imageAttachment(), provenance: values?.share ? "Shared window snapshot" : "Captured window" }],
-          leaseId: values?.share ? "owned-lease" : null });
+        return save({
+          attachments: [
+            {
+              ...imageAttachment(),
+              provenance: values?.share
+                ? "Shared window snapshot"
+                : "Captured window",
+            },
+          ],
+          leaseId: values?.share ? "owned-lease" : null,
+        });
       case "chat_capture_frame":
         return current;
       case "chat_capture_stop":
-        return save({ attachments: values?.keepSnapshot ? current.attachments : current.attachments.filter((item) => item.provenance === "Selected file"), leaseId: null });
+        return save({
+          attachments: values?.keepSnapshot
+            ? current.attachments
+            : current.attachments.filter(
+                (item) => item.provenance === "Selected file",
+              ),
+          leaseId: null,
+        });
       case "chat_content_send":
         save({ attachments: [], leaseId: null });
         return { stopReason: "end_turn" };
-      default: return standardInvoke(command, args);
+      default:
+        return standardInvoke(command, args);
     }
   };
   invokeHandler = native;
   return native;
 }
 
-async function addFixtureImage(view: Awaited<ReturnType<typeof workspace>>, share = false) {
-  fireEvent.click(view.getByRole("button", { name: "Add attachments or context" }));
-  const capture = await view.findByRole("button", { name: share ? "Share Screen" : "Capture Screen" });
+async function addFixtureImage(
+  view: Awaited<ReturnType<typeof workspace>>,
+  share = false,
+) {
+  fireEvent.click(
+    view.getByRole("button", { name: "Add attachments or context" }),
+  );
+  const capture = await view.findByRole("button", {
+    name: share ? "Share Screen" : "Capture Screen",
+  });
   await waitFor(() => expect(capture.hasAttribute("disabled")).toBe(false));
   fireEvent.click(capture);
-  const picker = await view.findByRole("combobox", { name: "Window to capture" });
+  const picker = await view.findByRole("combobox", {
+    name: "Window to capture",
+  });
   fireEvent.change(picker, { target: { value: "opaque-owned-source" } });
-  fireEvent.click(view.getByRole("button", { name: "Preview selected window" }));
+  fireEvent.click(
+    view.getByRole("button", { name: "Preview selected window" }),
+  );
   await view.findByRole("img", { name: "Preview of Darbot fixture window" });
   await act(async () => {});
 }
@@ -448,19 +564,32 @@ test("compact composer contains editing, attachment, personality, model and send
   const view = await workspace();
   const composer = view.getByRole("region", { name: "Message composer" });
   const scope = within(composer);
-  expect(scope.getByRole("textbox", { name: "Message Copilot CLI" })).toBeTruthy();
-  expect(scope.getByRole("button", { name: "Add attachments or context" })).toBeTruthy();
+  expect(
+    scope.getByRole("textbox", { name: "Message Copilot CLI" }),
+  ).toBeTruthy();
+  expect(
+    scope.getByRole("button", { name: "Add attachments or context" }),
+  ).toBeTruthy();
   expect(scope.getByRole("combobox", { name: "Personality" })).toBeTruthy();
   expect(scope.getByRole("button", { name: "Choose model" })).toBeTruthy();
   expect(scope.getByRole("button", { name: "Send" })).toBeTruthy();
   expect(scope.queryByRole("button", { name: "Settings" })).toBeNull();
-  expect(view.container.querySelector(".copilot-conversation > .copilot-runtime-warnings")).toBeNull();
+  expect(
+    view.container.querySelector(
+      ".copilot-conversation > .copilot-runtime-warnings",
+    ),
+  ).toBeNull();
 });
 
 test("composer model discovery opens without sending, and selection uses the real session command", async () => {
   const model = {
-    id: "model", name: "Model", currentValue: "model-one",
-    options: [{ value: "model-one", name: "Model One" }, { value: "model-two", name: "Model Two" }],
+    id: "model",
+    name: "Model",
+    currentValue: "model-one",
+    options: [
+      { value: "model-one", name: "Model One" },
+      { value: "model-two", name: "Model Two" },
+    ],
   };
   invokeHandler = async (command, args) => {
     if (command === "copilot_session_new") {
@@ -468,7 +597,9 @@ test("composer model discovery opens without sending, and selection uses the rea
       return { ...next, configOptions: [...(next.configOptions ?? []), model] };
     }
     if (command === "copilot_session_configure") {
-      return { configOptions: [ { ...model, currentValue: argument(args, "value") } ] };
+      return {
+        configOptions: [{ ...model, currentValue: argument(args, "value") }],
+      };
     }
     return standardInvoke(command, args);
   };
@@ -476,21 +607,36 @@ test("composer model discovery opens without sending, and selection uses the rea
   await userEvent.type(draftInput(view), "Keep this draft");
   fireEvent.click(view.getByRole("button", { name: "Choose model" }));
   const select = await view.findByRole("combobox", { name: "Model" });
-  if (!(select instanceof HTMLSelectElement)) throw new Error("Model selector must be a select");
+  if (!(select instanceof HTMLSelectElement))
+    throw new Error("Model selector must be a select");
   fireEvent.change(select, { target: { value: "model-two" } });
   await waitFor(() => expect(select.value).toBe("model-two"));
-  expect(calls.some((call) => call.command === "copilot_session_configure" &&
-    argument(call.args, "sessionId") === "model-session" &&
-    argument(call.args, "value") === "model-two")).toBe(true);
-  expect(calls.some((call) => call.command === "copilot_session_prompt")).toBe(false);
+  expect(
+    calls.some(
+      (call) =>
+        call.command === "copilot_session_configure" &&
+        argument(call.args, "sessionId") === "model-session" &&
+        argument(call.args, "value") === "model-two",
+    ),
+  ).toBe(true);
+  expect(calls.some((call) => call.command === "copilot_session_prompt")).toBe(
+    false,
+  );
   expect(draftInput(view).value).toBe("Keep this draft");
 });
 
 test("composer offers real local entry points and capture cancellation never sends", async () => {
   contentFixture();
   const view = await workspace();
-  fireEvent.click(view.getByRole("button", { name: "Add attachments or context" }));
-  for (const name of ["Upload", "Select context", "Capture Screen", "Share Screen"]) {
+  fireEvent.click(
+    view.getByRole("button", { name: "Add attachments or context" }),
+  );
+  for (const name of [
+    "Upload",
+    "Select context",
+    "Capture Screen",
+    "Share Screen",
+  ]) {
     expect(await view.findByRole("button", { name })).toBeTruthy();
   }
   const capture = view.getByRole("button", { name: "Capture Screen" });
@@ -498,10 +644,24 @@ test("composer offers real local entry points and capture cancellation never sen
   fireEvent.click(capture);
   await view.findByRole("combobox", { name: "Window to capture" });
   await act(async () => {});
-  await act(async () => fireEvent.click(view.getByRole("button", { name: "Cancel" })));
-  await waitFor(() => expect(view.queryByRole("combobox", { name: "Window to capture" })).toBeNull());
-  expect(calls.some((call) => call.command === "chat_capture_start" || call.command === "chat_content_send")).toBe(false);
-  expect(calls.some((call) => call.command === "copilot_pick_workspace")).toBe(false);
+  await act(async () =>
+    fireEvent.click(view.getByRole("button", { name: "Cancel" })),
+  );
+  await waitFor(() =>
+    expect(
+      view.queryByRole("combobox", { name: "Window to capture" }),
+    ).toBeNull(),
+  );
+  expect(
+    calls.some(
+      (call) =>
+        call.command === "chat_capture_start" ||
+        call.command === "chat_content_send",
+    ),
+  ).toBe(false);
+  expect(calls.some((call) => call.command === "copilot_pick_workspace")).toBe(
+    false,
+  );
 });
 
 test("image-only turn dispatches opaque scoped attachments and never persists image bytes", async () => {
@@ -509,24 +669,46 @@ test("image-only turn dispatches opaque scoped attachments and never persists im
   const view = await workspace();
   await addFixtureImage(view);
   expect(draftInput(view).value).toBe("");
-  expect(view.getByRole("button", { name: "Send" }).hasAttribute("disabled")).toBe(false);
+  expect(
+    view.getByRole("button", { name: "Send" }).hasAttribute("disabled"),
+  ).toBe(false);
   expect(localStorage.getItem(WORKSPACE_STORAGE_KEY)).not.toContain("base64");
   fireEvent.click(view.getByRole("button", { name: "Send" }));
-  await waitFor(() => expect(calls.some((call) => call.command === "chat_content_send")).toBe(true));
-  const args = calls.find((call) => call.command === "chat_content_send")?.args as Record<string, unknown>;
+  await waitFor(() =>
+    expect(calls.some((call) => call.command === "chat_content_send")).toBe(
+      true,
+    ),
+  );
+  const args = calls.find((call) => call.command === "chat_content_send")
+    ?.args as Record<string, unknown>;
   expect(args.prompt).toBe("");
   expect(args.attachmentIds).toEqual(["owned-image"]);
-  expect(args.owner).toEqual({ conversationId: readConversationWorkspace().ok
-    ? JSON.parse(localStorage.getItem(WORKSPACE_STORAGE_KEY)!).activeConversationId : "", agentId: "" });
+  expect(args.owner).toEqual({
+    conversationId: readConversationWorkspace().ok
+      ? JSON.parse(localStorage.getItem(WORKSPACE_STORAGE_KEY)!)
+          .activeConversationId
+      : "",
+    agentId: "",
+  });
   expect(JSON.stringify(args)).not.toContain("base64");
-  await waitFor(() => expect(view.queryByRole("img", { name: "Preview of Darbot fixture window" })).toBeNull());
-  expect(calls.some((call) => call.command === "copilot_session_prompt")).toBe(false);
+  await waitFor(() =>
+    expect(
+      view.queryByRole("img", { name: "Preview of Darbot fixture window" }),
+    ).toBeNull(),
+  );
+  expect(calls.some((call) => call.command === "copilot_session_prompt")).toBe(
+    false,
+  );
 });
 
 test("failed rich send preserves both draft and removable attachment for explicit retry", async () => {
   const native = contentFixture();
-  invokeHandler = (command, args) => command === "chat_content_send"
-    ? Promise.reject({ said: "Agent does not support image prompts. Draft kept." }) : native(command, args);
+  invokeHandler = (command, args) =>
+    command === "chat_content_send"
+      ? Promise.reject({
+          said: "Agent does not support image prompts. Draft kept.",
+        })
+      : native(command, args);
   const view = await workspace();
   await userEvent.type(draftInput(view), "Inspect the fixture");
   await addFixtureImage(view);
@@ -534,27 +716,56 @@ test("failed rich send preserves both draft and removable attachment for explici
   await view.findByText("Agent does not support image prompts. Draft kept.");
   await act(async () => {});
   expect(draftInput(view).value).toBe("Inspect the fixture");
-  expect(view.getByRole("img", { name: "Preview of Darbot fixture window" })).toBeTruthy();
-  expect(localStorage.getItem(WORKSPACE_STORAGE_KEY)).toContain("Inspect the fixture");
-  await act(async () => fireEvent.click(view.getByRole("button", { name: "Remove Darbot fixture window" })));
-  expect(view.queryByRole("img", { name: "Preview of Darbot fixture window" })).toBeNull();
+  expect(
+    view.getByRole("img", { name: "Preview of Darbot fixture window" }),
+  ).toBeTruthy();
+  expect(localStorage.getItem(WORKSPACE_STORAGE_KEY)).toContain(
+    "Inspect the fixture",
+  );
+  await act(async () =>
+    fireEvent.click(
+      view.getByRole("button", { name: "Remove Darbot fixture window" }),
+    ),
+  );
+  expect(
+    view.queryByRole("img", { name: "Preview of Darbot fixture window" }),
+  ).toBeNull();
 });
 
 test("selected text is explicit, typed, previewable and removable without ambient reads", async () => {
   contentFixture();
   const view = await workspace();
-  fireEvent.click(view.getByRole("button", { name: "Add attachments or context" }));
+  fireEvent.click(
+    view.getByRole("button", { name: "Add attachments or context" }),
+  );
   const choose = view.getByRole("button", { name: "Select context" });
   await waitFor(() => expect(choose.hasAttribute("disabled")).toBe(false));
   fireEvent.click(choose);
-  await userEvent.type(view.getByRole("textbox", { name: "Selected text" }), "Owned fixture text");
-  await act(async () => fireEvent.click(view.getByRole("button", { name: "Attach selected text" })));
+  await userEvent.type(
+    view.getByRole("textbox", { name: "Selected text" }),
+    "Owned fixture text",
+  );
+  await act(async () =>
+    fireEvent.click(view.getByRole("button", { name: "Attach selected text" })),
+  );
   await view.findByText("Owned fixture text", { selector: "pre" });
   await act(async () => {});
   expect(view.getByText(/text\/plain/)).toBeTruthy();
-  await act(async () => fireEvent.click(view.getByRole("button", { name: "Remove Selected text" })));
-  await waitFor(() => expect(view.queryByText("Owned fixture text", { selector: "pre" })).toBeNull());
-  expect(calls.some((call) => call.command === "copilot_session_prompt" || call.command === "chat_content_send")).toBe(false);
+  await act(async () =>
+    fireEvent.click(view.getByRole("button", { name: "Remove Selected text" })),
+  );
+  await waitFor(() =>
+    expect(
+      view.queryByText("Owned fixture text", { selector: "pre" }),
+    ).toBeNull(),
+  );
+  expect(
+    calls.some(
+      (call) =>
+        call.command === "copilot_session_prompt" ||
+        call.command === "chat_content_send",
+    ),
+  ).toBe(false);
 });
 
 test("sharing is local, duplicate frames do not accumulate, Stop revokes and send freezes the reviewed id", async () => {
@@ -562,15 +773,35 @@ test("sharing is local, duplicate frames do not accumulate, Stop revokes and sen
   const view = await workspace();
   await addFixtureImage(view, true);
   expect(view.getByRole("button", { name: "Stop sharing" })).toBeTruthy();
-  await waitFor(() => expect(calls.some((call) => call.command === "chat_capture_frame")).toBe(true), { timeout: 5000 });
-  expect(view.getAllByRole("img", { name: "Preview of Darbot fixture window" })).toHaveLength(1);
-  expect(calls.some((call) => call.command === "chat_content_send")).toBe(false);
-  await act(async () => fireEvent.click(view.getByRole("button", { name: "Stop sharing" })));
-  expect(view.queryByRole("img", { name: "Preview of Darbot fixture window" })).toBeNull();
+  await waitFor(
+    () =>
+      expect(calls.some((call) => call.command === "chat_capture_frame")).toBe(
+        true,
+      ),
+    { timeout: 5000 },
+  );
+  expect(
+    view.getAllByRole("img", { name: "Preview of Darbot fixture window" }),
+  ).toHaveLength(1);
+  expect(calls.some((call) => call.command === "chat_content_send")).toBe(
+    false,
+  );
+  await act(async () =>
+    fireEvent.click(view.getByRole("button", { name: "Stop sharing" })),
+  );
+  expect(
+    view.queryByRole("img", { name: "Preview of Darbot fixture window" }),
+  ).toBeNull();
   await addFixtureImage(view, true);
   fireEvent.click(view.getByRole("button", { name: "Send" }));
-  await waitFor(() => expect(calls.some((call) => call.command === "chat_content_send")).toBe(true));
-  const freeze = calls.filter((call) => call.command === "chat_capture_stop").at(-1)?.args as Record<string, unknown>;
+  await waitFor(() =>
+    expect(calls.some((call) => call.command === "chat_content_send")).toBe(
+      true,
+    ),
+  );
+  const freeze = calls
+    .filter((call) => call.command === "chat_capture_stop")
+    .at(-1)?.args as Record<string, unknown>;
   expect(freeze.keepSnapshot).toBe(true);
   expect(freeze.expectedAttachmentId).toBe("owned-image");
   expect(view.queryByRole("button", { name: "Stop sharing" })).toBeNull();
@@ -581,17 +812,34 @@ test("attachments block remote send and screenshot even with a current text-only
   const view = await workspace();
   await userEvent.type(draftInput(view), "Open fixture conversation");
   fireEvent.click(view.getByRole("button", { name: "Send" }));
-  await waitFor(() => expect(calls.some((call) => call.command === "copilot_session_prompt")).toBe(true));
-  await waitFor(() => expect(draftInput(view).hasAttribute("disabled")).toBe(false));
+  await waitFor(() =>
+    expect(
+      calls.some((call) => call.command === "copilot_session_prompt"),
+    ).toBe(true),
+  );
+  await waitFor(() =>
+    expect(draftInput(view).hasAttribute("disabled")).toBe(false),
+  );
   await addFixtureImage(view);
   await userEvent.type(draftInput(view), "Review locally");
   const current = await controlSnapshot();
-  const send = await controlAck(await beginControl({ action: "workspace_send_prompt", text: "Review locally", agentId: "" }, current));
+  const send = await controlAck(
+    await beginControl(
+      { action: "workspace_send_prompt", text: "Review locally", agentId: "" },
+      current,
+    ),
+  );
   expect(send.failure).toBeTruthy();
-  const capture = await controlAck(await beginControl({ action: "screenshot" }, current));
+  const capture = await controlAck(
+    await beginControl({ action: "screenshot" }, current),
+  );
   expect(capture.failure).toBeTruthy();
-  expect(calls.some((call) => call.command === "chat_content_send")).toBe(false);
-  expect(view.getByRole("img", { name: "Preview of Darbot fixture window" })).toBeTruthy();
+  expect(calls.some((call) => call.command === "chat_content_send")).toBe(
+    false,
+  );
+  expect(
+    view.getByRole("img", { name: "Preview of Darbot fixture window" }),
+  ).toBeTruthy();
 });
 
 test("closing the native window clears previews and revokes pending content results", async () => {
@@ -599,26 +847,43 @@ test("closing the native window clears previews and revokes pending content resu
   const view = await workspace();
   await addFixtureImage(view, true);
   await act(async () => emit("chat-content:revoked", null));
-  expect(view.queryByRole("img", { name: "Preview of Darbot fixture window" })).toBeNull();
+  expect(
+    view.queryByRole("img", { name: "Preview of Darbot fixture window" }),
+  ).toBeNull();
   expect(view.queryByRole("button", { name: "Stop sharing" })).toBeNull();
-  expect(view.getByRole("button", { name: "Send" }).hasAttribute("disabled")).toBe(true);
+  expect(
+    view.getByRole("button", { name: "Send" }).hasAttribute("disabled"),
+  ).toBe(true);
   view.unmount();
-  expect(calls.filter((call) => call.command === "chat_content_activate").at(-1)?.args).toEqual({ owner: null });
+  expect(
+    calls.filter((call) => call.command === "chat_content_activate").at(-1)
+      ?.args,
+  ).toEqual({ owner: null });
 });
 
 test("uploaded draft attachments stay isolated across conversations and return only to their owner", async () => {
   contentFixture();
   const view = await workspace();
   await userEvent.type(draftInput(view), "First private draft");
-  fireEvent.click(view.getByRole("button", { name: "Add attachments or context" }));
-  await act(async () => fireEvent.click(view.getByRole("button", { name: "Upload" })));
+  fireEvent.click(
+    view.getByRole("button", { name: "Add attachments or context" }),
+  );
+  await act(async () =>
+    fireEvent.click(view.getByRole("button", { name: "Upload" })),
+  );
   await view.findByRole("img", { name: "Preview of Darbot fixture window" });
   const firstId = saved().activeConversationId;
-  await act(async () => fireEvent.click(view.getByRole("button", { name: "New chat" })));
+  await act(async () =>
+    fireEvent.click(view.getByRole("button", { name: "New chat" })),
+  );
   expect(saved().activeConversationId).not.toBe(firstId);
-  expect(view.queryByRole("img", { name: "Preview of Darbot fixture window" })).toBeNull();
+  expect(
+    view.queryByRole("img", { name: "Preview of Darbot fixture window" }),
+  ).toBeNull();
   expect(draftInput(view).value).toBe("");
-  const chats = view.getAllByRole("button", { name: "Draft: New conversation" });
+  const chats = view.getAllByRole("button", {
+    name: "Draft: New conversation",
+  });
   await act(async () => fireEvent.click(chats[1]));
   await view.findByRole("img", { name: "Preview of Darbot fixture window" });
   expect(saved().activeConversationId).toBe(firstId);
@@ -628,123 +893,239 @@ test("uploaded draft attachments stay isolated across conversations and return o
 test("late native file selection cannot place an attachment in a different conversation", async () => {
   const native = contentFixture();
   const selection = deferred<ContentSnapshot>();
-  invokeHandler = (command, args) => command === "chat_content_pick" ? selection.promise : native(command, args);
+  invokeHandler = (command, args) =>
+    command === "chat_content_pick" ? selection.promise : native(command, args);
   const view = await workspace();
   await userEvent.type(draftInput(view), "Original draft");
-  fireEvent.click(view.getByRole("button", { name: "Add attachments or context" }));
-  await act(async () => fireEvent.click(view.getByRole("button", { name: "Upload" })));
-  await act(async () => fireEvent.click(view.getByRole("button", { name: "New chat" })));
-  await act(async () => selection.resolve({ attachments: [imageAttachment()], leaseId: null }));
+  fireEvent.click(
+    view.getByRole("button", { name: "Add attachments or context" }),
+  );
+  await act(async () =>
+    fireEvent.click(view.getByRole("button", { name: "Upload" })),
+  );
+  await act(async () =>
+    fireEvent.click(view.getByRole("button", { name: "New chat" })),
+  );
+  await act(async () =>
+    selection.resolve({ attachments: [imageAttachment()], leaseId: null }),
+  );
   expect(draftInput(view).value).toBe("");
-  expect(view.queryByRole("img", { name: "Preview of Darbot fixture window" })).toBeNull();
-  expect(view.getByRole("button", { name: "Send" }).hasAttribute("disabled")).toBe(true);
+  expect(
+    view.queryByRole("img", { name: "Preview of Darbot fixture window" }),
+  ).toBeNull();
+  expect(
+    view.getByRole("button", { name: "Send" }).hasAttribute("disabled"),
+  ).toBe(true);
 });
 
 test("shared preview freezes before slow session startup and remains in the failed draft", async () => {
   const native = contentFixture();
   const opening = deferred<CopilotSession>();
-  invokeHandler = (command, args) => command === "copilot_session_new" ? opening.promise : native(command, args);
+  invokeHandler = (command, args) =>
+    command === "copilot_session_new" ? opening.promise : native(command, args);
   const view = await workspace();
   await addFixtureImage(view, true);
-  await act(async () => fireEvent.click(view.getByRole("button", { name: "Send" })));
-  const freeze = calls.findIndex((call) => call.command === "chat_capture_stop");
-  const open = calls.findIndex((call) => call.command === "copilot_session_new");
+  await act(async () =>
+    fireEvent.click(view.getByRole("button", { name: "Send" })),
+  );
+  const freeze = calls.findIndex(
+    (call) => call.command === "chat_capture_stop",
+  );
+  const open = calls.findIndex(
+    (call) => call.command === "copilot_session_new",
+  );
   expect(freeze).toBeGreaterThan(-1);
   expect(open).toBeGreaterThan(freeze);
   expect(view.queryByRole("button", { name: "Stop sharing" })).toBeNull();
-  await act(async () => opening.reject({ said: "Fixture session could not open" }));
+  await act(async () =>
+    opening.reject({ said: "Fixture session could not open" }),
+  );
   await view.findByText("Fixture session could not open");
-  expect(view.getByRole("img", { name: "Preview of Darbot fixture window" })).toBeTruthy();
-  expect(calls.some((call) => call.command === "chat_content_send")).toBe(false);
+  expect(
+    view.getByRole("img", { name: "Preview of Darbot fixture window" }),
+  ).toBeTruthy();
+  expect(calls.some((call) => call.command === "chat_content_send")).toBe(
+    false,
+  );
 });
 
 test("leaving the visible conversation revokes shared screen previews", async () => {
   contentFixture();
   const view = await workspace();
   await addFixtureImage(view, true);
-  await act(async () => fireEvent.click(view.getByRole("tab", { name: "Your canvas" })));
-  expect(calls.filter((call) => call.command === "chat_content_activate").at(-1)?.args).toEqual({ owner: null });
-  await act(async () => fireEvent.click(view.getByRole("tab", { name: "Your workspace" })));
-  expect(view.queryByRole("img", { name: "Preview of Darbot fixture window" })).toBeNull();
+  await act(async () =>
+    fireEvent.click(view.getByRole("tab", { name: "Your canvas" })),
+  );
+  expect(
+    calls.filter((call) => call.command === "chat_content_activate").at(-1)
+      ?.args,
+  ).toEqual({ owner: null });
+  await act(async () =>
+    fireEvent.click(view.getByRole("tab", { name: "Your workspace" })),
+  );
+  expect(
+    view.queryByRole("img", { name: "Preview of Darbot fixture window" }),
+  ).toBeNull();
   expect(view.queryByRole("button", { name: "Stop sharing" })).toBeNull();
 });
 
-async function beginControl(operation: ControlAction, expected: ControlIdentity | null = null, lifetime = 5000) {
+async function beginControl(
+  operation: ControlAction,
+  expected: ControlIdentity | null = null,
+  lifetime = 5000,
+) {
   const ticket = crypto.randomUUID();
   const envelope: ControlEnvelope = {
-    ticket, expiresAt: Date.now() + lifetime,
+    ticket,
+    expiresAt: Date.now() + lifetime,
     request: { requestId: ticket, operation, expected },
   };
-  await act(async () => { emit("app-control:request", envelope); });
+  await act(async () => {
+    emit("app-control:request", envelope);
+  });
   return ticket;
 }
 
 async function controlAck(ticket: string) {
-  await waitFor(() => expect(calls.some((call) =>
-    call.command === "app_control_ack" && argument(call.args, "ticket") === ticket)).toBe(true));
-  const args = calls.find((call) => call.command === "app_control_ack" && argument(call.args, "ticket") === ticket)?.args;
-  if (!args || typeof args !== "object" || !("value" in args) || !("failure" in args) ||
-      (args.failure !== null && typeof args.failure !== "string")) throw new Error("Missing control acknowledgment");
+  await waitFor(() =>
+    expect(
+      calls.some(
+        (call) =>
+          call.command === "app_control_ack" &&
+          argument(call.args, "ticket") === ticket,
+      ),
+    ).toBe(true),
+  );
+  const args = calls.find(
+    (call) =>
+      call.command === "app_control_ack" &&
+      argument(call.args, "ticket") === ticket,
+  )?.args;
+  if (
+    !args ||
+    typeof args !== "object" ||
+    !("value" in args) ||
+    !("failure" in args) ||
+    (args.failure !== null && typeof args.failure !== "string")
+  )
+    throw new Error("Missing control acknowledgment");
   return { value: args.value, failure: args.failure };
 }
 
 async function controlSnapshot(): Promise<ControlIdentity> {
   const ack = await controlAck(await beginControl({ action: "snapshot" }));
   expect(ack.failure).toBeNull();
-  if (!ack.value || typeof ack.value !== "object" || !("state" in ack.value)) throw new Error("Missing snapshot");
+  if (!ack.value || typeof ack.value !== "object" || !("state" in ack.value))
+    throw new Error("Missing snapshot");
   const state = ack.value.state;
-  const nullableString = (value: unknown): value is string | null => value === null || typeof value === "string";
-  if (!state || typeof state !== "object" ||
-      !("instanceId" in state) || typeof state.instanceId !== "string" ||
-      !("revision" in state) || typeof state.revision !== "number" ||
-      !("sessionId" in state) || !nullableString(state.sessionId) ||
-      !("conversationId" in state) || !nullableString(state.conversationId) ||
-      !("activeTurnId" in state) || !nullableString(state.activeTurnId)) throw new Error("Invalid snapshot identity");
+  const nullableString = (value: unknown): value is string | null =>
+    value === null || typeof value === "string";
+  if (
+    !state ||
+    typeof state !== "object" ||
+    !("instanceId" in state) ||
+    typeof state.instanceId !== "string" ||
+    !("revision" in state) ||
+    typeof state.revision !== "number" ||
+    !("sessionId" in state) ||
+    !nullableString(state.sessionId) ||
+    !("conversationId" in state) ||
+    !nullableString(state.conversationId) ||
+    !("activeTurnId" in state) ||
+    !nullableString(state.activeTurnId)
+  )
+    throw new Error("Invalid snapshot identity");
   return {
-    instanceId: state.instanceId, revision: state.revision, sessionId: state.sessionId,
-    conversationId: state.conversationId, activeTurnId: state.activeTurnId,
+    instanceId: state.instanceId,
+    revision: state.revision,
+    sessionId: state.sessionId,
+    conversationId: state.conversationId,
+    activeTurnId: state.activeTurnId,
   };
 }
 
-test.each(["expired", "disconnected"])("app-control closes a successful late load after the request is %s and can reopen", async (reason) => {
-  const chat = { ...createConversationDraft("C:\\workspace", "architect", "Architect"), sessionId: "late-load", title: "Late load" };
-  writeConversationWorkspace({ ...emptyConversationWorkspace(), chats: [chat] });
-  const load = deferred<CopilotSession>();
-  let registered = false;
-  let loadCount = 0;
-  invokeHandler = async (command, args) => {
-    if (command === "copilot_session_load") {
-      if (registered) throw new Error("Session is already active");
-      registered = true;
-      if (++loadCount === 1) return load.promise;
-    }
-    if (command === "copilot_session_close") {
-      expect(args).toEqual({ sessionId: "late-load", agent: "architect" });
-      registered = false;
-    }
-    return standardInvoke(command, args);
-  };
-  const view = await workspace();
-  const ticket = await beginControl({ action: "workspace_open_chat", conversationId: chat.conversationId }, await controlSnapshot(), 250);
-  await waitFor(() => expect(loadCount).toBe(1));
-  if (reason === "expired") await act(async () => { await new Promise((resolve) => setTimeout(resolve, 300)); });
-  else await act(async () => { emit("app-control:cancel", ticket); });
-  await act(async () => { load.resolve(session("late-load", "architect")); });
-  await view.findByText("App-control request expired or disconnected");
-  expect(registered).toBe(false);
-  expect((await controlSnapshot()).sessionId).toBeNull();
-  expect(calls.some((call) => call.command === "app_control_ack" && argument(call.args, "ticket") === ticket)).toBe(false);
-  fireEvent.click(view.getByRole("button", { name: "Retry opening conversation" }));
-  await waitFor(() => expect(loadCount).toBe(2));
-  await waitFor(() => expect(view.queryByText("App-control request expired or disconnected")).toBeNull());
-  expect((await controlSnapshot()).sessionId).toBe("late-load");
-  expect(registered).toBe(true);
-  expect(calls.filter((call) => call.command === "copilot_session_prompt")).toHaveLength(0);
-});
+test.each(["expired", "disconnected"])(
+  "app-control closes a successful late load after the request is %s and can reopen",
+  async (reason) => {
+    const chat = {
+      ...createConversationDraft("C:\\workspace", "architect", "Architect"),
+      sessionId: "late-load",
+      title: "Late load",
+    };
+    writeConversationWorkspace({
+      ...emptyConversationWorkspace(),
+      chats: [chat],
+    });
+    const load = deferred<CopilotSession>();
+    let registered = false;
+    let loadCount = 0;
+    invokeHandler = async (command, args) => {
+      if (command === "copilot_session_load") {
+        if (registered) throw new Error("Session is already active");
+        registered = true;
+        if (++loadCount === 1) return load.promise;
+      }
+      if (command === "copilot_session_close") {
+        expect(args).toEqual({ sessionId: "late-load", agent: "architect" });
+        registered = false;
+      }
+      return standardInvoke(command, args);
+    };
+    const view = await workspace();
+    const ticket = await beginControl(
+      { action: "workspace_open_chat", conversationId: chat.conversationId },
+      await controlSnapshot(),
+      250,
+    );
+    await waitFor(() => expect(loadCount).toBe(1));
+    if (reason === "expired")
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      });
+    else
+      await act(async () => {
+        emit("app-control:cancel", ticket);
+      });
+    await act(async () => {
+      load.resolve(session("late-load", "architect"));
+    });
+    await view.findByText("App-control request expired or disconnected");
+    expect(registered).toBe(false);
+    expect((await controlSnapshot()).sessionId).toBeNull();
+    expect(
+      calls.some(
+        (call) =>
+          call.command === "app_control_ack" &&
+          argument(call.args, "ticket") === ticket,
+      ),
+    ).toBe(false);
+    fireEvent.click(
+      view.getByRole("button", { name: "Retry opening conversation" }),
+    );
+    await waitFor(() => expect(loadCount).toBe(2));
+    await waitFor(() =>
+      expect(
+        view.queryByText("App-control request expired or disconnected"),
+      ).toBeNull(),
+    );
+    expect((await controlSnapshot()).sessionId).toBe("late-load");
+    expect(registered).toBe(true);
+    expect(
+      calls.filter((call) => call.command === "copilot_session_prompt"),
+    ).toHaveLength(0);
+  },
+);
 
 test("app-control retains the exact late-load owner and surfaces failed cleanup before retrying it", async () => {
-  const chat = { ...createConversationDraft("C:\\workspace", "architect", "Architect"), sessionId: "retained-load", title: "Retained load" };
-  writeConversationWorkspace({ ...emptyConversationWorkspace(), chats: [chat] });
+  const chat = {
+    ...createConversationDraft("C:\\workspace", "architect", "Architect"),
+    sessionId: "retained-load",
+    title: "Retained load",
+  };
+  writeConversationWorkspace({
+    ...emptyConversationWorkspace(),
+    chats: [chat],
+  });
   const load = deferred<CopilotSession>();
   let registered = false;
   let loadCount = 0;
@@ -763,101 +1144,191 @@ test("app-control retains the exact late-load owner and surfaces failed cleanup 
     return standardInvoke(command, args);
   };
   const view = await workspace();
-  const ticket = await beginControl({ action: "workspace_open_chat", conversationId: chat.conversationId }, await controlSnapshot());
+  const ticket = await beginControl(
+    { action: "workspace_open_chat", conversationId: chat.conversationId },
+    await controlSnapshot(),
+  );
   await waitFor(() => expect(loadCount).toBe(1));
   await act(async () => {
     emit("app-control:cancel", ticket);
     load.resolve(session("retained-load", "architect"));
   });
-  await view.findByText(/The interrupted load could not be closed.*Native close refused/);
+  await view.findByText(
+    /The interrupted load could not be closed.*Native close refused/,
+  );
   expect(registered).toBe(true);
   expect((await controlSnapshot()).sessionId).toBeNull();
-  fireEvent.click(view.getByRole("button", { name: "Retry opening conversation" }));
+  fireEvent.click(
+    view.getByRole("button", { name: "Retry opening conversation" }),
+  );
   await waitFor(() => expect(loadCount).toBe(2));
   expect(closeCount).toBe(2);
   expect((await controlSnapshot()).sessionId).toBe("retained-load");
-  expect(calls.filter((call) => call.command === "copilot_session_prompt")).toHaveLength(0);
+  expect(
+    calls.filter((call) => call.command === "copilot_session_prompt"),
+  ).toHaveLength(0);
 });
 
 test("mounted human and API turns keep a stable cancel target across streaming, but replacement turns reject old approval", async () => {
   let pending = deferred<{ stopReason: string }>();
-  invokeHandler = (command, args) => command === "copilot_session_prompt"
-    ? pending.promise : standardInvoke(command, args);
+  invokeHandler = (command, args) =>
+    command === "copilot_session_prompt"
+      ? pending.promise
+      : standardInvoke(command, args);
   const view = await workspace();
   await userEvent.type(draftInput(view), "Human turn");
   fireEvent.click(view.getByRole("button", { name: "Send" }));
-  await waitFor(() => expect(calls.filter((call) => call.command === "copilot_session_prompt")).toHaveLength(1));
+  await waitFor(() =>
+    expect(
+      calls.filter((call) => call.command === "copilot_session_prompt"),
+    ).toHaveLength(1),
+  );
   const first = await controlSnapshot();
   expect(first.activeTurnId).toBeTruthy();
   await act(async () => {
-    emit("copilot:session-update", { sessionId: first.sessionId,
-      update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Streaming during owner review" } } });
+    emit("copilot:session-update", {
+      sessionId: first.sessionId,
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: "Streaming during owner review" },
+      },
+    });
   });
   await view.findByText("Streaming during owner review");
   const streaming = await controlSnapshot();
   expect(streaming.revision).toBeGreaterThan(first.revision);
   expect(streaming.activeTurnId).toBe(first.activeTurnId);
-  expect((await controlAck(await beginControl({ action: "workspace_cancel_prompt" }, first))).failure).toBeNull();
-  expect(calls.filter((call) => call.command === "copilot_session_cancel")).toHaveLength(1);
-  await act(async () => { pending.resolve({ stopReason: "end_turn" }); });
+  expect(
+    (
+      await controlAck(
+        await beginControl({ action: "workspace_cancel_prompt" }, first),
+      )
+    ).failure,
+  ).toBeNull();
+  expect(
+    calls.filter((call) => call.command === "copilot_session_cancel"),
+  ).toHaveLength(1);
+  await act(async () => {
+    pending.resolve({ stopReason: "end_turn" });
+  });
   expect((await controlSnapshot()).activeTurnId).toBeNull();
 
   pending = deferred<{ stopReason: string }>();
   await userEvent.type(draftInput(view), "API replacement");
-  const send = await beginControl({ action: "workspace_send_prompt", text: "API replacement", agentId: "" }, await controlSnapshot());
-  await waitFor(() => expect(calls.filter((call) => call.command === "copilot_session_prompt")).toHaveLength(2));
+  const send = await beginControl(
+    { action: "workspace_send_prompt", text: "API replacement", agentId: "" },
+    await controlSnapshot(),
+  );
+  await waitFor(() =>
+    expect(
+      calls.filter((call) => call.command === "copilot_session_prompt"),
+    ).toHaveLength(2),
+  );
   const second = await controlSnapshot();
   expect(second.activeTurnId).toBeTruthy();
   expect(second.activeTurnId).not.toBe(first.activeTurnId);
   expect(second.sessionId).toBe(first.sessionId);
   expect(second.conversationId).toBe(first.conversationId);
-  expect((await controlAck(await beginControl({ action: "workspace_cancel_prompt" }, first))).failure).toContain("Stale target");
-  expect(calls.filter((call) => call.command === "copilot_session_cancel")).toHaveLength(1);
+  expect(
+    (
+      await controlAck(
+        await beginControl({ action: "workspace_cancel_prompt" }, first),
+      )
+    ).failure,
+  ).toContain("Stale target");
+  expect(
+    calls.filter((call) => call.command === "copilot_session_cancel"),
+  ).toHaveLength(1);
   await act(async () => {
-    emit("copilot:session-update", { sessionId: second.sessionId,
-      update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: " API streaming" } } });
+    emit("copilot:session-update", {
+      sessionId: second.sessionId,
+      update: {
+        sessionUpdate: "agent_message_chunk",
+        content: { type: "text", text: " API streaming" },
+      },
+    });
   });
   const continued = await controlSnapshot();
   expect(continued.revision).toBeGreaterThan(second.revision);
   expect(continued.activeTurnId).toBe(second.activeTurnId);
-  expect((await controlAck(await beginControl({ action: "workspace_cancel_prompt" }, second))).failure).toBeNull();
-  expect(calls.filter((call) => call.command === "copilot_session_cancel")).toHaveLength(2);
-  await act(async () => { pending.resolve({ stopReason: "end_turn" }); });
+  expect(
+    (
+      await controlAck(
+        await beginControl({ action: "workspace_cancel_prompt" }, second),
+      )
+    ).failure,
+  ).toBeNull();
+  expect(
+    calls.filter((call) => call.command === "copilot_session_cancel"),
+  ).toHaveLength(2);
+  await act(async () => {
+    pending.resolve({ stopReason: "end_turn" });
+  });
   expect((await controlAck(send)).failure).toBeNull();
   expect((await controlSnapshot()).activeTurnId).toBeNull();
 });
 
-test.each(["expired", "disconnected"])("mounted cancellation approved near its deadline stays inactive when %s during claim", async (reason) => {
-  const pending = deferred<{ stopReason: string }>();
-  const claim = deferred<null>();
-  let holdClaim = false;
-  invokeHandler = (command, args) => {
-    if (command === "copilot_session_prompt") return pending.promise;
-    if (command === "app_control_claim" && holdClaim) return claim.promise;
-    return standardInvoke(command, args);
-  };
-  const view = await workspace();
-  await userEvent.type(draftInput(view), "Still running");
-  fireEvent.click(view.getByRole("button", { name: "Send" }));
-  await waitFor(() => expect(calls.some((call) => call.command === "copilot_session_prompt")).toBe(true));
-  const current = await controlSnapshot();
-  holdClaim = true;
-  const ticket = await beginControl({ action: "workspace_cancel_prompt" }, current, 250);
-  if (reason === "expired") await act(async () => { await new Promise((resolve) => setTimeout(resolve, 300)); });
-  else await act(async () => { emit("app-control:cancel", ticket); });
-  await act(async () => { claim.resolve(null); });
-  holdClaim = false;
-  expect(calls.filter((call) => call.command === "copilot_session_cancel")).toHaveLength(0);
-  expect((await controlSnapshot()).activeTurnId).toBe(current.activeTurnId);
-  expect(calls.some((call) => call.command === "app_control_ack" && argument(call.args, "ticket") === ticket)).toBe(false);
-  await act(async () => { pending.resolve({ stopReason: "end_turn" }); });
-});
+test.each(["expired", "disconnected"])(
+  "mounted cancellation approved near its deadline stays inactive when %s during claim",
+  async (reason) => {
+    const pending = deferred<{ stopReason: string }>();
+    const claim = deferred<null>();
+    let holdClaim = false;
+    invokeHandler = (command, args) => {
+      if (command === "copilot_session_prompt") return pending.promise;
+      if (command === "app_control_claim" && holdClaim) return claim.promise;
+      return standardInvoke(command, args);
+    };
+    const view = await workspace();
+    await userEvent.type(draftInput(view), "Still running");
+    fireEvent.click(view.getByRole("button", { name: "Send" }));
+    await waitFor(() =>
+      expect(
+        calls.some((call) => call.command === "copilot_session_prompt"),
+      ).toBe(true),
+    );
+    const current = await controlSnapshot();
+    holdClaim = true;
+    const ticket = await beginControl(
+      { action: "workspace_cancel_prompt" },
+      current,
+      250,
+    );
+    if (reason === "expired")
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      });
+    else
+      await act(async () => {
+        emit("app-control:cancel", ticket);
+      });
+    await act(async () => {
+      claim.resolve(null);
+    });
+    holdClaim = false;
+    expect(
+      calls.filter((call) => call.command === "copilot_session_cancel"),
+    ).toHaveLength(0);
+    expect((await controlSnapshot()).activeTurnId).toBe(current.activeTurnId);
+    expect(
+      calls.some(
+        (call) =>
+          call.command === "app_control_ack" &&
+          argument(call.args, "ticket") === ticket,
+      ),
+    ).toBe(false);
+    await act(async () => {
+      pending.resolve({ stopReason: "end_turn" });
+    });
+  },
+);
 
 test("mounted active-turn identity is absent after startup failure, prompt failure and runtime reset", async () => {
   let failStartup = true;
   const pending = deferred<{ stopReason: string }>();
   invokeHandler = async (command, args) => {
-    if (command === "copilot_session_new" && failStartup) throw { said: "Startup refused" };
+    if (command === "copilot_session_new" && failStartup)
+      throw { said: "Startup refused" };
     if (command === "copilot_session_prompt") return pending.promise;
     return standardInvoke(command, args);
   };
@@ -868,25 +1339,50 @@ test("mounted active-turn identity is absent after startup failure, prompt failu
   expect((await controlSnapshot()).activeTurnId).toBeNull();
   failStartup = false;
   fireEvent.click(view.getByRole("button", { name: "Send" }));
-  await waitFor(() => expect(calls.some((call) => call.command === "copilot_session_prompt")).toBe(true));
+  await waitFor(() =>
+    expect(
+      calls.some((call) => call.command === "copilot_session_prompt"),
+    ).toBe(true),
+  );
   expect((await controlSnapshot()).activeTurnId).toBeTruthy();
-  await act(async () => { pending.reject({ said: "Prompt refused" }); });
+  await act(async () => {
+    pending.reject({ said: "Prompt refused" });
+  });
   await view.findByText("Prompt refused");
   expect((await controlSnapshot()).activeTurnId).toBeNull();
 
   const reset = deferred<{ stopReason: string }>();
-  invokeHandler = (command, args) => command === "copilot_session_prompt" ? reset.promise : standardInvoke(command, args);
+  invokeHandler = (command, args) =>
+    command === "copilot_session_prompt"
+      ? reset.promise
+      : standardInvoke(command, args);
   fireEvent.click(view.getByRole("button", { name: "Send" }));
-  await waitFor(() => expect(calls.filter((call) => call.command === "copilot_session_prompt")).toHaveLength(2));
+  await waitFor(() =>
+    expect(
+      calls.filter((call) => call.command === "copilot_session_prompt"),
+    ).toHaveLength(2),
+  );
   const running = await controlSnapshot();
   expect(running.activeTurnId).toBeTruthy();
-  await act(async () => { emit("copilot:runtime-error", { said: "Runtime reset" }); });
+  await act(async () => {
+    emit("copilot:runtime-error", { said: "Runtime reset" });
+  });
   const after = await controlSnapshot();
   expect(after.activeTurnId).toBeNull();
   expect(after.sessionId).toBeNull();
-  expect((await controlAck(await beginControl({ action: "workspace_cancel_prompt" }, running))).failure).toContain("Stale target");
-  expect(calls.filter((call) => call.command === "copilot_session_cancel")).toHaveLength(0);
-  await act(async () => { reset.reject({ said: "Runtime reset" }); });
+  expect(
+    (
+      await controlAck(
+        await beginControl({ action: "workspace_cancel_prompt" }, running),
+      )
+    ).failure,
+  ).toContain("Stale target");
+  expect(
+    calls.filter((call) => call.command === "copilot_session_cancel"),
+  ).toHaveLength(0);
+  await act(async () => {
+    reset.reject({ said: "Runtime reset" });
+  });
 });
 
 test("API prompt failure clears its turn identity and an expired send cannot start a turn", async () => {
@@ -903,25 +1399,59 @@ test("API prompt failure clears its turn identity and an expired send cannot sta
     return standardInvoke(command, args);
   };
   await userEvent.type(draftInput(view), "API retry");
-  const send = await beginControl({ action: "workspace_send_prompt", text: "API retry", agentId: "" }, await controlSnapshot());
-  await waitFor(() => expect(calls.filter((call) => call.command === "copilot_session_prompt")).toHaveLength(2));
+  const send = await beginControl(
+    { action: "workspace_send_prompt", text: "API retry", agentId: "" },
+    await controlSnapshot(),
+  );
+  await waitFor(() =>
+    expect(
+      calls.filter((call) => call.command === "copilot_session_prompt"),
+    ).toHaveLength(2),
+  );
   const active = await controlSnapshot();
   expect(active.activeTurnId).toBeTruthy();
-  await act(async () => { pending.reject({ said: "API prompt refused" }); });
-  expect((await controlAck(send)).failure).toContain("did not complete successfully");
+  await act(async () => {
+    pending.reject({ said: "API prompt refused" });
+  });
+  expect((await controlAck(send)).failure).toContain(
+    "did not complete successfully",
+  );
   await view.findByText("API prompt refused");
   const inactive = await controlSnapshot();
   expect(inactive.activeTurnId).toBeNull();
   expect(draftInput(view).value).toBe("API retry");
-  expect((await controlAck(await beginControl({ action: "workspace_cancel_prompt" }, active))).failure).toContain("Stale target");
+  expect(
+    (
+      await controlAck(
+        await beginControl({ action: "workspace_cancel_prompt" }, active),
+      )
+    ).failure,
+  ).toContain("Stale target");
   holdClaim = true;
-  const expired = await beginControl({ action: "workspace_send_prompt", text: "API retry", agentId: "" }, inactive, 250);
-  await act(async () => { await new Promise((resolve) => setTimeout(resolve, 300)); claim.resolve(null); });
+  const expired = await beginControl(
+    { action: "workspace_send_prompt", text: "API retry", agentId: "" },
+    inactive,
+    250,
+  );
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    claim.resolve(null);
+  });
   holdClaim = false;
   expect((await controlSnapshot()).activeTurnId).toBeNull();
-  expect(calls.filter((call) => call.command === "copilot_session_prompt")).toHaveLength(2);
-  expect(calls.filter((call) => call.command === "copilot_session_cancel")).toHaveLength(0);
-  expect(calls.some((call) => call.command === "app_control_ack" && argument(call.args, "ticket") === expired)).toBe(false);
+  expect(
+    calls.filter((call) => call.command === "copilot_session_prompt"),
+  ).toHaveLength(2);
+  expect(
+    calls.filter((call) => call.command === "copilot_session_cancel"),
+  ).toHaveLength(0);
+  expect(
+    calls.some(
+      (call) =>
+        call.command === "app_control_ack" &&
+        argument(call.args, "ticket") === expired,
+    ),
+  ).toBe(false);
 });
 
 test("a native cancellation still in flight prevents a replacement turn from starting", async () => {
@@ -935,69 +1465,136 @@ test("a native cancellation still in flight prevents a replacement turn from sta
   const view = await workspace();
   await userEvent.type(draftInput(view), "First turn");
   fireEvent.click(view.getByRole("button", { name: "Send" }));
-  await waitFor(() => expect(calls.some((call) => call.command === "copilot_session_prompt")).toBe(true));
-  const ticket = await beginControl({ action: "workspace_cancel_prompt" }, await controlSnapshot());
-  await waitFor(() => expect(calls.some((call) => call.command === "copilot_session_cancel")).toBe(true));
-  await act(async () => { pending.resolve({ stopReason: "end_turn" }); });
+  await waitFor(() =>
+    expect(
+      calls.some((call) => call.command === "copilot_session_prompt"),
+    ).toBe(true),
+  );
+  const ticket = await beginControl(
+    { action: "workspace_cancel_prompt" },
+    await controlSnapshot(),
+  );
+  await waitFor(() =>
+    expect(
+      calls.some((call) => call.command === "copilot_session_cancel"),
+    ).toBe(true),
+  );
+  await act(async () => {
+    pending.resolve({ stopReason: "end_turn" });
+  });
   expect((await controlSnapshot()).activeTurnId).toBeNull();
   await userEvent.type(draftInput(view), "Replacement");
   fireEvent.click(view.getByRole("button", { name: "Send" }));
   await act(async () => {});
-  expect(calls.filter((call) => call.command === "copilot_session_prompt")).toHaveLength(1);
+  expect(
+    calls.filter((call) => call.command === "copilot_session_prompt"),
+  ).toHaveLength(1);
   expect(draftInput(view).value).toBe("Replacement");
-  await act(async () => { cancel.resolve(null); });
+  await act(async () => {
+    cancel.resolve(null);
+  });
   expect((await controlAck(ticket)).failure).toBeNull();
   fireEvent.click(view.getByRole("button", { name: "Send" }));
-  await waitFor(() => expect(calls.filter((call) => call.command === "copilot_session_prompt")).toHaveLength(2));
+  await waitFor(() =>
+    expect(
+      calls.filter((call) => call.command === "copilot_session_prompt"),
+    ).toHaveLength(2),
+  );
 });
 
 test("app-control observes and changes the real mounted UI, persists drafts, and rejects stale targets", async () => {
-    const view = await workspace();
-    await waitFor(() => expect(listeners.get("app-control:request")?.size).toBe(1));
-    let sequence = 0;
-    async function control(operation: ControlAction, state?: ControlState) {
-      const ticket = `owned-native-ticket-${++sequence}`;
-      await act(async () => {
-        emit("app-control:request", {
-          ticket, expiresAt: Date.now() + 5000,
-          request: { requestId: `owned-request-${sequence}`, operation,
-            expected: state ? {
-              instanceId: state.instanceId, revision: state.revision,
-              conversationId: state.conversationId, sessionId: state.sessionId,
-              activeTurnId: state.activeTurnId,
-            } : null,
-          },
-        });
+  const view = await workspace();
+  await waitFor(() =>
+    expect(listeners.get("app-control:request")?.size).toBe(1),
+  );
+  let sequence = 0;
+  async function control(operation: ControlAction, state?: ControlState) {
+    const ticket = `owned-native-ticket-${++sequence}`;
+    await act(async () => {
+      emit("app-control:request", {
+        ticket,
+        expiresAt: Date.now() + 5000,
+        request: {
+          requestId: `owned-request-${sequence}`,
+          operation,
+          expected: state
+            ? {
+                instanceId: state.instanceId,
+                revision: state.revision,
+                conversationId: state.conversationId,
+                sessionId: state.sessionId,
+                activeTurnId: state.activeTurnId,
+              }
+            : null,
+        },
       });
-      await waitFor(() => expect(calls.some((call) =>
-        call.command === "app_control_ack" && argument(call.args, "ticket") === ticket)).toBe(true));
-      const ack = calls.find((call) => call.command === "app_control_ack" && argument(call.args, "ticket") === ticket);
-      return ack!.args as { value: { state: ControlState }; failure: string | null };
-    }
-    const initial = await control({ action: "snapshot" });
-    expect(initial.failure).toBeNull();
-    expect(initial.value.state.surface).toBe("workspace");
-    expect(initial.value.state.window.id).toBe("main");
-    expect(initial.value.state.controls.some((c) => c.action === "workspace_edit_draft")).toBe(true);
+    });
+    await waitFor(() =>
+      expect(
+        calls.some(
+          (call) =>
+            call.command === "app_control_ack" &&
+            argument(call.args, "ticket") === ticket,
+        ),
+      ).toBe(true),
+    );
+    const ack = calls.find(
+      (call) =>
+        call.command === "app_control_ack" &&
+        argument(call.args, "ticket") === ticket,
+    );
+    return ack!.args as {
+      value: { state: ControlState };
+      failure: string | null;
+    };
+  }
+  const initial = await control({ action: "snapshot" });
+  expect(initial.failure).toBeNull();
+  expect(initial.value.state.surface).toBe("workspace");
+  expect(initial.value.state.window.id).toBe("main");
+  expect(
+    initial.value.state.controls.some(
+      (c) => c.action === "workspace_edit_draft",
+    ),
+  ).toBe(true);
 
-    const edited = await control({ action: "workspace_edit_draft", text: "Owned local draft fixture" }, initial.value.state);
-    expect(edited.failure).toBeNull();
-    expect(draftInput(view).value).toBe("Owned local draft fixture");
-    expect(saved().chats[0]?.draft).toBe("Owned local draft fixture");
-    expect(edited.value.state.revision).toBeGreaterThan(initial.value.state.revision);
-    expect(edited.value.state.conversationId).toBeTruthy();
+  const edited = await control(
+    { action: "workspace_edit_draft", text: "Owned local draft fixture" },
+    initial.value.state,
+  );
+  expect(edited.failure).toBeNull();
+  expect(draftInput(view).value).toBe("Owned local draft fixture");
+  expect(saved().chats[0]?.draft).toBe("Owned local draft fixture");
+  expect(edited.value.state.revision).toBeGreaterThan(
+    initial.value.state.revision,
+  );
+  expect(edited.value.state.conversationId).toBeTruthy();
 
-    const stale = await control({ action: "workspace_edit_draft", text: "must not overwrite" }, initial.value.state);
-    expect(stale.failure).toContain("Stale target");
-    expect(draftInput(view).value).toBe("Owned local draft fixture");
+  const stale = await control(
+    { action: "workspace_edit_draft", text: "must not overwrite" },
+    initial.value.state,
+  );
+  expect(stale.failure).toContain("Stale target");
+  expect(draftInput(view).value).toBe("Owned local draft fixture");
 
-    const navigated = await control({ action: "workspace_select_surface", surface: "canvas" }, edited.value.state);
-    expect(navigated.failure).toBeNull();
-    expect(view.getByRole("tab", { name: "Your canvas" }).getAttribute("aria-selected")).toBe("true");
-    expect(navigated.value.state.surface).toBe("canvas");
-    expect(navigated.value.state.captureAllowed).toBe(false);
-    expect(calls.some((call) => call.command === "copilot_session_prompt")).toBe(false);
-    expect(calls.some((call) => call.command === "copilot_permission_respond")).toBe(false);
+  const navigated = await control(
+    { action: "workspace_select_surface", surface: "canvas" },
+    edited.value.state,
+  );
+  expect(navigated.failure).toBeNull();
+  expect(
+    view
+      .getByRole("tab", { name: "Your canvas" })
+      .getAttribute("aria-selected"),
+  ).toBe("true");
+  expect(navigated.value.state.surface).toBe("canvas");
+  expect(navigated.value.state.captureAllowed).toBe(false);
+  expect(calls.some((call) => call.command === "copilot_session_prompt")).toBe(
+    false,
+  );
+  expect(
+    calls.some((call) => call.command === "copilot_permission_respond"),
+  ).toBe(false);
 });
 
 async function clickHarvest(
@@ -1173,7 +1770,14 @@ test("agent browsing keeps the live session and draft; delayed evidence ranks on
     calls
       .filter((c) => c.command === "copilot_session_load")
       .map((c) => c.args),
-  ).toEqual([{ agent: "architect", cwd: second.cwd, sessionId: "newer", conversationId: second.conversationId }]);
+  ).toEqual([
+    {
+      agent: "architect",
+      cwd: second.cwd,
+      sessionId: "newer",
+      conversationId: second.conversationId,
+    },
+  ]);
   expect(
     calls.slice(before).some((c) => c.command === "copilot_session_prompt"),
   ).toBe(false);
@@ -1565,6 +2169,49 @@ test("recorded-agent replay can be retried without resubmitting its draft", asyn
   ).toHaveLength(0);
   expect(saved().chats[0].conversationId).toBe(draft.conversationId);
   expect(saved().chats[0].draft).toBe("Unsent follow-up");
+});
+
+test("missing runtime session is converted into a local draft and can be resent", async () => {
+  const draft = {
+    ...createConversationDraft("C:\\workspace", "architect", "Architect"),
+    sessionId: "missing",
+    title: "Transient opening",
+    draft: "Keep this draft",
+  };
+  writeConversationWorkspace({
+    ...emptyConversationWorkspace(),
+    chats: [draft],
+    activeConversationId: draft.conversationId,
+  });
+  invokeHandler = async (command, args) => {
+    if (command === "copilot_session_load")
+      throw {
+        said: "GitHub Copilot returned a runtime error.",
+        detail:
+          '{"code":-32002,"message":"Resource not found: Session missing not found"}',
+      };
+    return standardInvoke(command, args);
+  };
+  const view = await workspace();
+  fireEvent.click(view.getByRole("button", { name: "Transient opening" }));
+  await view.findByText(
+    "Copilot could not reopen that runtime session. Darbot kept this chat as a local draft; send to start a new session.",
+  );
+  await waitFor(() => expect(saved().chats[0].sessionId).toBeNull());
+  expect(draftInput(view, "Architect").value).toBe("Keep this draft");
+  expect(
+    view.queryByRole("button", { name: "Retry opening conversation" }),
+  ).toBeNull();
+  fireEvent.click(view.getByRole("button", { name: "Send" }));
+  await view.findByText("Unit-test reply");
+  expect(
+    calls.filter((call) => call.command === "copilot_session_load"),
+  ).toHaveLength(1);
+  expect(
+    calls.filter((call) => call.command === "copilot_session_new"),
+  ).toHaveLength(1);
+  expect(saved().chats[0].sessionId).toBe("runtime-1");
+  expect(saved().chats[0].draft).toBe("");
 });
 
 test("all local drafts remain reachable through agent-filtered History", async () => {

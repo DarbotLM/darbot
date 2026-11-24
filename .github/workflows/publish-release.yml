@@ -111,11 +111,22 @@ jobs:
     permissions:
       contents: read
 
+  # Desktop is a separate deployable: a server CI pass cannot prove that an NSIS installer,
+  # DMG, AppImage, deb or rpm still packages and launches. Gate every release on the same
+  # native macOS, Windows and Linux build matrix used by desktop pull requests.
+  desktop:
+    needs: [metadata, verify]
+    if: needs.metadata.outputs.is_release == 'true'
+    uses: ./.github/workflows/desktop.yml
+    secrets: inherit
+    permissions:
+      contents: read
+
   # One image, built once. Everything downstream refers to it by digest, so what was tested is what
   # is deployed and there is no second build to disagree with the first.
   image:
     name: image
-    needs: [metadata, verify, checks]
+    needs: [metadata, verify, checks, desktop]
     if: needs.metadata.outputs.is_release == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -174,7 +185,7 @@ jobs:
   # would be the slower and less reliable option at no saving.
   component-images:
     name: ${{ matrix.image }} ${{ matrix.platform.arch }}
-    needs: [metadata, verify, checks]
+    needs: [metadata, verify, checks, desktop]
     if: needs.metadata.outputs.is_release == 'true'
     runs-on: ${{ matrix.platform.runner }}
     permissions:
@@ -255,7 +266,7 @@ jobs:
   # the manifest list and gets its own architecture without being told which one it is.
   component-manifests:
     name: ${{ matrix.image }} manifest
-    needs: [metadata, verify, checks, component-images]
+    needs: [metadata, verify, checks, desktop, component-images]
     if: needs.metadata.outputs.is_release == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -343,9 +354,44 @@ jobs:
   # The tag and the release, last, so nothing is announced that was not built. The manifest is the
   # useful artefact: it pins the digest, so a deploy or a rollback names an exact image rather than a
   # tag somebody could move.
+  windows-verify:
+    name: verify downloaded Windows signatures
+    needs: [metadata, verify, checks, desktop]
+    if: needs.metadata.outputs.is_release == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: darbot-desktop-windows
+          path: darbot-desktop-windows
+      - name: Verify downloaded executable and installer
+        shell: pwsh
+        run: |
+          $deliverables = Get-ChildItem -Path "darbot-desktop-windows" -Filter "*.exe" -File -Recurse
+          $standalone = $deliverables | Where-Object { $_.Name -eq "darbot-desktop.exe" } | Select-Object -First 1
+          $installer = $deliverables | Where-Object { $_.Name -like "*-setup.exe" } | Select-Object -First 1
+          if (-not $standalone) { throw "Downloaded standalone executable was not found." }
+          if (-not $installer) { throw "Downloaded NSIS installer was not found." }
+          $deliverables = @(
+            $standalone,
+            $installer
+          )
+          $signTool = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Filter signtool.exe -Recurse |
+            Sort-Object FullName -Descending | Select-Object -First 1).FullName
+          if ([string]::IsNullOrWhiteSpace($signTool)) { throw "signtool.exe was not found." }
+          foreach ($deliverable in $deliverables) {
+            if (-not $deliverable.Exists) { throw "Missing downloaded deliverable: $deliverable" }
+            & $signTool verify /pa /all /v $deliverable.FullName
+            if ($LASTEXITCODE -ne 0) { throw "Downloaded signature verification failed: $deliverable" }
+            $signature = Get-AuthenticodeSignature $deliverable.FullName
+            if ($signature.Status -ne "Valid") {
+              throw "Downloaded Authenticode status for $deliverable is $($signature.Status)"
+            }
+          }
+
   github-release:
     name: tag and release
-    needs: [metadata, verify, checks, image, component-manifests]
+    needs: [metadata, verify, checks, desktop, image, component-manifests, windows-verify]
     if: needs.metadata.outputs.is_release == 'true'
     runs-on: ubuntu-latest
     permissions:
@@ -362,6 +408,10 @@ jobs:
           pattern: manifest-*
           path: manifests
           merge-multiple: true
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: darbot-desktop-windows
+          path: darbot-desktop-windows
       - name: Write the image manifest
         env:
           VERSION: ${{ needs.metadata.outputs.version }}
@@ -430,7 +480,11 @@ jobs:
           if gh release view "$VERSION" >/dev/null 2>&1; then
             gh release edit "$VERSION" --title "$VERSION" --notes-file notes.md
             gh release upload "$VERSION" container-images.json --clobber
+            find darbot-desktop-windows -type f \( -name '*.exe' -o -name 'SHA256SUMS.txt' \) -print0 |
+              xargs -0 -r gh release upload "$VERSION" --clobber
           else
             gh release create "$VERSION" container-images.json \
               --title "$VERSION" --notes-file notes.md
+            find darbot-desktop-windows -type f \( -name '*.exe' -o -name 'SHA256SUMS.txt' \) -print0 |
+              xargs -0 -r gh release upload "$VERSION" --clobber
           fi

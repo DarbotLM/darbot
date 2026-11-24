@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+## 0.0.29
+
+- Recover installed desktop conversations whose ACP replay session no longer
+  exists into stable local drafts, preserving identity, agent and unsent text.
+- Gate production releases on native desktop packaging across macOS, Windows and
+  Linux, and include repeatable Authenticode signing and signature verification
+  for Windows executable and installer artifacts.
+- Gate published releases on the native desktop macOS, Windows and Linux packaging
+  workflow, and recognize expired or unauthorized CLI authentication as requiring sign-in.
+- Keep Windows-first production packaging on the existing PowerShell toolbox and
+  publish checksums separately from publisher identity.
+- **Unsigned alpha-build status:** the Windows executable and NSIS installer remain
+  unsigned until an approved Authenticode identity is provisioned. SHA-256 checksums
+  do not replace publisher signatures; production release publication verifies both
+  downloaded Windows deliverables when signing secrets are available.
+
 ## 0.0.28
 
 - Resolve Darbot role icons through the existing canonical identity artwork and

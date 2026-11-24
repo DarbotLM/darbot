@@ -110,7 +110,8 @@ export class TeamsConversationStore implements ConversationStore {
     const state = this.acceptRevision(conversationKey, messageId, revision);
     if (!state) return undefined;
     const isCurrent = () =>
-      this.revisions.get(conversationKey)?.get(messageId)?.token === state.token;
+      this.revisions.get(conversationKey)?.get(messageId)?.token ===
+      state.token;
     this.updateUser(conversationKey, messageId, content);
     return {
       isCurrent,
@@ -171,7 +172,7 @@ export class TeamsConversationStore implements ConversationStore {
       timestamp:
         revision.kind === "deleted"
           ? timestamp
-          : timestamp ?? previous?.timestamp,
+          : (timestamp ?? previous?.timestamp),
       seen: previous?.seen ?? new Set([revision.revisionId]),
     };
     revisions.set(messageId, state);
@@ -196,7 +197,8 @@ export class TeamsConversationStore implements ConversationStore {
     messageId: string,
     revision: TeamsUserRevision,
   ): boolean {
-    if (!this.acceptRevision(conversationKey, messageId, revision)) return false;
+    if (!this.acceptRevision(conversationKey, messageId, revision))
+      return false;
     const history = this.history.get(conversationKey);
     if (history)
       this.history.set(

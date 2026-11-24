@@ -117,8 +117,16 @@ import {
   writeSidepaneDisclosure,
 } from "./sidepane-layers";
 import { DESKTOP_SEMANTIC_MODEL } from "./ui-semantic-model";
-import { redactControlText, useAppControl, type ControlLease } from "./app-control";
-import { CopilotComposer, type ComposerContentHandle, type DarbotAttachment } from "./CopilotComposer";
+import {
+  redactControlText,
+  useAppControl,
+  type ControlLease,
+} from "./app-control";
+import {
+  CopilotComposer,
+  type ComposerContentHandle,
+  type DarbotAttachment,
+} from "./CopilotComposer";
 import { BrandLockup } from "./Welcome";
 import { FleetPanel } from "./FleetPanel";
 import { DesktopUpdates } from "./DesktopUpdates";
@@ -231,6 +239,39 @@ function describeStopReason(reason: string): string {
     default:
       return reason ? `Stopped: ${reason}` : "Ready";
   }
+}
+
+function parseRuntimeRpcError(problem: Problem): {
+  code: number;
+  message: string;
+} | null {
+  if (!problem.detail) return null;
+  try {
+    const parsed = JSON.parse(problem.detail);
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      typeof (parsed as { code?: unknown }).code === "number" &&
+      typeof (parsed as { message?: unknown }).message === "string"
+    ) {
+      return {
+        code: (parsed as { code: number }).code,
+        message: (parsed as { message: string }).message,
+      };
+    }
+  } catch {
+    // Runtime detail can be non-JSON in other failure paths.
+  }
+  return null;
+}
+
+function isMissingRuntimeSession(problem: Problem): boolean {
+  const runtime = parseRuntimeRpcError(problem);
+  if (runtime?.code === -32002) {
+    const text = runtime.message.toLowerCase();
+    return text.includes("session") && text.includes("not found");
+  }
+  return /session .* not found/i.test(problem.said);
 }
 
 function formatRawPayload(value: unknown): string {
@@ -738,11 +779,14 @@ export function CopilotWorkspace({
   const [attachmentProtected, setAttachmentProtected] = useState(false);
   const [attachmentPending, setAttachmentPending] = useState(false);
   const composerContentRef = useRef<ComposerContentHandle>(null);
-  const contentStateChanged = useCallback((count: number, protectedContent: boolean, pending: boolean) => {
-    setAttachmentCount(count);
-    setAttachmentProtected(protectedContent);
-    setAttachmentPending(pending);
-  }, []);
+  const contentStateChanged = useCallback(
+    (count: number, protectedContent: boolean, pending: boolean) => {
+      setAttachmentCount(count);
+      setAttachmentProtected(protectedContent);
+      setAttachmentPending(pending);
+    },
+    [],
+  );
   const [busy, setBusy] = useState(false);
   const [openingSession, setOpeningSession] = useState(false);
   const [eventsReady, setEventsReady] = useState(false);
@@ -817,7 +861,10 @@ export function CopilotWorkspace({
   /** The session whose events currently matter, set before invoking new/load so a load's replay
    * cannot arrive before the listener is ready to recognise it. */
   const sessionIdRef = useRef<string | null>(null);
-  const pendingSessionCloseRef = useRef<{ session: CopilotSession; agentId: string } | null>(null);
+  const pendingSessionCloseRef = useRef<{
+    session: CopilotSession;
+    agentId: string;
+  } | null>(null);
   const [activeTurnId, setActiveTurnId] = useState<string | null>(null);
   const activeTurnRef = useRef<string | null>(null);
   const cancellingRef = useRef(0);
@@ -1139,11 +1186,14 @@ export function CopilotWorkspace({
 
   async function closeSessionSafely(): Promise<boolean> {
     if (cancellingRef.current > 0) {
-      setFailure({ said: "Wait for the current cancellation before switching conversations." });
+      setFailure({
+        said: "Wait for the current cancellation before switching conversations.",
+      });
       return false;
     }
     const current = pendingSessionCloseRef.current?.session ?? session;
-    const currentAgent = pendingSessionCloseRef.current?.agentId ?? sessionAgentId;
+    const currentAgent =
+      pendingSessionCloseRef.current?.agentId ?? sessionAgentId;
     if (current) {
       try {
         await invoke("copilot_session_close", {
@@ -1931,7 +1981,8 @@ export function CopilotWorkspace({
     try {
       const closed = await closeSessionSafely();
       if (!closed) {
-        if (control) throw new Error("The previous session could not be closed");
+        if (control)
+          throw new Error("The previous session could not be closed");
         return null;
       }
       control?.check();
@@ -1963,7 +2014,8 @@ export function CopilotWorkspace({
       });
       loadedSession = next;
       control?.check();
-      if (!mountedRef.current) throw new Error("The conversation view was closed during load");
+      if (!mountedRef.current)
+        throw new Error("The conversation view was closed during load");
       // Verification closes a mismatched native session itself.
       loadedSession = null;
       await verifyOpenedSession(next, chat);
@@ -1999,8 +2051,13 @@ export function CopilotWorkspace({
           });
         } catch (cleanupError) {
           // Keep the exact native owner so the next open/close retries cleanup first.
-          pendingSessionCloseRef.current = { session: loadedSession, agentId: chat.agentId };
-          problem = { said: `The interrupted load could not be closed. Retry opening the conversation to close it first. ${asProblem(cleanupError).said}` };
+          pendingSessionCloseRef.current = {
+            session: loadedSession,
+            agentId: chat.agentId,
+          };
+          problem = {
+            said: `The interrupted load could not be closed. Retry opening the conversation to close it first. ${asProblem(cleanupError).said}`,
+          };
         }
       }
       if (mountedRef.current) {
@@ -2016,11 +2073,25 @@ export function CopilotWorkspace({
         terminalSnapshots.current.clear();
         toolTerminals.current.clear();
         initialTerminalOutputs.current = [];
-        setStatusText("Conversation not opened");
-        setFailure(problem);
-        if (dashboardId !== null) setDashboardProblem(problem);
+        if (chat.sessionId !== null && isMissingRuntimeSession(problem)) {
+          selectConversation({
+            ...chat,
+            sessionId: null,
+          });
+          setStatusText("Draft saved locally");
+          setFailure({
+            said: "Copilot could not reopen that runtime session. Darbot kept this chat as a local draft; send to start a new session.",
+            detail: problem.detail ?? problem.said,
+          });
+          if (dashboardId !== null) setDashboardProblem(null);
+        } else {
+          setStatusText("Conversation not opened");
+          setFailure(problem);
+          if (dashboardId !== null) setDashboardProblem(problem);
+        }
       }
-      if (control) throw new Error("The requested conversation could not be opened");
+      if (control)
+        throw new Error("The requested conversation could not be opened");
       return null;
     } finally {
       if (!sending) operationRef.current = false;
@@ -2033,12 +2104,20 @@ export function CopilotWorkspace({
   }
 
   async function configureSession(configId: string, value: string) {
-    if (!session || busy || operationRef.current || cancellingRef.current > 0) return;
+    if (!session || busy || operationRef.current || cancellingRef.current > 0)
+      return;
     const option = findConfigOption(configOptions, configId);
-    if (!option?.options.some((item) => item.value === value && !isConfigValueDisabled(item))) return;
+    if (
+      !option?.options.some(
+        (item) => item.value === value && !isConfigValueDisabled(item),
+      )
+    )
+      return;
     const targetSessionId = session.sessionId;
     const targetConversationId = conversationIdRef.current;
-    const isCurrent = () => mountedRef.current && sessionIdRef.current === targetSessionId &&
+    const isCurrent = () =>
+      mountedRef.current &&
+      sessionIdRef.current === targetSessionId &&
       conversationIdRef.current === targetConversationId;
     operationRef.current = true;
     setBusy(true);
@@ -2060,21 +2139,41 @@ export function CopilotWorkspace({
 
   /** Negotiate this conversation's real choices without submitting its draft. */
   async function initializeComposerModel() {
-    if (session || !location || busy || operationRef.current || !eventsReady ||
-      !savedWorkspace.ok || dashboardId !== null || attachmentPending ||
-      cancellingRef.current > 0 || localBlock(selectedAgentId)) return;
+    if (
+      session ||
+      !location ||
+      busy ||
+      operationRef.current ||
+      !eventsReady ||
+      !savedWorkspace.ok ||
+      dashboardId !== null ||
+      attachmentPending ||
+      cancellingRef.current > 0 ||
+      localBlock(selectedAgentId)
+    )
+      return;
     operationRef.current = true;
     const chat = activeConversation ?? {
-      ...createConversationDraft(location.cwd, selectedAgentId,
+      ...createConversationDraft(
+        location.cwd,
+        selectedAgentId,
         inventory?.agents.find((agent) => agent.id === selectedAgentId)?.name ??
-          (selectedAgentId || "Copilot CLI")),
+          (selectedAgentId || "Copilot CLI"),
+      ),
       draft: prompt,
     };
     if (!activeConversation) selectConversation(chat);
     try {
-      const next = chat.sessionId ? await loadSession(chat, true) : await startSession(chat);
+      const next = chat.sessionId
+        ? await loadSession(chat, true)
+        : await startSession(chat);
       if (next && mountedRef.current) {
-        const problem = await rememberChat(next, chat.agentId, chat.conversationId, chat.title);
+        const problem = await rememberChat(
+          next,
+          chat.agentId,
+          chat.conversationId,
+          chat.title,
+        );
         if (problem) setFailure(problem);
       }
     } catch (error) {
@@ -2111,7 +2210,8 @@ export function CopilotWorkspace({
 
   async function sendPrompt(control?: ControlLease) {
     control?.check();
-    if (control && attachmentProtected) throw new Error("Attachments must be reviewed and sent locally.");
+    if (control && attachmentProtected)
+      throw new Error("Attachments must be reviewed and sent locally.");
     const text = prompt.trim();
     if (
       (!text && attachmentCount === 0) ||
@@ -2128,7 +2228,10 @@ export function CopilotWorkspace({
       if (control) throw new Error("The composer is not ready to send");
       return;
     }
-    if (control && !session) throw new Error("Open this conversation locally before an app-control send");
+    if (control && !session)
+      throw new Error(
+        "Open this conversation locally before an app-control send",
+      );
     operationRef.current = true;
     const chat = activeConversation ?? {
       ...createConversationDraft(
@@ -2142,7 +2245,7 @@ export function CopilotWorkspace({
     if (!activeConversation) selectConversation(chat);
     let attachments: DarbotAttachment[];
     try {
-      attachments = await composerContentRef.current?.freeze() ?? [];
+      attachments = (await composerContentRef.current?.freeze()) ?? [];
     } catch (error) {
       operationRef.current = false;
       setFailure(asProblem(error));
@@ -2150,7 +2253,9 @@ export function CopilotWorkspace({
     }
     if (!text && attachments.length === 0) {
       operationRef.current = false;
-      setFailure({ said: "The screen snapshot expired or was revoked. Capture it again before sending." });
+      setFailure({
+        said: "The screen snapshot expired or was revoked. Capture it again before sending.",
+      });
       return;
     }
     const activeSession =
@@ -2167,10 +2272,10 @@ export function CopilotWorkspace({
     let memoryProblem: Problem | null;
     try {
       memoryProblem = await rememberChat(
-      activeSession,
-      chat.agentId,
-      chat.conversationId,
-      chat.title,
+        activeSession,
+        chat.agentId,
+        chat.conversationId,
+        chat.title,
       );
       control?.check();
     } catch (error) {
@@ -2188,13 +2293,28 @@ export function CopilotWorkspace({
     setFailure(memoryProblem);
     setMessages((current) => [
       ...current,
-      { id: optimisticId, role: "user", text: text + (attachments.length ? `\n[${attachments.length} reviewed attachment${attachments.length === 1 ? "" : "s"}]` : "") },
+      {
+        id: optimisticId,
+        role: "user",
+        text:
+          text +
+          (attachments.length
+            ? `\n[${attachments.length} reviewed attachment${attachments.length === 1 ? "" : "s"}]`
+            : ""),
+      },
     ]);
     const turnId = crypto.randomUUID();
     const abort = () => {
       if (!control || activeTurnRef.current !== turnId) return;
-      void requestTurnCancellation(activeSession.sessionId, chat.agentId, control.ticket).catch(() => {
-        if (mountedRef.current) setFailure({ said: "The expired app-control send could not be cancelled. Check this conversation." });
+      void requestTurnCancellation(
+        activeSession.sessionId,
+        chat.agentId,
+        control.ticket,
+      ).catch(() => {
+        if (mountedRef.current)
+          setFailure({
+            said: "The expired app-control send could not be cancelled. Check this conversation.",
+          });
       });
     };
     control?.signal.addEventListener("abort", abort, { once: true });
@@ -2204,18 +2324,20 @@ export function CopilotWorkspace({
       setActiveTurnId(turnId);
       const result = attachments.length
         ? await invoke<CopilotPromptResult>("chat_content_send", {
-          owner: { conversationId: chat.conversationId, agentId: chat.agentId },
-          sessionId: activeSession.sessionId,
-          prompt: text,
-          attachmentIds: attachments.map((attachment) => attachment.id),
-        })
+            owner: {
+              conversationId: chat.conversationId,
+              agentId: chat.agentId,
+            },
+            sessionId: activeSession.sessionId,
+            prompt: text,
+            attachmentIds: attachments.map((attachment) => attachment.id),
+          })
         : await invoke<CopilotPromptResult>("copilot_session_prompt", {
-          sessionId: activeSession.sessionId,
-          prompt: text,
-          agent: chat.agentId || null,
-          appControlTicket: control?.ticket ?? null,
-        },
-      );
+            sessionId: activeSession.sessionId,
+            prompt: text,
+            agent: chat.agentId || null,
+            appControlTicket: control?.ticket ?? null,
+          });
       if (mountedRef.current) {
         if (attachments.length) composerContentRef.current?.sent();
         setStatusText(describeStopReason(result.stopReason));
@@ -2235,7 +2357,10 @@ export function CopilotWorkspace({
         );
         setPrompt(text);
       }
-      if (control) throw new Error("The app-control prompt did not complete successfully; inspect the conversation before retrying");
+      if (control)
+        throw new Error(
+          "The app-control prompt did not complete successfully; inspect the conversation before retrying",
+        );
     } finally {
       control?.signal.removeEventListener("abort", abort);
       if (activeTurnRef.current === turnId) {
@@ -2247,11 +2372,19 @@ export function CopilotWorkspace({
     }
   }
 
-  async function requestTurnCancellation(sessionId: string, agentId: string, appControlTicket?: string) {
+  async function requestTurnCancellation(
+    sessionId: string,
+    agentId: string,
+    appControlTicket?: string,
+  ) {
     cancellingRef.current++;
     setCancelling(true);
     try {
-      await invoke("copilot_session_cancel", { sessionId, agent: agentId || null, appControlTicket });
+      await invoke("copilot_session_cancel", {
+        sessionId,
+        agent: agentId || null,
+        appControlTicket,
+      });
     } finally {
       cancellingRef.current--;
       if (mountedRef.current) setCancelling(cancellingRef.current > 0);
@@ -2572,98 +2705,177 @@ export function CopilotWorkspace({
     !sessionsProblem &&
     !sessionsPage.warnings.length &&
     !rowsByAgent.has("__unavailable__");
-  const controlProtected = attachmentProtected || !location || !savedWorkspace.ok || permissions.length > 0 || elicitations.length > 0 ||
-    (openDialog !== null && !["settings", "resources", "conversations"].includes(openDialog));
-  const controlEditable = !controlProtected && !busy && !operationRef.current &&
-    !cancelling && pendingSessionCloseRef.current === null &&
-    dashboardId === null && !!location && savedWorkspace.ok;
+  const controlProtected =
+    attachmentProtected ||
+    !location ||
+    !savedWorkspace.ok ||
+    permissions.length > 0 ||
+    elicitations.length > 0 ||
+    (openDialog !== null &&
+      !["settings", "resources", "conversations"].includes(openDialog));
+  const controlEditable =
+    !controlProtected &&
+    !busy &&
+    !operationRef.current &&
+    !cancelling &&
+    pendingSessionCloseRef.current === null &&
+    dashboardId === null &&
+    !!location &&
+    savedWorkspace.ok;
   const controlAgents = [...(inventory?.agents ?? []), ...createdAgents];
-  const controlRevisionKey = useMemo(() => crypto.randomUUID(), [prompt, messages, attachmentCount, attachmentProtected]);
-  const controlSensitiveText = redactControlText(prompt, prompt.length) !== prompt ||
-    messages.some((message) => redactControlText(message.text, message.text.length) !== message.text);
-  const appControl = useAppControl({
-    window: { id: "main", widget: desktopWindow.widget, front: desktopWindow.front },
-    conversationId: activeConversationId,
-    sessionId: session?.sessionId ?? null,
-    activeTurnId,
-    surface: !savedWorkspace.ok ? "repair" : !location ? "folder" : surface,
-    dialog: controlProtected ? "human-only" : openDialog,
-    agentId: selectedAgentId,
-    dashboardAgentId: dashboardId,
-    busy,
-    protected: controlProtected,
-    // Unknown embedded/canvas/CLI and credential-bearing dialogs are deliberately not captured.
-    captureAllowed: !controlProtected && !controlSensitiveText && surface === "workspace" && openDialog === null && dashboardId === null,
-    composer: {
-      text: redactControlText(prompt, 8000),
-      attachmentCount,
-      attachmentAccess: attachmentProtected ? "local-review-only" : "none",
-      editable: controlEditable,
-      sendable: controlEditable && !!session && eventsReady && !!prompt.trim(),
+  const controlRevisionKey = useMemo(
+    () => crypto.randomUUID(),
+    [prompt, messages, attachmentCount, attachmentProtected],
+  );
+  const controlSensitiveText =
+    redactControlText(prompt, prompt.length) !== prompt ||
+    messages.some(
+      (message) =>
+        redactControlText(message.text, message.text.length) !== message.text,
+    );
+  const appControl = useAppControl(
+    {
+      window: {
+        id: "main",
+        widget: desktopWindow.widget,
+        front: desktopWindow.front,
+      },
+      conversationId: activeConversationId,
+      sessionId: session?.sessionId ?? null,
+      activeTurnId,
+      surface: !savedWorkspace.ok ? "repair" : !location ? "folder" : surface,
+      dialog: controlProtected ? "human-only" : openDialog,
+      agentId: selectedAgentId,
+      dashboardAgentId: dashboardId,
+      busy,
+      protected: controlProtected,
+      // Unknown embedded/canvas/CLI and credential-bearing dialogs are deliberately not captured.
+      captureAllowed:
+        !controlProtected &&
+        !controlSensitiveText &&
+        surface === "workspace" &&
+        openDialog === null &&
+        dashboardId === null,
+      composer: {
+        text: redactControlText(prompt, 8000),
+        attachmentCount,
+        attachmentAccess: attachmentProtected ? "local-review-only" : "none",
+        editable: controlEditable,
+        sendable:
+          controlEditable && !!session && eventsReady && !!prompt.trim(),
+      },
+      transcript: controlProtected
+        ? []
+        : messages
+            .filter((m) => m.role !== "activity")
+            .slice(-16)
+            .map((m) => ({
+              role: m.role,
+              text: redactControlText(m.text, 2000),
+            })),
+      agents: controlAgents.slice(0, 100).map((agent) => ({
+        id: agent.id,
+        name: redactControlText(agent.name, 120),
+      })),
+      conversations: chats.slice(0, 100).map((chat) => ({
+        id: chat.conversationId,
+        agentId: chat.agentId,
+        sessionId: chat.sessionId,
+        title: redactControlText(chat.title, 120),
+      })),
+      config: {
+        theme,
+        autoScroll: autoScrollEnabled,
+        snapScroll: snapScrollEnabled,
+      },
+      sessionConfig: configOptions
+        .filter((option) => option.id === "model" || option.id === "mode")
+        .map((option) => ({
+          id: option.id,
+          value: redactControlText(option.currentValue, 120),
+        })),
+      truncated:
+        prompt.length > 8000 ||
+        messages.length > 16 ||
+        messages.some((message) => message.text.length > 2000) ||
+        controlAgents.length > 100 ||
+        chats.length > 100,
     },
-    transcript: controlProtected ? [] : messages.filter((m) => m.role !== "activity").slice(-16)
-      .map((m) => ({ role: m.role, text: redactControlText(m.text, 2000) })),
-    agents: controlAgents.slice(0, 100).map((agent) => ({ id: agent.id, name: redactControlText(agent.name, 120) })),
-    conversations: chats.slice(0, 100).map((chat) => ({
-      id: chat.conversationId, agentId: chat.agentId, sessionId: chat.sessionId, title: redactControlText(chat.title, 120),
-    })),
-    config: { theme, autoScroll: autoScrollEnabled, snapScroll: snapScrollEnabled },
-    sessionConfig: configOptions.filter((option) => option.id === "model" || option.id === "mode")
-      .map((option) => ({ id: option.id, value: redactControlText(option.currentValue, 120) })),
-    truncated: prompt.length > 8000 || messages.length > 16 || messages.some((message) => message.text.length > 2000) ||
-      controlAgents.length > 100 || chats.length > 100,
-  }, async (action, lease) => {
-    lease.check();
-    switch (action.action) {
-      case "workspace_select_surface":
-        showWorkspace();
-        setSurface(action.surface);
-        setOpenDialog(null);
-        break;
-      case "workspace_open_dialog":
-        showWorkspace();
-        openDialogFrom(action.dialog);
-        break;
-      case "workspace_close_dialog":
-        setOpenDialog(null);
-        break;
-      case "workspace_edit_draft":
-        if (!controlEditable) throw new Error("Composer is not editable");
-        if (action.text.length > MAX_DRAFT_LENGTH) throw new Error("Draft exceeds the composer limit");
-        updateDraft(action.text);
-        break;
-      case "workspace_new_chat":
-        if (busy || operationRef.current || !location || !savedWorkspace.ok ||
-            (action.agentId !== "" && !controlAgents.some((agent) => agent.id === action.agentId)) ||
-            localBlock(action.agentId) || isStudioAgentId(action.agentId)) {
-          throw new Error("Agent is unavailable for a local conversation");
+    async (action, lease) => {
+      lease.check();
+      switch (action.action) {
+        case "workspace_select_surface":
+          showWorkspace();
+          setSurface(action.surface);
+          setOpenDialog(null);
+          break;
+        case "workspace_open_dialog":
+          showWorkspace();
+          openDialogFrom(action.dialog);
+          break;
+        case "workspace_close_dialog":
+          setOpenDialog(null);
+          break;
+        case "workspace_edit_draft":
+          if (!controlEditable) throw new Error("Composer is not editable");
+          if (action.text.length > MAX_DRAFT_LENGTH)
+            throw new Error("Draft exceeds the composer limit");
+          updateDraft(action.text);
+          break;
+        case "workspace_new_chat":
+          if (
+            busy ||
+            operationRef.current ||
+            !location ||
+            !savedWorkspace.ok ||
+            (action.agentId !== "" &&
+              !controlAgents.some((agent) => agent.id === action.agentId)) ||
+            localBlock(action.agentId) ||
+            isStudioAgentId(action.agentId)
+          ) {
+            throw new Error("Agent is unavailable for a local conversation");
+          }
+          showWorkspace();
+          setOpenDialog(null);
+          if (!(await startDraft(action.agentId, lease)))
+            throw new Error("The new conversation was not created");
+          break;
+        case "workspace_open_chat": {
+          const chat = chats.find(
+            (item) => item.conversationId === action.conversationId,
+          );
+          if (!chat || busy || operationRef.current)
+            throw new Error("Conversation is unavailable");
+          const loaded = await loadSession(chat, false, lease);
+          if (chat.sessionId !== null && !loaded)
+            throw new Error("Session did not open");
+          break;
         }
-        showWorkspace();
-        setOpenDialog(null);
-        if (!(await startDraft(action.agentId, lease))) throw new Error("The new conversation was not created");
-        break;
-      case "workspace_open_chat": {
-        const chat = chats.find((item) => item.conversationId === action.conversationId);
-        if (!chat || busy || operationRef.current) throw new Error("Conversation is unavailable");
-        const loaded = await loadSession(chat, false, lease);
-        if (chat.sessionId !== null && !loaded) throw new Error("Session did not open");
-        break;
+        case "workspace_send_prompt":
+          if (
+            attachmentProtected ||
+            action.text !== prompt.trim() ||
+            action.agentId !== selectedAgentId ||
+            action.agentId !== sessionAgentId ||
+            !controlEditable ||
+            !session
+          ) {
+            throw new Error(
+              "Exact approved content, recipient or live session no longer matches",
+            );
+          }
+          // ACP remains the real agent transport; completion is awaited and a timed-out turn is cancelled.
+          await sendPrompt(lease);
+          break;
+        case "workspace_cancel_prompt":
+          await cancelPrompt(lease);
+          break;
+        default:
+          throw new Error("Unsupported app-control operation");
       }
-      case "workspace_send_prompt":
-        if (attachmentProtected || action.text !== prompt.trim() || action.agentId !== selectedAgentId ||
-            action.agentId !== sessionAgentId || !controlEditable || !session) {
-          throw new Error("Exact approved content, recipient or live session no longer matches");
-        }
-        // ACP remains the real agent transport; completion is awaited and a timed-out turn is cancelled.
-        await sendPrompt(lease);
-        break;
-      case "workspace_cancel_prompt":
-        await cancelPrompt(lease);
-        break;
-      default:
-        throw new Error("Unsupported app-control operation");
-    }
-  }, controlRevisionKey);
+    },
+    controlRevisionKey,
+  );
   const { index, loading: archiveLoading, failed: archiveFailed } = sources;
   const project = useMemo(() => {
     const cache = new Map<string, AgentHistory>();
@@ -3117,8 +3329,15 @@ export function CopilotWorkspace({
     <main
       className={`copilot-main copilot-flip-stage${desktopWindow.front ? " is-front" : ""}`}
     >
-      <DesktopUpdates mode="toast" visible={!desktopWindow.front && openDialog === null &&
-        permissions.length === 0 && elicitations.length === 0} />
+      <DesktopUpdates
+        mode="toast"
+        visible={
+          !desktopWindow.front &&
+          openDialog === null &&
+          permissions.length === 0 &&
+          elicitations.length === 0
+        }
+      />
       {desktopWindow.widget && (
         <section
           className="copilot-live-tile"
@@ -3882,89 +4101,180 @@ export function CopilotWorkspace({
                   letter.toUpperCase(),
                 )}
               </label>
-              <CopilotComposer ref={composerContentRef}
-                conversationId={activeConversationId} agentId={selectedAgentId} agentName={currentAgent.name}
-                visible={!desktopWindow.front && surface === "workspace" && dashboardId === null && openDialog === null}
+              <CopilotComposer
+                ref={composerContentRef}
+                conversationId={activeConversationId}
+                agentId={selectedAgentId}
+                agentName={currentAgent.name}
+                visible={
+                  !desktopWindow.front &&
+                  surface === "workspace" &&
+                  dashboardId === null &&
+                  openDialog === null
+                }
                 disabled={busy || !eventsReady || dashboardId !== null}
-                ensureConversation={() => { if (!activeConversation) updateDraft(prompt); }}
+                ensureConversation={() => {
+                  if (!activeConversation) updateDraft(prompt);
+                }}
                 onState={contentStateChanged}
                 editor={
-                <textarea
-                  ref={promptRef}
-                  id="copilot-prompt"
-                  rows={2}
-                  data-ui-action="workspace_edit_draft"
-                  value={prompt}
-                  onChange={(event) => updateDraft(event.target.value)}
-                  maxLength={MAX_DRAFT_LENGTH}
-                  onKeyDown={(event) => {
-                    if (
-                      event.key === "Enter" &&
-                      !event.shiftKey &&
-                      !event.nativeEvent.isComposing
-                    ) {
-                      event.preventDefault();
-                      if (!busy) void sendPrompt();
-                    }
-                  }}
-                  disabled={busy || !eventsReady}
-                  placeholder="Describe what you want to do"
-                />}
-                controls={<>
-                  <select className="copilot-composer-agent" aria-label="Personality"
-                    title={`${currentAgent.name} · switch personality in a new chat; this draft is kept`}
-                    data-ui-action="workspace_new_chat" value={effectiveAgentId}
-                    disabled={busy || !eventsReady || attachmentPending}
-                    onChange={(event) => { if (event.target.value !== effectiveAgentId) void startDraft(event.target.value); }}>
-                    {!agentChoices.some((agent) => agent.id === effectiveAgentId) &&
-                      <option value={effectiveAgentId}>{currentAgent.name}</option>}
-                    {agentChoices.filter((agent) => !isStudioAgentId(agent.id)).map((agent) =>
-                      <option key={agent.id} value={agent.id} disabled={!!localBlock(agent.id)}>
-                        {agent.id === effectiveAgentId ? currentAgent.name : agent.name}
-                      </option>)}
-                  </select>
-                  {session ? <select className="copilot-composer-model" aria-label="Model"
-                    title={modelOption ? "Model for this conversation · reported by Copilot CLI" : "This session does not advertise model choices"}
-                    data-ui-action="settings_configure_session"
-                    value={modelOption?.currentValue ?? ""}
-                    disabled={busy || !eventsReady || !modelOption?.options.length}
-                    onChange={(event) => void configureSession("model", event.target.value)}>
-                    {(!modelOption || !modelOption.options.some((item) => item.value === modelOption.currentValue)) &&
-                      <option value={modelOption?.currentValue ?? ""}>{modelOption?.currentValue || "Model not reported"}</option>}
-                    {modelOption?.options.map((item) =>
-                      <option key={item.value} value={item.value} disabled={isConfigValueDisabled(item)}>{item.name}</option>)}
-                  </select> : <button type="button" className="quiet copilot-composer-model"
-                    aria-label="Choose model"
-                    title={currentAgent.model
-                      ? `Declared agent default: ${currentAgent.model}. Open this conversation to discover available models; no message is sent.`
-                      : "Open this conversation to discover available models; no message is sent."}
-                    data-ui-action="workspace_initialize_model"
-                    disabled={busy || !eventsReady || attachmentPending || !!localBlock(effectiveAgentId)}
-                    onClick={() => void initializeComposerModel()}>
-                    {currentAgent.model ? `${currentAgent.model} (default)` : "Choose model…"}
-                  </button>}
-                </>}
-                primaryAction={activeTurnId && session ? (
-                  <button type="button" className="quiet"
-                    data-ui-action="workspace_cancel_prompt" disabled={cancelling}
-                    onClick={() => void cancelPrompt()}>Stop</button>
-                ) : <button
-                  type="button"
-                  data-ui-action="workspace_send_prompt"
-                  onClick={() => void sendPrompt()}
-                  disabled={busy || !eventsReady || attachmentPending || (!prompt.trim() && attachmentCount === 0)}
-                >
-                  Send
-                </button>}
+                  <textarea
+                    ref={promptRef}
+                    id="copilot-prompt"
+                    rows={2}
+                    data-ui-action="workspace_edit_draft"
+                    value={prompt}
+                    onChange={(event) => updateDraft(event.target.value)}
+                    maxLength={MAX_DRAFT_LENGTH}
+                    onKeyDown={(event) => {
+                      if (
+                        event.key === "Enter" &&
+                        !event.shiftKey &&
+                        !event.nativeEvent.isComposing
+                      ) {
+                        event.preventDefault();
+                        if (!busy) void sendPrompt();
+                      }
+                    }}
+                    disabled={busy || !eventsReady}
+                    placeholder="Describe what you want to do"
+                  />
+                }
+                controls={
+                  <>
+                    <select
+                      className="copilot-composer-agent"
+                      aria-label="Personality"
+                      title={`${currentAgent.name} · switch personality in a new chat; this draft is kept`}
+                      data-ui-action="workspace_new_chat"
+                      value={effectiveAgentId}
+                      disabled={busy || !eventsReady || attachmentPending}
+                      onChange={(event) => {
+                        if (event.target.value !== effectiveAgentId)
+                          void startDraft(event.target.value);
+                      }}
+                    >
+                      {!agentChoices.some(
+                        (agent) => agent.id === effectiveAgentId,
+                      ) && (
+                        <option value={effectiveAgentId}>
+                          {currentAgent.name}
+                        </option>
+                      )}
+                      {agentChoices
+                        .filter((agent) => !isStudioAgentId(agent.id))
+                        .map((agent) => (
+                          <option
+                            key={agent.id}
+                            value={agent.id}
+                            disabled={!!localBlock(agent.id)}
+                          >
+                            {agent.id === effectiveAgentId
+                              ? currentAgent.name
+                              : agent.name}
+                          </option>
+                        ))}
+                    </select>
+                    {session ? (
+                      <select
+                        className="copilot-composer-model"
+                        aria-label="Model"
+                        title={
+                          modelOption
+                            ? "Model for this conversation · reported by Copilot CLI"
+                            : "This session does not advertise model choices"
+                        }
+                        data-ui-action="settings_configure_session"
+                        value={modelOption?.currentValue ?? ""}
+                        disabled={
+                          busy || !eventsReady || !modelOption?.options.length
+                        }
+                        onChange={(event) =>
+                          void configureSession("model", event.target.value)
+                        }
+                      >
+                        {(!modelOption ||
+                          !modelOption.options.some(
+                            (item) => item.value === modelOption.currentValue,
+                          )) && (
+                          <option value={modelOption?.currentValue ?? ""}>
+                            {modelOption?.currentValue || "Model not reported"}
+                          </option>
+                        )}
+                        {modelOption?.options.map((item) => (
+                          <option
+                            key={item.value}
+                            value={item.value}
+                            disabled={isConfigValueDisabled(item)}
+                          >
+                            {item.name}
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      <button
+                        type="button"
+                        className="quiet copilot-composer-model"
+                        aria-label="Choose model"
+                        title={
+                          currentAgent.model
+                            ? `Declared agent default: ${currentAgent.model}. Open this conversation to discover available models; no message is sent.`
+                            : "Open this conversation to discover available models; no message is sent."
+                        }
+                        data-ui-action="workspace_initialize_model"
+                        disabled={
+                          busy ||
+                          !eventsReady ||
+                          attachmentPending ||
+                          !!localBlock(effectiveAgentId)
+                        }
+                        onClick={() => void initializeComposerModel()}
+                      >
+                        {currentAgent.model
+                          ? `${currentAgent.model} (default)`
+                          : "Choose model…"}
+                      </button>
+                    )}
+                  </>
+                }
+                primaryAction={
+                  activeTurnId && session ? (
+                    <button
+                      type="button"
+                      className="quiet"
+                      data-ui-action="workspace_cancel_prompt"
+                      disabled={cancelling}
+                      onClick={() => void cancelPrompt()}
+                    >
+                      Stop
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      data-ui-action="workspace_send_prompt"
+                      onClick={() => void sendPrompt()}
+                      disabled={
+                        busy ||
+                        !eventsReady ||
+                        attachmentPending ||
+                        (!prompt.trim() && attachmentCount === 0)
+                      }
+                    >
+                      Send
+                    </button>
+                  )
+                }
               />
             </div>
             {dashboardId === null && failure && (
               <div className="copilot-chat-error" role="alert">
                 <span>{failure.said}</span>
-                {failure.detail && <details>
-                  <summary data-ui-action="inspect_details">Details</summary>
-                  <pre>{failure.detail}</pre>
-                </details>}
+                {failure.detail && (
+                  <details>
+                    <summary data-ui-action="inspect_details">Details</summary>
+                    <pre>{failure.detail}</pre>
+                  </details>
+                )}
               </div>
             )}
             {failure && activeChat?.sessionId && !session && !busy && (
@@ -4123,16 +4433,34 @@ export function CopilotWorkspace({
           <DesktopUpdates mode="settings" />
           <section>
             <h3>Local app control</h3>
-            <FleetPanel visible={openDialog === "settings"} cwd={location?.cwd ?? ""} agents={inventory?.agents ?? []} />
-            <p>MCP and REST access is off by default. Native owner approval is required to enable and connect. Stop revokes every connection.</p>
-            <button type="button" className="quiet" data-ui-action="settings_app_control"
-              disabled={appControl.changing} onClick={() => void appControl.toggle()}>
-              {appControl.status.enabled ? "Stop app control" : "Enable app control"}
+            <FleetPanel
+              visible={openDialog === "settings"}
+              cwd={location?.cwd ?? ""}
+              agents={inventory?.agents ?? []}
+            />
+            <p>
+              MCP and REST access is off by default. Native owner approval is
+              required to enable and connect. Stop revokes every connection.
+            </p>
+            <button
+              type="button"
+              className="quiet"
+              data-ui-action="settings_app_control"
+              disabled={appControl.changing}
+              onClick={() => void appControl.toggle()}
+            >
+              {appControl.status.enabled
+                ? "Stop app control"
+                : "Enable app control"}
             </button>
-            {appControl.status.enabled && <p>
-              Endpoint: <code>{appControl.status.endpoint}</code><br />
-              Private connection file: <code>{appControl.status.discoveryFile}</code>
-            </p>}
+            {appControl.status.enabled && (
+              <p>
+                Endpoint: <code>{appControl.status.endpoint}</code>
+                <br />
+                Private connection file:{" "}
+                <code>{appControl.status.discoveryFile}</code>
+              </p>
+            )}
             {appControl.problem && <p role="alert">{appControl.problem}</p>}
           </section>
           <section>

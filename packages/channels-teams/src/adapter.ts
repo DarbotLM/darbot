@@ -238,7 +238,12 @@ export class TeamsAdapter implements PlatformAdapter {
     }
     const revision = this.userRevision(activity, conversationKey);
     const token = activity.id
-      ? this.store.beginUserRevision(conversationKey, activity.id, text, revision)
+      ? this.store.beginUserRevision(
+          conversationKey,
+          activity.id,
+          text,
+          revision,
+        )
       : undefined;
     if (activity.id && !token) return;
 
@@ -354,7 +359,10 @@ export class TeamsAdapter implements PlatformAdapter {
     }
   }
 
-  private userRevision(activity: Activity, fallback: string): TeamsUserRevision {
+  private userRevision(
+    activity: Activity,
+    fallback: string,
+  ): TeamsUserRevision {
     const parsed = activity.timestamp
       ? new Date(activity.timestamp).getTime()
       : NaN;
@@ -364,7 +372,9 @@ export class TeamsAdapter implements PlatformAdapter {
     const identity =
       timestamp ??
       createHash("sha256")
-        .update(JSON.stringify([activity.text ?? "", activity.attachments ?? []]))
+        .update(
+          JSON.stringify([activity.text ?? "", activity.attachments ?? []]),
+        )
         .digest("hex");
     return {
       kind:
@@ -543,7 +553,8 @@ export class TeamsAdapter implements PlatformAdapter {
     if (activity.type === ActivityTypes.MessageDelete) {
       if (!activity.id) throw new Error("Message delete requires an id.");
       const revision = this.userRevision(activity, conversationKey);
-      if (!this.store.deleteUser(conversationKey, activity.id, revision)) return;
+      if (!this.store.deleteUser(conversationKey, activity.id, revision))
+        return;
       await sink.onTurn({
         ...base,
         userText: "",

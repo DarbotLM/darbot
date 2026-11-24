@@ -1235,14 +1235,22 @@ mod platform {
             ReleaseDC(Some(hwnd), dc);
             target.check()?;
             let blank = if app_only {
-                pixels.chunks_exact(4).all(|p| p[..3] == pixels[..3])
+                pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|pixel| pixel[..3] == pixels[..3])
             } else {
-                pixels.chunks_exact(4).all(|p| p[..3] == [0, 0, 0])
+                pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|pixel| pixel[..3] == [0, 0, 0])
             };
             if rows != height || blank {
                 return Err(fail("This window does not support rendered capture. Choose another window; no desktop fallback was used."));
             }
-            for pixel in pixels.chunks_exact_mut(4) {
+            for pixel in pixels.as_chunks_mut::<4>().0 {
                 pixel.swap(0, 2);
                 pixel[3] = 255;
             }
