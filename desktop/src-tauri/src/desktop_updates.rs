@@ -902,7 +902,7 @@ mod tests {
 
     fn notice() -> UpdateHint {
         UpdateHint {
-            version: "0.0.29".into(),
+            version: "0.0.30".into(),
             build_repository: BUILD_REPOSITORY.into(),
             source_repository: SOURCE_REPOSITORY.into(),
             workflow: WORKFLOW.into(),
@@ -919,7 +919,7 @@ mod tests {
             "schema":"darbot.desktop.release", "schemaVersion":1, "version":hint.version,
             "sourceRepository":SOURCE_REPOSITORY, "sourceSha":hint.source_sha,
             "buildRepository":BUILD_REPOSITORY, "workflow":WORKFLOW, "runId":hint.run_id,
-            "installerFile":"darbot_0.0.29_x64-setup.exe",
+            "installerFile":"darbot_0.0.30_x64-setup.exe",
             "installerSha256":format!("{:x}",Sha256::digest(bytes)),
             "installedExeSha256":"c".repeat(64), "signed":false
         });
@@ -932,7 +932,7 @@ mod tests {
             .write_all(&serde_json::to_vec(&manifest).unwrap())
             .unwrap();
         writer
-            .start_file("darbot_0.0.29_x64-setup.exe", options)
+            .start_file("darbot_0.0.30_x64-setup.exe", options)
             .unwrap();
         writer.write_all(bytes).unwrap();
         writer.finish().unwrap().into_inner()
@@ -947,10 +947,10 @@ mod tests {
         hint = notice();
         hint.source_sha = "../main".into();
         assert!(hint.validate().is_err());
-        assert!(newer("0.0.29", "0.0.28"));
-        assert!(!newer("0.0.9", "0.0.28"));
-        assert!(!newer("0.0.28", "0.0.28"));
-        assert!(version("0.00.29").is_none());
+        assert!(newer("0.0.30", "0.0.29"));
+        assert!(!newer("0.0.9", "0.0.29"));
+        assert!(!newer("0.0.29", "0.0.29"));
+        assert!(version("0.00.30").is_none());
     }
 
     #[test]

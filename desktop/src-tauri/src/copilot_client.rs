@@ -1266,7 +1266,7 @@ fn main() {
             std::thread::sleep(Duration::from_millis(40));
             out.write_all(&[0x98, 0x80, 0x5a]).unwrap(); out.flush().unwrap();
             eprint!("stderr\n");
-            std::thread::sleep(Duration::from_millis(150));
+            std::thread::sleep(Duration::from_secs(3));
             std::process::exit(7);
         },
         Some("inspect") => println!("{:?}|{}|{}", &args[1..],
@@ -1384,7 +1384,10 @@ fn main() {
             let request = fixture.request("output", 1024);
             let began = std::time::Instant::now();
             let handle = start(&manager, &fixture, &request);
-            assert!(began.elapsed() < Duration::from_secs(1));
+            assert!(
+                began.elapsed() < Duration::from_secs(2),
+                "terminal creation waited for the child instead of returning its handle"
+            );
             assert!(manager.output(&handle).unwrap().get("exitStatus").is_none());
             assert_eq!(
                 manager.wait(&handle).unwrap(),
