@@ -3327,6 +3327,7 @@ fn main() {
             darbot_desktop_lib::app_control::app_control_heartbeat,
             darbot_desktop_lib::app_control::app_control_claim,
             darbot_desktop_lib::app_control::app_control_ack,
+            darbot_desktop_lib::app_control::app_control_approval_respond,
             desktop_window::desktop_window_state,
             desktop_window::desktop_window_present,
             record_setup_event,

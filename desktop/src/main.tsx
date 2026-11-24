@@ -1,6 +1,7 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
+import { ApprovalOverlay } from "./ApprovalOverlay";
 import { DesktopWindow } from "./DesktopWindow";
 import { bootstrapTheme } from "./copilot-preferences";
 import "./styles.css";
@@ -17,5 +18,6 @@ createRoot(root).render(
     <DesktopWindow>
       <App />
     </DesktopWindow>
+    <ApprovalOverlay />
   </StrictMode>,
 );
