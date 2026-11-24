@@ -3278,3 +3278,71 @@ html[data-copilot-theme="dark"] .copilot-agent-icon-default {
     display: none;
   }
 }
+
+/* Approval overlay — flipcard widget theme */
+.approval-overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+  z-index: 9999;
+  backdrop-filter: blur(2px);
+}
+
+.approval-card {
+  width: min(420px, calc(100vw - 2rem));
+  border-radius: 20px;
+  border: 1px solid var(--hair);
+  background:
+    radial-gradient(
+      circle at 100% 0,
+      color-mix(in srgb, var(--brand-cyan) 15%, transparent),
+      transparent 70%
+    ),
+    var(--raised);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+  overflow: clip;
+}
+
+.approval-card-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.75rem;
+  padding: 0.85rem 1rem;
+  border-bottom: 1px solid var(--hair);
+  background: color-mix(in srgb, var(--focus) 8%, var(--raised));
+}
+
+.approval-card-header h3 {
+  margin: 0;
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+.approval-card-body {
+  padding: 0.9rem 1rem;
+  font-size: 0.8125rem;
+  color: var(--ink);
+  white-space: pre-wrap;
+  line-height: 1.5;
+}
+
+.approval-card-actions {
+  display: flex;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  border-top: 1px solid var(--hair);
+  background: color-mix(in srgb, var(--focus) 4%, var(--ground));
+  justify-content: flex-end;
+}
+
+.approval-card-actions .always-allow {
+  background: color-mix(in srgb, var(--brand-cyan) 20%, var(--raised));
+  border: 1px solid color-mix(in srgb, var(--brand-cyan) 40%, var(--hair));
+}
+
+.approval-card-actions .cancel-btn {
+  color: var(--ink-faint);
+}

@@ -64,6 +64,14 @@ fn error(code: &'static str, message: impl Into<String>) -> ControlError {
 
 type Result<T> = std::result::Result<T, ControlError>;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalOutcome {
+    AlwaysAllow,
+    AllowOnce,
+    Cancel,
+}
+
 impl IntoResponse for ControlError {
     fn into_response(self) -> Response {
         let status = match self.code {
@@ -287,6 +295,40 @@ struct Connection {
     rpc_seen: HashSet<String>,
 }
 
+#[derive(Default, Serialize, Deserialize, Clone)]
+struct TrustStore {
+    trusted: Vec<String>,
+}
+
+impl TrustStore {
+    fn path(app: &tauri::AppHandle) -> Option<PathBuf> {
+        app.path()
+            .app_data_dir()
+            .ok()
+            .map(|d| d.join("trusted-clients.json"))
+    }
+    fn load(app: &tauri::AppHandle) -> Self {
+        Self::path(app)
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+    fn save(&self, app: &tauri::AppHandle) {
+        if let Some(path) = Self::path(app) {
+            let _ = std::fs::create_dir_all(path.parent().unwrap());
+            let _ = std::fs::write(path, serde_json::to_string(self).unwrap_or_default());
+        }
+    }
+    fn is_trusted(&self, id: &str) -> bool {
+        self.trusted.contains(&id.to_string())
+    }
+    fn add(&mut self, id: String) {
+        if !self.trusted.contains(&id) {
+            self.trusted.push(id);
+        }
+    }
+}
+
 struct CallLifetime {
     connection: String,
     rpc_id: Option<Value>,
@@ -317,6 +359,10 @@ trait ControlHost: Send + Sync {
     fn request(&self, envelope: Envelope) -> Result<()>;
     fn cancel(&self, ticket: &str, session: Option<String>);
     async fn approve(&self, message: String) -> Result<()>;
+    /// Connection-level approval; default falls back to `approve` for test fixtures.
+    async fn approve_connection(&self, _display_id: &str, message: String) -> Result<()> {
+        self.approve(message).await
+    }
     async fn capture(&self) -> Result<Value>;
 }
 
@@ -361,6 +407,85 @@ impl ControlHost for NativeHost {
         approve(&self.0, message).await
     }
 
+    async fn approve_connection(&self, display_id: &str, message: String) -> Result<()> {
+        if TrustStore::load(&self.0).is_trusted(display_id) {
+            return Ok(());
+        }
+        let guard = NativeActivityGuard::acquire(self.0.state::<AppControl>().2.clone())?;
+        let window = self
+            .0
+            .get_webview_window("main")
+            .ok_or_else(|| error("unavailable", "Window is closed"))?;
+        window
+            .show()
+            .map_err(|_| error("unavailable", "Window cannot be shown"))?;
+        window
+            .set_focus()
+            .map_err(|_| error("unavailable", "Window cannot be focused"))?;
+        let request_id = random_id();
+        let (tx, rx) = oneshot::channel::<ApprovalOutcome>();
+        self.0
+            .state::<AppControl>()
+            .3
+            .lock()
+            .unwrap()
+            .insert(request_id.clone(), tx);
+        let expires_at = now_ms() + TIMEOUT.as_millis() as u64;
+        if self
+            .0
+            .emit_to(
+                "main",
+                "app-control:owner-approval",
+                json!({
+                    "requestId": request_id,
+                    "title": "Darbot app control — owner approval",
+                    "message": message,
+                    "expiresAt": expires_at,
+                }),
+            )
+            .is_err()
+        {
+            self.0
+                .state::<AppControl>()
+                .3
+                .lock()
+                .unwrap()
+                .remove(&request_id);
+            return Err(error("unavailable", "Renderer could not be reached"));
+        }
+        let outcome = match tokio::time::timeout(TIMEOUT, rx).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) => {
+                return Err(error(
+                    "unavailable",
+                    "Approval channel closed unexpectedly",
+                ))
+            }
+            Err(_) => {
+                self.0
+                    .state::<AppControl>()
+                    .3
+                    .lock()
+                    .unwrap()
+                    .remove(&request_id);
+                return Err(error("timeout", "Connection approval expired"));
+            }
+        };
+        drop(guard);
+        match outcome {
+            ApprovalOutcome::AlwaysAllow => {
+                let mut store = TrustStore::load(&self.0);
+                store.add(display_id.to_string());
+                store.save(&self.0);
+                Ok(())
+            }
+            ApprovalOutcome::AllowOnce => Ok(()),
+            ApprovalOutcome::Cancel => {
+                Err(error("denied", "The local owner denied this request"))
+            }
+        }
+    }
+
     async fn capture(&self) -> Result<Value> {
         let window = self
             .0
@@ -374,7 +499,12 @@ impl ControlHost for NativeHost {
 }
 
 #[derive(Default)]
-pub struct AppControl(Mutex<Option<Arc<Service>>>, AtomicU64, Arc<AtomicBool>);
+pub struct AppControl(
+    Mutex<Option<Arc<Service>>>,
+    AtomicU64,
+    Arc<AtomicBool>,
+    Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalOutcome>>>>,
+);
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -817,6 +947,24 @@ fn ack_ticket(
         .map_err(|_| error("cancelled", "Caller disconnected"))
 }
 
+#[tauri::command]
+pub async fn app_control_approval_respond(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, AppControl>,
+    request_id: String,
+    outcome: ApprovalOutcome,
+) -> Result<()> {
+    main_window(&window)?;
+    let tx = state
+        .3
+        .lock()
+        .unwrap()
+        .remove(&request_id)
+        .ok_or_else(|| error("cancelled", "Approval request not found or already resolved"))?;
+    let _ = tx.send(outcome);
+    Ok(())
+}
+
 fn router(service: Arc<Service>) -> Router {
     Router::new()
         .route("/v1/connect", post(rest_connect))
@@ -935,9 +1083,9 @@ async fn connect(service: &Arc<Service>, name: &str, initialized: bool) -> Resul
     }
     let display_id = random_id();
     tokio::select! {
-        result = tokio::time::timeout(TIMEOUT, service.host.approve(format!(
+        result = tokio::time::timeout(TIMEOUT, service.host.approve_connection(&display_id, format!(
             "Local client (self-reported name): {name}\nConnection identifier (non-secret): {display_id}\n\nAllow this connection for 30 minutes?\nIt may read bounded app state, conversation text and drafts, navigate local surfaces, edit drafts and capture this app window on demand. Sending/cancelling and changing agent/session require separate native approval. It cannot grant permissions or access credentials.\n\nOnly approve a client you just started. If this request expires, Allow once cannot revive it; dismiss the dialog before capture."
-        ))) => result.map_err(|_| error("timeout", "Connection approval expired; dismiss the native dialog to unblock capture"))??,
+        ))) => result.map_err(|_| error("timeout", "Connection approval expired"))??,
         _ = service.stop.cancelled() => return Err(error("cancelled", "Service revoked")),
     }
     if service.stop.is_cancelled() {
