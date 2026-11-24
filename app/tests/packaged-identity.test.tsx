@@ -117,7 +117,8 @@ test("IdentityFacts adds a Framework row only for identities that name one", () 
   const view = render(<IdentityFacts identity={adk} />);
 
   expect(view.getByText("Framework")).toBeTruthy();
-  if (!adk.frameworkReference) throw new Error("ADK framework reference is missing.");
+  if (!adk.frameworkReference)
+    throw new Error("ADK framework reference is missing.");
   expect(view.container.textContent).toContain(adk.frameworkReference);
 });
 
