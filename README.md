@@ -204,6 +204,30 @@ behavior; it is not a license-check bypass.
 
 `scripts/stop.sh` takes the same things down, including each Bot's computer, which compose does not own. Nothing is deleted: the database, the Bots' files and their browser profiles are volumes.
 
+### Local app-only development
+
+For a UI-only smoke path that does not start the full platform:
+
+```sh
+bun install
+bun run build
+docker compose up -d postgres
+$env:APP_PORT="5923"
+bun app/serve.ts
+```
+
+Open <http://127.0.0.1:5923>. The app server proxies `/api` and WebSocket requests to port 3001, so an API-only test requires the normal server service as well.
+
+The compose stack builds these local platform images:
+
+- `darbot-server:latest`
+- `darbot-agent-computer:latest`
+- `darbot-supervisor:latest`
+- `darbot-agent-bot:latest`
+- `darbot-agent-langgraph:latest`
+
+PostgreSQL uses the published `pgvector/pgvector:pg17` image. SPIRE also uses published `ghcr.io/spiffe/spire-server:1.15.1` and `ghcr.io/spiffe/spire-agent:1.15.1` images.
+
 ## Deploy it
 
 One image carries the app, the API, the browser the Bots drive, and optionally PostgreSQL. Same
