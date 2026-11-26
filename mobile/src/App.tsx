@@ -1,7 +1,7 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import React, { useEffect, useRef, useState } from "react";
 import {
-  ActivityIndicator, Alert, BackHandler, KeyboardAvoidingView, Linking, Platform,
+  ActivityIndicator, Alert, BackHandler, Image, KeyboardAvoidingView, Linking, Modal, Platform,
   Pressable, ScrollView, StatusBar, StyleSheet, Text, TextInput, View,
 } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
@@ -28,6 +28,7 @@ function Shell() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [networkError, setNetworkError] = useState(false);
+  const [blockedNavigation, setBlockedNavigation] = useState(false);
   const [loading, setLoading] = useState(true);
   const [canBack, setCanBack] = useState(false);
   const [revision, setRevision] = useState(0);
@@ -60,7 +61,7 @@ function Shell() {
       const origin = normalizeEndpoint(draft);
       await AsyncStorage.setItem(STORE, origin);
       setEndpoint(origin); setDraft(origin); setEditing(false);
-      setCanBack(false); setNetworkError(false); setLoading(true); setRevision(n => n + 1);
+      setCanBack(false); setNetworkError(false); setBlockedNavigation(false); setLoading(true); setRevision(n => n + 1);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Could not save the server.");
     } finally { setSaving(false); }
@@ -73,13 +74,13 @@ function Shell() {
       }}]);
   }
   function settings() { setDraft(endpoint ?? ""); setError(""); setEditing(true); }
-  function retry() { setNetworkError(false); setLoading(true); setCanBack(false); setRevision(n => n + 1); }
+  function retry() { setNetworkError(false); setBlockedNavigation(false); setLoading(true); setCanBack(false); setRevision(n => n + 1); }
 
   if (!ready) return <View style={styles.center}><ActivityIndicator color={palette.violet}/></View>;
-  if (!endpoint || editing) return (
+  const serverForm = (
     <KeyboardAvoidingView style={styles.flex} behavior={Platform.OS === "ios" ? "padding" : undefined}>
       <ScrollView keyboardShouldPersistTaps="handled" contentContainerStyle={styles.setup}>
-        <View style={styles.mark}><Text style={styles.markText}>d.</Text></View>
+        <Image accessibilityIgnoresInvertColors source={require("../assets/darbot-orb.png")} style={styles.mark}/>
         <Text style={styles.title}>Your agents. Anywhere.</Text>
         <Text style={styles.description}>Connect to your Darbot deployment. Conversations, agents and tools remain on your server.</Text>
         <Text style={styles.label}>Darbot server</Text>
@@ -94,7 +95,11 @@ function Shell() {
       </ScrollView>
     </KeyboardAvoidingView>
   );
+  if (!endpoint) return serverForm;
   return <View style={styles.flex}>
+    <Modal visible={editing} animationType="slide" presentationStyle="fullScreen" onRequestClose={() => setEditing(false)}>
+      <SafeAreaView style={styles.flex}>{serverForm}</SafeAreaView>
+    </Modal>
     <View style={styles.connection}>
       <View style={styles.row}>
         {canBack && <Pressable accessibilityRole="button" accessibilityLabel="Go back" style={styles.back}
@@ -105,9 +110,9 @@ function Shell() {
         <Text style={styles.connectionText}>Server</Text>
       </Pressable>
     </View>
-    {networkError ? <View style={styles.failure}>
-      <Text style={styles.title}>Cannot reach Darbot</Text>
-      <Text style={styles.description}>Check your network, VPN, certificate and server address.</Text>
+    {networkError || blockedNavigation ? <View style={styles.failure}>
+      <Text style={styles.title}>{blockedNavigation ? "Navigation blocked" : "Cannot reach Darbot"}</Text>
+      <Text style={styles.description}>{blockedNavigation ? "The page tried to leave your configured Darbot server." : "Check your network, VPN, certificate and server address."}</Text>
       <Action title="Retry" primary onPress={retry}/><Action title="Change server" onPress={settings}/>
     </View> : <View style={styles.flex}>
       <WebView key={endpoint + revision} ref={web} source={{uri:endpoint}}
@@ -118,7 +123,13 @@ function Shell() {
         allowUniversalAccessFromFileURLs={false}
         javaScriptCanOpenWindowsAutomatically={false}
         allowsBackForwardNavigationGestures
-        onNavigationStateChange={state => setCanBack(state.canGoBack)}
+        onNavigationStateChange={state => {
+          // A secondary guard for platform-specific redirect paths not reported by the request hook.
+          if (state.url !== "about:blank" && !isSameOrigin(state.url, endpoint)) {
+            web.current?.stopLoading(); setBlockedNavigation(true); setLoading(false); return;
+          }
+          setCanBack(state.canGoBack);
+        }}
         onShouldStartLoadWithRequest={request => {
           // Existing sandboxed components can load in child frames. Top-level navigation is origin-bound.
           if (request.isTopFrame === false) return true;
@@ -146,8 +157,7 @@ const styles = StyleSheet.create({
   flex:{flex:1,backgroundColor:palette.black},
   center:{flex:1,alignItems:"center",justifyContent:"center",backgroundColor:palette.black},
   setup:{flexGrow:1,justifyContent:"center",padding:24,gap:16,maxWidth:540,width:"100%",alignSelf:"center"},
-  mark:{width:56,height:56,borderRadius:17,backgroundColor:palette.navy,borderWidth:1,borderColor:palette.cyan,alignItems:"center",justifyContent:"center"},
-  markText:{color:palette.text,fontSize:32,fontWeight:"700"},
+  mark:{width:64,height:64,resizeMode:"contain"},
   title:{fontSize:32,letterSpacing:-1.3,fontWeight:"600",color:palette.text},
   description:{fontSize:16,lineHeight:24,color:palette.muted},
   label:{color:palette.text,fontSize:14,fontWeight:"600",marginTop:8},

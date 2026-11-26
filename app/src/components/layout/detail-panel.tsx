@@ -50,7 +50,9 @@ export function DetailPanel({
 
   return (
     <div className="darbot-detail-shell relative flex h-full min-h-0">
-      <div className="flex flex-1 min-w-0 flex-col" inert={mobile && open}>{children}</div>
+      <div className="flex flex-1 min-w-0 flex-col" inert={mobile && open}>
+        {children}
+      </div>
       <motion.div
         animate={{ width: open ? detailWidth : 0 }}
         className="darbot-detail-panel shrink-0 overflow-hidden"
@@ -73,7 +75,12 @@ export function DetailPanel({
               {title}
             </div>
             <div className="flex flex-row gap-1.5">
-              <Button aria-label="Close detail panel" onClick={onClose} variant="ghost" size="icon">
+              <Button
+                aria-label="Close detail panel"
+                onClick={onClose}
+                variant="ghost"
+                size="icon"
+              >
                 <IconX className="size-4.5" />
               </Button>
             </div>

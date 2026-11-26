@@ -44,7 +44,13 @@ function RouteComponent() {
     <>
       <div className="darbot-home-header">
         <SidebarToggleBar />
-        <Link aria-label="New conversation" to="/channel/new" className="darbot-mobile-new-chat md:hidden"><IconPlus size={24} /></Link>
+        <Link
+          aria-label="New conversation"
+          to="/channel/new"
+          className="darbot-mobile-new-chat md:hidden"
+        >
+          <IconPlus size={24} />
+        </Link>
       </div>
       <div className="darbot-mobile-home flex-1 flex flex-col items-center justify-center w-full p-4 mt-8">
         <div className="darbot-home-intro flex flex-col items-center">

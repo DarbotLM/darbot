@@ -1,6 +1,6 @@
 # Darbot Mobile (iOS and Android)
 
-A native Expo/React Native host for the existing authenticated Darbot web application. This is a shared-client architecture, not a rewrite of the agent runtime. The application loads a user-selected HTTPS Darbot deployment in WKWebView / Android WebView. No native bridge or injected JavaScript is provided to the remote page. Same-origin API calls, cookies, streaming, channel history and agent routing remain owned by Darbot. The web UI in app/ contains the phone layout.
+A native Expo/React Native host for the existing authenticated Darbot web application. This is a shared-client architecture, not a rewrite of the agent runtime. The application loads a user-selected HTTPS Darbot deployment in WKWebView / Android WebView. No application-level native message bridge or injected JavaScript is provided to the remote page. Origin checks are a defense in depth, not a guarantee that a platform WebView never initiates an off-origin network request. Same-origin API calls, cookies, streaming, channel history and agent routing remain owned by Darbot. The web UI in app/ contains the phone layout.
 
 ## Development
 
@@ -24,7 +24,7 @@ Deploy the updated Darbot web app first, then enter the HTTPS origin in the nati
 - Exercise small and large phones, tablets, rotation, keyboard opening, large font, screen reader, back navigation and interrupted Wi-Fi on both OSes.
 - Verify certificate errors fail closed, top-level origin restrictions, popup links, session-cookie isolation, download/file picker behavior, and untrusted embedded content.
 - External top-level HTTPS links require confirmation and open in the system browser. External OAuth/SSO callbacks are not implemented in this host; embedded user agents may be rejected by identity providers. Deployments requiring SSO need a system-browser auth session and secure callback/session exchange before production.
-- Native voice, push notifications, offline sync, platform share-sheet ingestion, branded launcher assets, native deep links and store review are not implemented. The web interface does not acquire native capabilities merely by being hosted in a WebView.
+- Native voice, push notifications, offline sync, platform share-sheet ingestion, native deep links and store review are not implemented. The launcher and setup image reuse the desktop orb master verbatim; generate and inspect opaque iOS and adaptive Android store variants before submission. The web interface does not acquire native capabilities merely by being hosted in a WebView.
 - Release only after signed physical-device builds and real deployment integration pass. No live server, build or store publication is implied by this source.
 
 The black mobile surfaces use the existing desktop brand palette; desktop layouts and saved explicit theme preferences remain intact.

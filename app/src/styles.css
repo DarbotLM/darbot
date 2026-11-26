@@ -292,8 +292,14 @@ body {
 
 /* Phone-first conversation surface. Desktop layout and explicit light preference remain intact. */
 @media (max-width: 767px) {
-  html { font-size: 16px; }
-  body { min-width: 0; }
+  html {
+    font-size: 16px;
+  }
+
+  body {
+    min-width: 0;
+  }
+
   .dark {
     --darbot-brand-navy: #080c2e;
     --darbot-brand-magenta: #d714d4;
@@ -317,38 +323,119 @@ body {
     --border: #303038;
     --sidebar-border: #303038;
   }
+
   .darbot-app-shell {
+    min-height: 0;
     padding-top: env(safe-area-inset-top, 0px);
     padding-bottom: env(safe-area-inset-bottom, 0px);
     padding-inline: env(safe-area-inset-left, 0px) env(safe-area-inset-right, 0px);
   }
-  .darbot-app-shell main { min-width: 0; }
-  .darbot-home-header { display: flex; align-items: center; justify-content: space-between; }
+
+  .darbot-app-shell main {
+    min-width: 0;
+  }
+
+  .darbot-home-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
   .darbot-mobile-new-chat {
-    display: grid; place-items: center; width: 44px; height: 44px;
-    margin-inline-end: 12px; border-radius: 50%; color: var(--foreground);
+    display: grid;
+    place-items: center;
+    width: 44px;
+    height: 44px;
+    margin-inline-end: 12px;
+    border-radius: 50%;
+    color: var(--foreground);
   }
+
   .darbot-mobile-home {
-    justify-content: flex-start; min-height: 0; overflow-y: auto;
-    overscroll-behavior: contain; margin-top: 0; gap: 24px; padding: 16px;
+    justify-content: flex-start;
+    min-height: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    margin-top: 0;
+    gap: 24px;
+    padding: 16px;
   }
-  .darbot-home-intro { margin-block: auto; padding-block: 20px; }
-  .darbot-home-intro h1 { font-size: clamp(1.6rem, 7vw, 2.2rem); line-height: 1.15; letter-spacing: -.045em; }
-  .darbot-home-agents { margin-top: 0; order: 1; }
-  .darbot-home-composer { margin-top: 0; order: 2; flex-shrink: 0; }
-  .darbot-channel-header { min-height: 56px; height: auto; background: var(--background); }
-  .darbot-composer-dock { padding: 0 12px 12px; }
-  .darbot-composer { border-radius: 26px; }
-  .darbot-composer button:not([aria-hidden="true"]) { min-height: 44px; min-width: 44px; }
-  .darbot-composer [contenteditable="true"] { font-size: 16px; line-height: 1.5; }
-  .darbot-app-shell [aria-label="Show sidebar"], .darbot-app-shell [aria-label="Hide sidebar"],
-  .darbot-channel-header button, .darbot-detail-inner button[aria-label="Close detail panel"] {
-    min-width: 44px; min-height: 44px;
+
+  .darbot-home-intro {
+    margin-block: auto;
+    padding-block: 20px;
   }
-  .darbot-app-shell pre { max-width: 100%; overflow-x: auto; }
-  .darbot-detail-panel[data-open="true"] { position: absolute; inset: 0; width: 100% !important; z-index: 30; }
-  .darbot-detail-panel[data-open="false"] { display: none; }
-  .darbot-detail-inner { width: 100% !important; border-left: 0; }
+
+  .darbot-home-intro h1 {
+    font-size: clamp(1.6rem, 7vw, 2.2rem);
+    line-height: 1.15;
+    letter-spacing: -0.045em;
+  }
+
+  .darbot-home-agents {
+    margin-top: 0;
+    order: 1;
+  }
+
+  .darbot-home-composer {
+    margin-top: 0;
+    order: 2;
+    flex-shrink: 0;
+  }
+
+  .darbot-channel-header {
+    min-height: 56px;
+    height: auto;
+    background: var(--background);
+  }
+
+  .darbot-composer-dock {
+    padding: 0 12px 12px;
+  }
+
+  .darbot-composer {
+    border-radius: 26px;
+  }
+
+  .darbot-composer button:not([aria-hidden="true"]) {
+    min-height: 44px;
+    min-width: 44px;
+  }
+
+  .darbot-composer [contenteditable="true"] {
+    font-size: 16px;
+    line-height: 1.5;
+  }
+
+  .darbot-app-shell [aria-label="Show sidebar"],
+  .darbot-app-shell [aria-label="Hide sidebar"],
+  .darbot-channel-header button,
+  .darbot-detail-inner button[aria-label="Close detail panel"] {
+    min-width: 44px;
+    min-height: 44px;
+  }
+
+  .darbot-app-shell pre {
+    max-width: 100%;
+    overflow-x: auto;
+  }
+
+  .darbot-detail-panel[data-open="true"] {
+    position: absolute;
+    inset: 0;
+    width: 100% !important;
+    z-index: 30;
+  }
+
+  .darbot-detail-panel[data-open="false"] {
+    display: none;
+  }
+
+  .darbot-detail-inner {
+    width: 100% !important;
+    border-left: 0;
+  }
+
   [data-slot="sidebar"][data-mobile="true"] {
     width: min(88vw, 340px) !important;
     max-width: 100vw;
@@ -356,6 +443,9 @@ body {
     padding-bottom: env(safe-area-inset-bottom, 0px);
   }
 }
+
 @media (min-width: 768px) {
-  .darbot-home-header { display: contents; }
+  .darbot-home-header {
+    display: contents;
+  }
 }
