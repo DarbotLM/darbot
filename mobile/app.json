@@ -1,0 +1,21 @@
+{
+  "expo": {
+    "name": "Darbot",
+    "slug": "darbot-mobile",
+    "version": "0.0.29",
+    "orientation": "default",
+    "userInterfaceStyle": "dark",
+    "ios": {
+      "bundleIdentifier": "ai.darbotlm.darbot.mobile",
+      "supportsTablet": true,
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    },
+    "android": {
+      "package": "ai.darbotlm.darbot.mobile",
+      "softwareKeyboardLayoutMode": "resize",
+      "edgeToEdgeEnabled": true
+    }
+  }
+}

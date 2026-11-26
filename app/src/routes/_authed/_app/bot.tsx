@@ -148,7 +148,7 @@ function BotChat({ agent, agentId }: { agent: AgentProfile; agentId: string }) {
   const stopped = useStoppedTurn(agentId);
 
   return (
-    <div className="flex h-screen flex-col">
+    <div className="flex h-full min-h-0 flex-col">
       <SidebarToggleBar />
       <header className="border-b px-6 py-3">
         <div className="flex items-center justify-between">

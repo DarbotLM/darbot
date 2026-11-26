@@ -1,6 +1,7 @@
 import { IconX } from "@tabler/icons-react";
 import { motion, useReducedMotion } from "motion/react";
 import type { ReactNode } from "react";
+import { useIsMobile } from "@/hooks/use-mobile";
 import { Button } from "@/components/ui/button";
 import { EASE_OUT } from "@/lib/motion";
 
@@ -45,13 +46,16 @@ export function DetailPanel({
 }) {
   // Reduced motion keeps the fade, which explains the change, and drops the movement.
   const shouldReduceMotion = useReducedMotion();
+  const mobile = useIsMobile();
 
   return (
-    <div className="flex h-full min-h-0">
-      <div className="flex flex-1 min-w-0 flex-col">{children}</div>
+    <div className="darbot-detail-shell relative flex h-full min-h-0">
+      <div className="flex flex-1 min-w-0 flex-col" inert={mobile && open}>{children}</div>
       <motion.div
         animate={{ width: open ? detailWidth : 0 }}
-        className="shrink-0 overflow-hidden"
+        className="darbot-detail-panel shrink-0 overflow-hidden"
+        data-open={open}
+        inert={!open}
         // No entry animation on first paint: URL-opened panels should appear as initial state.
         initial={false}
         transition={{
@@ -60,7 +64,7 @@ export function DetailPanel({
         }}
       >
         <div
-          className="flex h-full flex-col bg-sidebar border-l border-border"
+          className="darbot-detail-inner flex h-full flex-col bg-sidebar border-l border-border"
           style={{ width: detailWidth }}
         >
           {/* Rendered for the whole animation, so the way out is available immediately. */}
@@ -69,7 +73,7 @@ export function DetailPanel({
               {title}
             </div>
             <div className="flex flex-row gap-1.5">
-              <Button onClick={onClose} variant="ghost" size="icon">
+              <Button aria-label="Close detail panel" onClick={onClose} variant="ghost" size="icon">
                 <IconX className="size-4.5" />
               </Button>
             </div>

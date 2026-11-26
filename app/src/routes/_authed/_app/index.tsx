@@ -1,3 +1,4 @@
+import { IconPlus } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import { createFileRoute, Link } from "@tanstack/react-router";
 import { useState } from "react";
@@ -41,17 +42,20 @@ function RouteComponent() {
 
   return (
     <>
-      <SidebarToggleBar />
-      <div className="flex-1 flex flex-col items-center justify-center w-full p-4 mt-8">
-        <div className="flex flex-col items-center">
+      <div className="darbot-home-header">
+        <SidebarToggleBar />
+        <Link aria-label="New conversation" to="/channel/new" className="darbot-mobile-new-chat md:hidden"><IconPlus size={24} /></Link>
+      </div>
+      <div className="darbot-mobile-home flex-1 flex flex-col items-center justify-center w-full p-4 mt-8">
+        <div className="darbot-home-intro flex flex-col items-center">
           <h2 className="text-sm uppercase text-muted-foreground font-medium tracking-tight text-center">
             {appConfig.brand.productName}
           </h2>
           <h1 className="text-2xl font-bold tracking-tight mt-1.5 text-center">
-            Start a new channel
+            What can I help you with?
           </h1>
         </div>
-        <div className="mt-8 w-full flex flex-col items-center">
+        <div className="darbot-home-composer mt-8 w-full flex flex-col items-center">
           <Composer
             agents={toAgentOptions(agents)}
             className="w-full max-w-2xl"
@@ -130,7 +134,7 @@ function RouteComponent() {
          * the fifth public Bot squeezed all five — the same failure `/agents` had just been fixed
          * for, still sitting here.
          */}
-        <div className="mt-10 w-full max-w-2xl">
+        <div className="darbot-home-agents mt-10 w-full max-w-2xl">
           {/*
            * The heading is repeated in each arm rather than hoisted above this conditional:
            * `CarouselPrevious`/`CarouselNext` read the carousel's own context, so they must stay

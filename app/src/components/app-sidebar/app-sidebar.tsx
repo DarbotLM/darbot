@@ -18,10 +18,11 @@ import {
   type LinkOptions,
   useNavigate,
   useParams,
+  useRouterState,
 } from "@tanstack/react-router";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import type * as React from "react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -43,6 +44,7 @@ import {
   SidebarMenuButton,
   SidebarMenuItem,
   SidebarRail,
+  useSidebar,
 } from "@/components/ui/sidebar";
 import type { AgentIconIdentity } from "@/lib/agents/icons";
 import { agentListQueryOptions } from "@/lib/agents/queries";
@@ -223,6 +225,11 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
   // One socket for the app, opened where the roster is kept live.
   useChannelEvents();
   const [search, setSearch] = useState("");
+  const { setOpenMobile } = useSidebar();
+  const href = useRouterState({ select: (state) => state.location.href });
+  useEffect(() => {
+    setOpenMobile(false);
+  }, [href, setOpenMobile]);
   const searching = search.trim().length > 0;
   const visibleChannels = pinnedFirst(matchingChannels(channels.data, search));
   /*

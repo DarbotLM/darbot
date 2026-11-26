@@ -20,7 +20,10 @@ const ThemeContext = createContext<ThemeContextValue | null>(null);
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
   const [dark, setDark] = useState(() =>
-    parseStoredDarkTheme(window.localStorage.getItem(THEME_STORAGE_KEY)),
+    parseStoredDarkTheme(
+      window.localStorage.getItem(THEME_STORAGE_KEY) ??
+        (window.matchMedia("(max-width: 767px)").matches ? "dark" : null),
+    ),
   );
 
   useEffect(() => {

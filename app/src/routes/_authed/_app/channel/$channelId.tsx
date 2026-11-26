@@ -185,7 +185,7 @@ function RouteComponent() {
       }
     >
       <div className="flex flex-col">
-        <div className="h-12 border-b border-border sticky top-0 flex flex-row items-center justify-between px-3 gap-2">
+        <div className="darbot-channel-header h-12 border-b border-border sticky top-0 flex flex-row items-center justify-between px-3 gap-2">
           {/* Keyed on the displayed name so cold channel loads animate the resolved name, not the id. */}
           <div className="flex min-w-0 items-center gap-1.5">
             <SidebarToggle />

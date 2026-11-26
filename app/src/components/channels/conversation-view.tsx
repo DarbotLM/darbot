@@ -432,7 +432,7 @@ export function ConversationView({
           {...(stopped ? { stopped } : {})}
         />
       </div>
-      <div className="max-w-2xl mx-auto w-full px-0 pb-4 shrink-0">
+      <div className="darbot-composer-dock max-w-2xl mx-auto w-full px-0 pb-4 shrink-0">
         {notice}
         <Composer
           agents={agents}

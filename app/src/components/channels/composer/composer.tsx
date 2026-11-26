@@ -1392,7 +1392,7 @@ export function Composer({
              * started it 42px in from the frame's left edge with nothing under it. The strip is
              * its own row across the top now, and the three controls keep their row below it.
              */
-            "flex min-h-14 flex-col rounded-2xl border border-border bg-card px-3 py-3 focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50",
+            "darbot-composer flex min-h-14 flex-col rounded-2xl border border-border bg-card px-3 py-3 focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50",
             className,
           )}
           onSubmit={handleFormSubmit}
@@ -1495,7 +1495,7 @@ export function Composer({
       {tooManyStagedNotice}
       <form
         aria-busy={isBusy}
-        className="overflow-hidden rounded-2xl border border-border bg-card"
+        className="darbot-composer overflow-hidden rounded-2xl border border-border bg-card"
         onSubmit={handleFormSubmit}
       >
         {filePicker}
